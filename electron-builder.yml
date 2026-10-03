@@ -1,0 +1,85 @@
+appId: com.logicreader.app
+productName: LogicReader
+copyright: Copyright © 2026 LogicReader
+directories:
+  output: release
+  buildResources: resources
+# 使用本地已下载的 Electron 发行版，避免打包时再次联网下载（离线/内网环境友好）
+electronDist: node_modules/electron/dist
+files:
+  - out/**/*
+  - package.json
+  - "!**/*.map"
+asarUnpack:
+  - "**/node_modules/better-sqlite3/**"
+extraResources:
+  - from: resources/icons
+    to: icons
+    filter: ["**/*"]
+  # 官方 Claude Agent SDK 的原生 CLI（236 MB）。**必须放在 asar 之外**：
+  #  · 可执行文件不能从 asar 里启动；
+  #  · 它也太大，塞进 asar 会让安装包与解压都难受。
+  # 运行时由 services/agent/sdk.ts 从 process.resourcesPath/claude-cli/ 解析。
+  # 来源由 scripts/copy-claude-cli.mjs 在打包前准备好（pnpm 的子包路径带哈希，没法直接写 here）
+  - from: resources/claude-cli
+    to: claude-cli
+    filter:
+      - "**/*"
+# 启动器放到 win-unpacked 根目录（LogicReader.exe 旁边）：
+# 个别机器的安全策略会在程序代码运行之前拦死未签名 exe（沙箱初始化崩溃 / C: 盘写入被拒），
+# 此时双击 exe 无反应；双击「启动逻辑阅读器.cmd」会按 正常 → 关沙箱 → 便携数据目录 三档降级（避坑指南 §2.9）。
+extraFiles:
+  - from: scripts/launcher
+    to: .
+    filter: ["**/*"]
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: portable
+      arch: [x64]
+  icon: resources/icons/app.ico
+  # ★ 不要改：asInvoker = 程序本身绝不请求管理员权限。
+  #   改成 highestAvailable / requireAdministrator 会让双击弹出 UAC，
+  #   标准用户（非管理员账户）从此无法启动 LogicReader.exe。
+  requestedExecutionLevel: asInvoker
+
+  # ---------------------------------------------------------------- 代码签名
+  # 这是"Windows 把程序判为风险"的**唯一根治手段**：
+  # 未签名的 exe 会被标成"未知发布者"，从网络/聊天工具拿到后运行会弹
+  # "Windows 已保护你的电脑"，企业策略也可能直接拦下。
+  # 下面的配置让**有证书就自动签名、没证书照常构建**（只是产物未签名）：
+  #   · OV/EV 证书（.pfx）：  set CSC_LINK=D:\cert\logicreader.pfx
+  #                          set CSC_KEY_PASSWORD=***
+  #   · 或把证书路径直接写进 signtoolOptions.certificateFile / certificatePassword
+  # 时间戳服务器已在 signtoolOptions 里显式写出（默认值也是它）：
+  # 带时间戳的签名在证书过期后依然有效。
+  # 排查用命令：pnpm trust:windows（体检） / pnpm trust:windows -- -Scan（实测扫描）
+  forceCodeSigning: false
+  signAndEditExecutable: true
+  signtoolOptions:
+    rfc3161TimeStampServer: http://timestamp.digicert.com
+    timeStampServer: http://timestamp.digicert.com
+  # 换用 Azure Trusted Signing 时，把上面 signtoolOptions 换成（两者不能同时配置）：
+  # azureSignOptions:
+  #   publisherName: LogicReader
+  #   endpoint: https://weu.codesigning.azure.net
+  #   codeSigningAccountName: <你的 Trusted Signing 账号名>
+  #   certificateProfileName: <你的证书配置名>
+
+  artifactName: ${productName}-${version}-${arch}.${ext}
+nsis:
+  oneClick: false
+  # ★ 不要改：perMachine=false 时默认装到 %LOCALAPPDATA%\Programs\LogicReader，
+  #   整条安装链路都不需要管理员权限（用户若自选 Program Files，才会走一次 UAC）。
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  deleteAppDataOnUninstall: false
+  artifactName: ${productName}-Setup-${version}-${arch}.${ext}
+portable:
+  # 单文件免安装版是"自解压 exe"，也是安全软件误报率最高的产物形态；
+  # 需要免安装分发时，更稳的做法是直接压缩 release/win-unpacked 目录：
+  #   Compress-Archive -Path release\win-unpacked\* -DestinationPath release\LogicReader-portable.zip
+  artifactName: ${productName}-${version}-portable.${ext}

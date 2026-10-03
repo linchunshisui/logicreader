@@ -1,0 +1,498 @@
+/* 关系图视觉规范（规划书 §5.5.6） */
+.lr-graph {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  background: var(--graph-canvas);
+  position: relative;
+}
+
+.lr-graph__toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--lr-toolbar-height);
+  flex: 0 0 auto;
+  padding: 0 8px;
+  background: var(--vscode-editorGroupHeader-tabsBackground);
+  border-bottom: 1px solid var(--vscode-editorGroup-border);
+  position: relative;
+  z-index: 6;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+}
+
+.lr-graph__toolbar > * {
+  flex: 0 0 auto;
+}
+
+.lr-graph__generation {
+  font-size: var(--lr-fs-xs);
+  opacity: 0.75;
+  white-space: nowrap;
+}
+
+.lr-graph__search {
+  width: 160px;
+  padding: 1px 6px;
+}
+
+.lr-graph__export {
+  max-width: 150px;
+}
+
+.lr-graph__canvas {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+.lr-graph__filter-panel {
+  position: absolute;
+  right: 8px;
+  top: calc(var(--lr-toolbar-height) + 6px);
+  z-index: 10;
+  width: 220px;
+  padding: 8px;
+  border-radius: 6px;
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-widget-border);
+  box-shadow: var(--lr-shadow-2);
+  font-size: var(--lr-fs-sm);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.lr-graph__filter-title {
+  font-size: var(--lr-fs-xs);
+  opacity: 0.7;
+  margin-bottom: 4px;
+}
+
+.lr-graph__filter-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 1px 0;
+  cursor: pointer;
+}
+
+.lr-graph__swatch {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  display: inline-block;
+}
+
+/* ------------------------------------------------------------- 节点 */
+.lr-gnode {
+  display: flex;
+  align-items: stretch;
+  width: 220px;
+  min-height: 64px;
+  border-radius: 8px;
+  border: 1px solid var(--graph-node-border);
+  background: var(--graph-node-bg);
+  overflow: hidden;
+  transition: box-shadow var(--lr-transition), opacity var(--lr-transition);
+}
+
+.lr-gnode[data-selected='true'] {
+  box-shadow: 0 0 0 2px var(--vscode-focusBorder);
+}
+
+.lr-gnode[data-highlighted='true'] {
+  box-shadow: 0 0 0 2px var(--graph-edge-inquiry);
+}
+
+.lr-gnode[data-section='true'] {
+  border-style: dashed;
+  opacity: 0.95;
+}
+
+.lr-gnode__bar {
+  width: 3px;
+  flex: 0 0 3px;
+}
+
+.lr-gnode__body {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  justify-content: center;
+}
+
+.lr-gnode__title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--graph-node-title);
+  line-height: 1.3;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.lr-gnode__summary {
+  font-size: 11px;
+  color: var(--graph-node-subtitle);
+  line-height: 1.35;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.lr-gnode__meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10px;
+  color: var(--graph-node-subtitle);
+  opacity: 0.85;
+}
+
+.lr-gnode__kind {
+  padding: 0 5px;
+  border-radius: 7px;
+  background: rgba(127, 127, 127, 0.18);
+}
+
+/**
+ * 连接把手：要能看出"这里可以拖出一条线"。
+ * 平时低调（跟着节点边框色），鼠标进到节点上时高亮放大 —— 否则用户根本不知道图能手工连线。
+ */
+.lr-gnode__handle {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--graph-node-border);
+  border: none;
+  transition: transform var(--lr-transition), background var(--lr-transition);
+}
+
+.lr-gnode:hover .lr-gnode__handle,
+.lr-gnode__handle:hover {
+  background: var(--vscode-focusBorder);
+  transform: scale(1.35);
+  cursor: crosshair;
+}
+
+/* ------------------------------------------------------------- 连线 */
+.lr-gedge-label {
+  position: absolute;
+  font-size: 10px;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--graph-node-bg);
+  color: var(--graph-node-subtitle);
+  border: 1px solid var(--graph-node-border);
+  pointer-events: all;
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------- 图例/检查器 */
+.lr-graph__legend {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  z-index: 5;
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-widget-border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: var(--lr-fs-xs);
+  max-width: 220px;
+}
+
+.lr-graph__legend-toggle {
+  font-size: var(--lr-fs-xs);
+  opacity: 0.85;
+}
+
+.lr-graph__legend-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 5px;
+}
+
+.lr-graph__legend-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.lr-graph__legend-line {
+  width: 18px;
+  height: 2px;
+  border-radius: 1px;
+}
+
+.lr-graph__inspector {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  width: 300px;
+  z-index: 5;
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-widget-border);
+  border-radius: 6px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  font-size: var(--lr-fs-sm);
+  box-shadow: var(--lr-shadow-1);
+}
+
+.lr-graph__inspector-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+}
+
+.lr-graph__inspector-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.lr-graph__inspector-quote {
+  font-size: var(--lr-fs-xs);
+  opacity: 0.8;
+  border-left: 2px solid var(--vscode-textBlockQuote-border);
+  padding-left: 6px;
+  max-height: 80px;
+  overflow: auto;
+}
+
+.lr-graph__inspector-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* --------------------------------------------------------- 进度/质量 */
+.lr-graph-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  font-size: var(--lr-fs-xs);
+  background: var(--vscode-editorWidget-background);
+  border-bottom: 1px solid var(--vscode-widget-border);
+}
+
+.lr-graph-progress__bar {
+  flex: 1;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(127, 127, 127, 0.25);
+  overflow: hidden;
+}
+
+.lr-graph-progress__fill {
+  height: 100%;
+  background: var(--vscode-focusBorder);
+  transition: width 200ms ease;
+}
+
+.lr-quality {
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--vscode-editorGroup-border);
+  background: var(--vscode-editorWidget-background);
+  font-size: var(--lr-fs-sm);
+}
+
+.lr-quality__toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 5px 10px;
+  text-align: left;
+  font-size: var(--lr-fs-xs);
+}
+
+.lr-quality__summary {
+  margin-left: auto;
+  opacity: 0.6;
+}
+
+.lr-quality__body {
+  padding: 2px 12px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.lr-quality__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: var(--lr-fs-xs);
+}
+
+.lr-quality__value {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.lr-quality__actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+/* ------------------------------------------------------------ 对话框 */
+.lr-dialog {
+  width: min(720px, 88vw);
+  max-height: 86vh;
+  overflow: auto;
+  padding: 18px 20px;
+  border-radius: 8px;
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-widget-border);
+  box-shadow: var(--lr-shadow-2);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.lr-dialog__title {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.lr-dialog__subtitle {
+  font-size: var(--lr-fs-xs);
+  opacity: 0.65;
+}
+
+.lr-dialog__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.lr-dialog__row--wrap {
+  align-items: flex-start;
+}
+
+.lr-dialog__row > label {
+  flex: 0 0 130px;
+  font-size: var(--lr-fs-sm);
+  opacity: 0.85;
+}
+
+.lr-dialog__row select,
+.lr-dialog__row input[type='number'] {
+  flex: 1;
+  max-width: 320px;
+}
+
+.lr-dialog__precision {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.lr-dialog__precision-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border: 1px solid var(--vscode-input-border);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: var(--lr-fs-sm);
+}
+
+.lr-dialog__precision-item[data-active='true'] {
+  border-color: var(--vscode-focusBorder);
+  background: rgba(0, 127, 212, 0.1);
+}
+
+.lr-dialog__estimate {
+  display: flex;
+  gap: 20px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: rgba(127, 127, 127, 0.08);
+  font-size: var(--lr-fs-sm);
+}
+
+.lr-dialog__estimate > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.lr-dialog__advanced-toggle {
+  text-align: left;
+  font-size: var(--lr-fs-sm);
+  opacity: 0.85;
+}
+
+.lr-dialog__advanced {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 6px;
+  border: 1px solid var(--vscode-widget-border);
+}
+
+.lr-dialog__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.lr-dialog__chips .lr-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+}
+
+.lr-dialog__chips input[type='checkbox'] {
+  margin: 0;
+}
+
+.lr-dialog__presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.lr-dialog__warning {
+  color: var(--vscode-errorForeground);
+  font-size: var(--lr-fs-sm);
+}
+
+.lr-dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+.lr-graph__inspector-ask {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.lr-graph__inspector-ask textarea {
+  resize: vertical;
+  min-height: 48px;
+  width: 100%;
+}

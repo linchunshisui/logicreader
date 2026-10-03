@@ -1,0 +1,235 @@
+/* Markdown / DOCX / 表格 阅读器 */
+.lr-prose--markdown {
+  font-family: var(--lr-font-reading);
+  line-height: 1.8;
+}
+
+.lr-prose--markdown h1,
+.lr-prose--markdown h2,
+.lr-prose--markdown h3,
+.lr-prose--markdown h4 {
+  line-height: 1.35;
+  margin: 1.4em 0 0.6em;
+}
+
+.lr-prose--markdown h1 {
+  font-size: 1.6em;
+  border-bottom: 1px solid var(--vscode-textSeparator-foreground);
+  padding-bottom: 0.25em;
+}
+
+.lr-prose--markdown h2 {
+  font-size: 1.32em;
+}
+
+.lr-prose--markdown h3 {
+  font-size: 1.14em;
+}
+
+.lr-prose--markdown p {
+  margin: 0.8em 0;
+}
+
+.lr-prose--markdown ul,
+.lr-prose--markdown ol {
+  padding-left: 1.6em;
+  margin: 0.6em 0;
+}
+
+.lr-prose--markdown li {
+  margin: 0.25em 0;
+}
+
+.lr-prose--markdown a {
+  color: var(--vscode-textLink-foreground);
+}
+
+.lr-prose--markdown blockquote {
+  margin: 1em 0;
+  padding: 0.3em 1em;
+  border-left: 3px solid var(--vscode-textBlockQuote-border);
+  background: var(--vscode-textBlockQuote-background);
+}
+
+.lr-prose--markdown table {
+  border-collapse: collapse;
+  margin: 1em 0;
+  font-size: 0.94em;
+  display: block;
+  overflow-x: auto;
+}
+
+.lr-prose--markdown th,
+.lr-prose--markdown td {
+  border: 1px solid var(--vscode-textSeparator-foreground);
+  padding: 4px 10px;
+  text-align: left;
+}
+
+.lr-prose--markdown th {
+  background: var(--vscode-textCodeBlock-background);
+  font-weight: 600;
+}
+
+.lr-prose--markdown code {
+  font-family: var(--lr-font-mono);
+  font-size: 0.9em;
+  background: var(--vscode-textCodeBlock-background);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+.lr-prose--markdown pre code {
+  background: none;
+  padding: 0;
+}
+
+.lr-prose__code-shiki {
+  margin: 1em 0;
+  border-radius: 6px;
+  overflow-x: auto;
+  font-family: var(--lr-font-mono);
+  font-size: 0.88em;
+}
+
+.lr-prose__code-shiki pre {
+  margin: 0;
+  padding: 12px 14px;
+}
+
+.lr-prose--markdown input[type='checkbox'] {
+  margin-right: 6px;
+}
+
+.lr-prose--markdown .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 4px 0;
+}
+
+/* ------------------------------------------------------------- DOCX */
+.lr-docx-host {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  transform-origin: top center;
+}
+
+.lr-docx-host .lr-docx-wrapper,
+.lr-docx-host .docx-wrapper {
+  background: transparent !important;
+  padding: 0 !important;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+}
+
+.lr-docx-host section.lr-docx,
+.lr-docx-host section.docx {
+  background: var(--reader-page-background) !important;
+  color: var(--reader-text) !important;
+  box-shadow: 0 2px 12px var(--reader-page-shadow) !important;
+  margin: 0 !important;
+}
+
+.lr-docx-host section * {
+  color: inherit;
+}
+
+.lr-docx-host table {
+  border-collapse: collapse;
+}
+
+.lr-docx-host td,
+.lr-docx-host th {
+  border: 1px solid var(--vscode-textSeparator-foreground);
+  padding: 3px 6px;
+}
+
+/* ------------------------------------------------------------ 表格 */
+.lr-sheet-viewport {
+  padding: 0;
+  background: var(--vscode-editor-background);
+}
+
+.lr-sheet {
+  border-collapse: collapse;
+  font-family: var(--lr-font-mono);
+  font-size: var(--lr-fs-sm);
+  white-space: nowrap;
+}
+
+.lr-sheet__corner,
+.lr-sheet__col-header,
+.lr-sheet__row-header {
+  position: sticky;
+  background: var(--vscode-editorGroupHeader-tabsBackground);
+  color: var(--vscode-descriptionForeground);
+  font-weight: 400;
+  border: 1px solid var(--vscode-editorGroup-border);
+  padding: 1px 6px;
+  font-size: 10px;
+  text-align: center;
+}
+
+.lr-sheet__col-header {
+  top: 0;
+  z-index: 2;
+}
+
+.lr-sheet__row-header {
+  left: 0;
+  z-index: 1;
+}
+
+.lr-sheet__corner {
+  top: 0;
+  left: 0;
+  z-index: 3;
+}
+
+.lr-sheet__col-header[data-active='true'],
+.lr-sheet__row-header[data-active='true'] {
+  background: var(--vscode-focusBorder);
+  color: #fff;
+}
+
+.lr-sheet__cell {
+  border: 1px solid var(--vscode-editorGroup-border);
+  padding: 2px 6px;
+  min-width: 64px;
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: cell;
+  user-select: text;
+}
+
+.lr-sheet__cell[data-number='true'] {
+  text-align: right;
+}
+
+.lr-sheet__cell:hover {
+  background: var(--vscode-list-hoverBackground);
+}
+
+.lr-sheet__cell[data-active='true'] {
+  outline: 2px solid var(--vscode-focusBorder);
+  outline-offset: -2px;
+}
+
+.lr-sheet-tab {
+  padding: 3px 10px;
+  border-radius: var(--lr-radius);
+  font-size: var(--lr-fs-sm);
+  color: var(--vscode-foreground);
+  opacity: 0.75;
+}
+
+.lr-sheet-tab[data-active='true'] {
+  background: var(--vscode-list-activeSelectionBackground);
+  color: var(--vscode-list-activeSelectionForeground);
+  opacity: 1;
+}

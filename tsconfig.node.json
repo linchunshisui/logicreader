@@ -1,0 +1,41 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": [
+      "ES2023"
+    ],
+    "types": [
+      "node"
+    ],
+    "strict": true,
+    "noUnusedLocals": false,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "forceConsistentCasingInFileNames": true,
+    "baseUrl": ".",
+    "paths": {
+      "@logicreader/shared": [
+        "packages/shared/src/index.ts"
+      ],
+      "@logicreader/document-model": [
+        "packages/document-model/src/index.ts"
+      ],
+      "@logicreader/graph-schema": [
+        "packages/graph-schema/src/index.ts"
+      ]
+    }
+  },
+  "include": [
+    "apps/main/src/**/*.ts",
+    "apps/preload/src/**/*.ts",
+    "packages/*/src/**/*.ts",
+    "scripts/**/*.mjs",
+    "electron.vite.config.ts",
+    "vitest.config.ts"
+  ]
+}

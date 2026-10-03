@@ -1,0 +1,14 @@
+# 仓库内统一 LF（工作区在 Windows，但 .editorconfig 也要求 LF），避免每次提交整树变红
+* text=auto eol=lf
+
+# 二进制：不做行尾转换，也不要把它们当文本 diff
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.ico  binary
+*.pdf  binary
+*.docx binary
+*.xlsx binary
+*.exe  binary
+*.zip  binary
+*.db   binary
