@@ -1,0 +1,149 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--lr-font-ui);
+  font-size: var(--lr-fs-md);
+  color: var(--vscode-foreground);
+  background: var(--vscode-editor-background);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  cursor: default;
+}
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+input,
+textarea,
+select {
+  font-family: inherit;
+  font-size: inherit;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border);
+  border-radius: 2px;
+  outline: none;
+  padding: 3px 6px;
+}
+
+input:focus,
+textarea:focus,
+select:focus {
+  border-color: var(--vscode-focusBorder);
+}
+
+::placeholder {
+  color: var(--vscode-input-placeholderForeground);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--vscode-scrollbarSlider-background);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--vscode-scrollbarSlider-hoverBackground);
+}
+
+::-webkit-scrollbar-thumb:active {
+  background: var(--vscode-scrollbarSlider-activeBackground);
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+.lr-focus-ring:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+.lr-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 12px;
+  border-radius: 2px;
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+}
+
+.lr-button:hover {
+  background: var(--vscode-button-hoverBackground);
+}
+
+.lr-button--secondary {
+  background: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-button-secondaryForeground);
+}
+
+.lr-button--secondary:hover {
+  background: var(--vscode-button-secondaryHoverBackground);
+}
+
+.lr-button[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.lr-icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 4px;
+  color: var(--vscode-icon-foreground);
+}
+
+.lr-icon-button:hover {
+  background: var(--vscode-list-hoverBackground);
+}
+
+.lr-icon-button[disabled] {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.lr-scroll {
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+.lr-selectable {
+  user-select: text;
+  cursor: text;
+}
+
+.lr-truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

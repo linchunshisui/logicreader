@@ -1,0 +1,336 @@
+/* PDF 阅读器 */
+.lr-pdf-root {
+  display: flex;
+  flex: 1;
+  /*
+   * ★ 不要删：flex 项的 `min-width` 默认是 `auto`（= 内容的最小宽度），
+   * 于是"页面比容器宽"时这一层会被**内容撑大**，而不是让 .lr-pdf-scroll 出横向滚动条。
+   * 配合"适应宽度"就成了一条正反馈：
+   *   旋转 90° → 页面宽高互换、渲染宽度 ×1.41 → 撑大 .lr-pdf-root
+   *   → .lr-pdf-scroll.clientWidth 变大 → 适应宽度按新宽度重算 scale → 页面更大 → …
+   * 一路涨到 Chromium 的 2^25(≈3355 万) px 上限才算停（实测就是这个数）。
+   * 把它压成 0 之后，超出部分由 .lr-pdf-scroll 滚动，容器宽度保持稳定。
+   */
+  min-width: 0;
+  min-height: 0;
+  background: var(--reader-canvas);
+}
+
+.lr-pdf-root__main {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.lr-pdf-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 16px 0 60px;
+}
+
+.lr-pdf-pages {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+}
+
+/*
+ * 双页：一行**两页并排**，行与行之间才竖着排（所以全篇照旧能一路滚完）。
+ * ★ 不要再把这一层改成 column —— 那是"竖向摆两页"，与双页的语义相反。
+ * gap 必须与 PdfReaderView 里的 SPREAD_GAP 一致（"适应页面"按它算宽度）。
+ */
+.lr-pdf-spread {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 14px;
+}
+
+.lr-pdf-page {
+  position: relative;
+  background: var(--reader-page-background);
+  box-shadow: 0 2px 12px var(--reader-page-shadow);
+  user-select: text;
+  cursor: text;
+  contain: layout style;
+}
+
+.lr-pdf-page[data-theme='dark'] {
+  background: #1a1a1a;
+}
+
+.lr-pdf-canvas {
+  display: block;
+}
+
+.lr-pdf-page .textLayer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  line-height: 1;
+  opacity: 1;
+  forced-color-adjust: none;
+}
+
+.lr-pdf-page .textLayer span,
+.lr-pdf-page .textLayer br {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+  user-select: text;
+}
+
+/* 选中的文字需要可见，否则用户不知道选中了什么 */
+.lr-pdf-page .textLayer span::selection,
+.lr-pdf-page .textLayer span *::selection {
+  background: var(--reader-selection);
+  color: transparent;
+}
+
+.lr-pdf-page .textLayer ::selection {
+  background: var(--reader-selection);
+}
+
+.lr-pdf-page .textLayer .lr-pdf-search-hit {
+  background: var(--reader-search-hit);
+  color: transparent;
+  border-radius: 2px;
+}
+
+.lr-pdf-links {
+  position: absolute;
+  inset: 0;
+  /* 关键：覆盖层默认不参与命中测试，否则整页都无法用鼠标划选文字 */
+  pointer-events: none;
+}
+
+.lr-pdf-link {
+  position: absolute;
+  display: block;
+  border-radius: 2px;
+  /* 只有真实链接区域才接收点击 */
+  pointer-events: auto;
+}
+
+.lr-pdf-link:hover {
+  background: rgba(0, 122, 204, 0.16);
+  outline: 1px solid var(--vscode-focusBorder);
+}
+
+.lr-pdf-annotations {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+/* 跳转落点高亮（图中节点/连线、目录、查找、标注列表共用） */
+.lr-pdf-flash {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.lr-pdf-flash__rect {
+  position: absolute;
+  border-radius: 2px;
+  background: var(--reader-highlight);
+  mix-blend-mode: multiply;
+  animation: lr-flash 1.6s ease;
+}
+
+.lr-pdf-page[data-theme='dark'] .lr-pdf-flash__rect {
+  mix-blend-mode: screen;
+}
+
+.lr-pdf-annotation {
+  position: absolute;
+  border-radius: 2px;
+  mix-blend-mode: multiply;
+}
+
+.lr-pdf-page[data-theme='dark'] .lr-pdf-annotation {
+  mix-blend-mode: screen;
+}
+
+.lr-pdf-annotation[data-kind='rect'],
+.lr-pdf-annotation[data-kind='note'] {
+  border: 1.5px solid;
+  background: transparent;
+}
+
+.lr-pdf-annotation[data-active='true'] {
+  outline: 1px solid var(--vscode-focusBorder);
+}
+
+.lr-pdf-page__badge {
+  position: absolute;
+  right: 6px;
+  top: 6px;
+  font-size: 10px;
+  opacity: 0.5;
+}
+
+.lr-pdf-rail {
+  width: 220px;
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--vscode-editorGroup-border);
+  background: var(--vscode-sideBar-background);
+}
+
+.lr-pdf-rail__tabs {
+  display: flex;
+  gap: 2px;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--vscode-sideBar-border);
+}
+
+.lr-pdf-rail__tab {
+  flex: 1;
+  padding: 3px 4px;
+  font-size: var(--lr-fs-xs);
+  border-radius: var(--lr-radius);
+  color: var(--vscode-sideBar-foreground);
+  opacity: 0.75;
+}
+
+.lr-pdf-rail__tab[data-active='true'] {
+  background: var(--vscode-list-activeSelectionBackground);
+  color: var(--vscode-list-activeSelectionForeground);
+  opacity: 1;
+}
+
+.lr-pdf-rail__body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px;
+}
+
+.lr-pdf-thumb {
+  display: block;
+  width: 100%;
+  margin-bottom: 8px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  overflow: hidden;
+  position: relative;
+  background: var(--reader-page-background);
+}
+
+.lr-pdf-thumb[data-active='true'] {
+  border-color: var(--vscode-focusBorder);
+}
+
+.lr-pdf-thumb canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.lr-pdf-thumb__label {
+  position: absolute;
+  right: 3px;
+  bottom: 2px;
+  font-size: 10px;
+  padding: 0 3px;
+  border-radius: 2px;
+  background: rgba(0, 0, 0, 0.5);
+  color: #fff;
+}
+
+.lr-pdf-outline-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  padding: 3px 6px;
+  text-align: left;
+  font-size: var(--lr-fs-sm);
+  border-radius: var(--lr-radius);
+}
+
+.lr-pdf-outline-row:hover {
+  background: var(--vscode-list-hoverBackground);
+}
+
+.lr-pdf-sidebar-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--vscode-editorGroup-border);
+}
+.lr-reader__page-input {
+  width: 46px;
+  text-align: center;
+  padding: 1px 4px;
+}
+
+.lr-reader__find {
+  width: 140px;
+  padding: 1px 6px;
+}
+
+.lr-pdf-flash-indicator {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.45);
+  color: #fff;
+  font-size: var(--lr-fs-xs);
+  pointer-events: none;
+}
+
+.lr-pdf-progress {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--vscode-focusBorder), transparent);
+  animation: lr-progress 1.2s linear infinite;
+}
+
+@keyframes lr-progress {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+.lr-annotation-row[data-active='true'] {
+  background: var(--vscode-list-activeSelectionBackground);
+  color: var(--vscode-list-activeSelectionForeground);
+}
+/* 工具条防溢出：单行、可横向滚动 */
+.lr-reader__toolbar {
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.lr-reader__toolbar::-webkit-scrollbar {
+  height: 0;
+}
+
+.lr-reader__toolbar > * {
+  flex: 0 0 auto;
+}
+
+.lr-reader__toolbar-meta {
+  white-space: nowrap;
+}
