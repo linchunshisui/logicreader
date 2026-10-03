@@ -54,6 +54,27 @@ export function assertPath(value: unknown, name = 'path'): string {
 // -------------------------------------------------------------- 日志转发
 let logForwarder: ((entry: LogEntry) => void) | null = null
 
+/**
+ * 控制台管道断开后就别再往控制台写了。
+ *
+ * 实测（本轮）：本程序被别的程序**当子进程**拉起时（例如 DSH 桌面端的宿主环境），
+ * 父进程一关掉 stdout 管道，`console.log` 就抛 `EPIPE: broken pipe, write`。
+ * 关键点是它**异步**抛在流上、不是同步 throw —— `try/catch` 兜不住，
+ * 于是落到 uncaughtException 处理器，而处理器又要写一条日志（又 EPIPE）……
+ * 每秒几百条，日志几分钟涨到几 MB，进程一直空转。
+ *
+ * 修法：给 stdout/stderr 挂一次 'error' 监听（同时消掉默认的 uncaught），
+ * 之后所有控制台写入直接跳过 —— 日志该落盘还落盘，只是不再往断掉的管道里灌。
+ */
+let consoleBroken = false
+function watchConsoleStream(stream: NodeJS.WriteStream | undefined): void {
+  stream?.on('error', (error: NodeJS.ErrnoException) => {
+    if (error?.code === 'EPIPE' || error?.code === 'ERR_STREAM_DESTROYED') consoleBroken = true
+  })
+}
+watchConsoleStream(process.stdout)
+watchConsoleStream(process.stderr)
+
 export function setLogForwarder(fn: (entry: LogEntry) => void): void {
   logForwarder = fn
 }
@@ -68,12 +89,15 @@ export function logMain(level: LogEntry['level'], scope: string, message: string
     detail
   }
   const line = '[' + new Date(entry.at).toISOString() + '] [' + level.toUpperCase() + '] [' + scope + '] ' + message + (detail ? ' :: ' + detail : '')
-  try {
-    if (level === 'error') console.error(line)
-    else if (level === 'warn') console.warn(line)
-    else console.log(line)
-  } catch {
-    // 控制台管道断开（EPIPE）不应影响主流程
+  if (!consoleBroken) {
+    try {
+      if (level === 'error') console.error(line)
+      else if (level === 'warn') console.warn(line)
+      else console.log(line)
+    } catch {
+      // 同步抛出的写失败（管道断开）也不该影响主流程
+      consoleBroken = true
+    }
   }
   try {
     logForwarder?.(entry)

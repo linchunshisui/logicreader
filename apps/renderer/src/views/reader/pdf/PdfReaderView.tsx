@@ -8,6 +8,7 @@ import { loadPdfDocument, releasePdfDocument, getPdfLayout, pdfjsLib } from '../
 import { expandRevealRange } from '@logicreader/document-model'
 import { confirmFragments, rangeForChars, resolveDomSelection } from '../../../lib/selection'
 import { useRevealRequest } from '../../../lib/revealRequest'
+import { useZoomAnchor } from '../../../lib/zoomAnchor'
 import { TEXT_LAYER_MAPPING_VERSION } from '../../../lib/textLayerMapping'
 import { parsePdfDocument } from '../../../parsers/pdf'
 import { useDocuments } from '../../../state/documents.store'
@@ -76,8 +77,14 @@ export function PdfReaderView({ tab, model }: Props): JSX.Element {
   const [colorIndex, setColorIndex] = useState(0)
   const [pendingSelection, setPendingSelection] = useState<PendingSelection | null>(null)
   const [flashRange, setFlashRange] = useState<{ charStart: number; charEnd: number } | null>(null)
-  /** 跳转落点的高亮矩形（页内坐标）：页比视口高时"闪整页"说不清落在哪一段 */
-  const [flashRects, setFlashRects] = useState<{ page: number; rects: Rect[]; charStart: number; charEnd: number } | null>(null)
+  /**
+   * 跳转落点：**只记页号与字符区间，不记像素矩形**。
+   *
+   * 矩形由 `PdfPageView` 在文本层每次重建完成后按**当前缩放 / 旋转**重新量一次
+   * （见 PdfPageView 的 `flashRects`）。旧实现把"跳转那一刻"的像素矩形存在这里：
+   * 缩放后页面重新排版、矩形却停在原地 —— 就是"高亮区域不随缩放变化"。
+   */
+  const [flashTarget, setFlashTarget] = useState<{ page: number; charStart: number; charEnd: number; hold: boolean } | null>(null)
   const flashTimerRef = useRef<number | null>(null)
   const { settings } = useSettings()
   const setReaderProgress = useUiStore((s) => s.setReaderProgress)
@@ -677,7 +684,12 @@ export function PdfReaderView({ tab, model }: Props): JSX.Element {
           .filter((rect) => rect.width > 0 && rect.height > 0)
         if (rects.length > 0) {
           if (flashTimerRef.current !== null) window.clearTimeout(flashTimerRef.current)
-          setFlashRects({ page, rects, charStart, charEnd })
+          flashTimerRef.current = null
+          /*
+           * 只登记"哪一页的哪一段"：矩形由 PdfPageView 按当前缩放量。
+           * 这一轮量出的 `rects` 只用于下面的"把落点拉到视口中间"，不进 state。
+           */
+          setFlashTarget({ page, charStart, charEnd, hold: Boolean(options.hold) })
           /*
            * hold = 高亮常驻（关系图跳转）：用户要求"跳转后高亮维持"，
            * 直到下一次跳转或被手动关掉；其余入口仍是 1.6 秒闪一下。
@@ -685,7 +697,7 @@ export function PdfReaderView({ tab, model }: Props): JSX.Element {
           if (!options.hold) {
             flashTimerRef.current = window.setTimeout(() => {
               flashTimerRef.current = null
-              setFlashRects(null)
+              setFlashTarget(null)
             }, options.durationMs ?? 1600)
           }
           /*
@@ -710,6 +722,8 @@ export function PdfReaderView({ tab, model }: Props): JSX.Element {
        * 等够 20 轮（约 2 秒）还拿不到映射（扫描页、无偏移表的旧缓存）才降级为闪整页。
        */
       if (attempt < 20) return false
+      /* 拿不到文本层偏移表（扫描页、无映射的旧缓存）：收起"区间高亮"，降级为闪整页 */
+      setFlashTarget(null)
       pageElement.classList.add('lr-flash')
       window.setTimeout(() => pageElement.classList.remove('lr-flash'), 1600)
       return true
@@ -724,6 +738,21 @@ export function PdfReaderView({ tab, model }: Props): JSX.Element {
     })
   )
 
+  /**
+   * 跳转上下文结束（关掉逻辑链面板 → `revealRequest` 置空）时收起常驻高亮。
+   * 与 Markdown / DOCX / 文本阅读器的 `useClearRevealOnReset` 对齐 ——
+   * PDF 的高亮是矩形覆盖层，复用不了那个按 class 清理的工具函数。
+   */
+  const revealRequest = useUiStore((state) => state.revealRequest)
+  useEffect(() => {
+    if (revealRequest) return
+    if (flashTimerRef.current !== null) {
+      window.clearTimeout(flashTimerRef.current)
+      flashTimerRef.current = null
+    }
+    setFlashTarget(null)
+  }, [revealRequest])
+
   /** 命令层调用（不重试，能定到哪算哪） */
   const revealRange = useCallback(
     (charStart: number, charEnd: number) => {
@@ -731,6 +760,40 @@ export function PdfReaderView({ tab, model }: Props): JSX.Element {
     },
     [applyReveal]
   )
+
+  /**
+   * 缩放锚点：跳转高亮 / 用户选区那一段在缩放（以及旋转）后**仍然居中、开头可见**。
+   *
+   * PDF 的文本层是异步重建的，所以额外给两道判断：
+   *  · `ready`：目标页的文本层已按**新**的 scale/rotation 重建完（PdfPageView 写的 `data-render-scale`）；
+   *  · `resolveRect`：用字符区间量出这一段的第一个矩形 —— 与跳转落点是同一把尺子。
+   */
+  useZoomAnchor({
+    containerRef: scrollRef,
+    docId: model.docId,
+    layoutKey: String(scale) + '|' + String(rotation),
+    ready: (anchor) => {
+      const page = pageForChar(model.blocks, anchor.charStart) ?? 1
+      const layer = scrollRef.current?.querySelector<HTMLElement>(
+        '.lr-pdf-page[data-page="' + page + '"] .textLayer'
+      )
+      return Boolean(
+        layer &&
+          layer.dataset.renderScale === String(scale) &&
+          layer.dataset.renderRotation === String(rotation)
+      )
+    },
+    resolveRect: (anchor) => {
+      const element = scrollRef.current
+      if (!element) return null
+      const page = pageForChar(model.blocks, anchor.charStart) ?? 1
+      const pageElement = element.querySelector<HTMLElement>('.lr-pdf-page[data-page="' + page + '"]')
+      const range = pageElement
+        ? rangeForChars(pageElement, '.textLayer span[data-char-start]', anchor.charStart, anchor.charEnd)
+        : null
+      return range?.getClientRects()[0] ?? null
+    }
+  })
 
   // --------------------------------------------- 向命令层注册阅读器能力
   useEffect(() => {
@@ -858,8 +921,11 @@ export function PdfReaderView({ tab, model }: Props): JSX.Element {
       theme={useSettings.getState().readerTheme}
       annotations={marksByPage.get(page) ?? []}
       searchQuery={findQuery}
-      flashRects={flashRects && flashRects.page === page ? flashRects.rects : null}
-      flashRange={flashRects && flashRects.page === page ? flashRects : null}
+      flashRange={
+        flashTarget && flashTarget.page === page
+          ? { charStart: flashTarget.charStart, charEnd: flashTarget.charEnd }
+          : null
+      }
       onNavigate={(target) => {
         if (target.page) scrollToPage(target.page)
         else if (target.url) void api.app.openExternal(target.url)

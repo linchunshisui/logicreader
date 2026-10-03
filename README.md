@@ -119,6 +119,7 @@ release/           Windows 免安装程序（electron-builder 输出，已 gitig
 | [ARCHITECTURE.md](ARCHITECTURE.md) | **长期记忆**：稳定约定与不变量、模块职责、启动顺序、验证矩阵、已知边界 |
 | [执行记录.md](执行记录.md) | 逐里程碑落地情况、验收证据、与规划书的偏差、各轮反馈的根因分析与修复记录 |
 | [避坑指南.md](避坑指南.md) | 实战踩坑总结：环境/打包/渲染进程/第三方库/Agent CLI/算法/验证手法，含一页速查表 |
+| [docs/deepseek-harness.md](docs/deepseek-harness.md) | **DeepSeek Harness（dsh）搭载方案**：上游入口模式与 ACP 契约、密钥与模型目录、本程序的接入位置与已知边界 |
 | [docs/screenshots/](docs/screenshots/) | 各里程碑与两轮修复的验证截图（可运行 `pnpm build` 后自行复现） |
 | [逻辑阅读器-任务规划书.md](逻辑阅读器-任务规划书.md) | 上游需求与设计依据（v1.3） |
 
@@ -207,6 +208,9 @@ pnpm launch:doctor -- -Kill   # 结束所有实例（含以管理员身份运行
 - **不需要管理员权限**：标准用户账户即可安装（默认装到 `%LOCALAPPDATA%` 下的 Programs 目录）与双击启动；
   安装包与 `LogicReader.exe` 都不请求提权（`requestedExecutionLevel=asInvoker`）
 - 可选：本机已安装的 Agent CLI（Claude Code / Codex / DeepSeek Harness / Gemini CLI）
+  - DeepSeek Harness：`npm i -g @deepseek-ai/dsh`，然后在**设置 → Agent → DeepSeek API Key** 填一次密钥
+    （程序以 `DEEPSEEK_API_KEY` 注入给 dsh；**已经在 dsh 自己那边配过密钥就别在这里再填**，环境变量会盖过它）
+    —— 接入细节见 [docs/deepseek-harness.md](docs/deepseek-harness.md)
 - 可选：LibreOffice（用于 `.doc` / `.ppt` / `.odt` / `.odp`）
 
 ## 许可与第三方组件

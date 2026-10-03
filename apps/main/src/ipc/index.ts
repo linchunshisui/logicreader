@@ -21,6 +21,31 @@ export interface IpcContext {
   takePendingFiles: () => string[]
 }
 
+/**
+ * 解析 Agent 注册表里的环境变量映射。
+ * 只收"合法环境变量名 → 字符串值"，其余一律丢弃 —— 这些键值最终会原样进子进程环境，
+ * 不允许出现空名 / 数字 / 超长内容；`secret:<key>` 形态由 runtime 在启动时解析成密钥库里的值。
+ */
+function parseEnvMap(value: unknown): Record<string, string> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return {}
+  const out: Record<string, string> = {}
+  for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue
+    if (typeof raw !== 'string') continue
+    if (raw.length > 8192) continue
+    out[key] = raw
+  }
+  return out
+}
+
+/**
+ * 给注册表条目补一个"密钥配没配"的标记（界面用它提示"到设置里填 DeepSeek API Key"）。
+ * 只有需要密钥的 Agent（dsh）会得到 true/false，其余是 null（不需要）。
+ */
+function withCredentialState<T extends { id: string }>(registration: T): T & { credentialOk: boolean | null } {
+  return { ...registration, credentialOk: agentRegistry.hasCredentials(registration.id) }
+}
+
 function makeDialogs(ctx: IpcContext) {
   return {
     open: async (options: Electron.OpenDialogOptions) => {
@@ -252,6 +277,12 @@ export function registerIpc(ctx: IpcContext): void {
   handle(CH.store.conversationUpsert, (_e, payload) => {
     storeService.conversationUpsert(assertObject(payload, 'payload'))
   })
+  handle(CH.store.conversationRemoteSession, (_e, conversationId, remoteSessionId) => {
+    storeService.setConversationRemoteSession(
+      assertString(conversationId, 'conversationId'),
+      assertString(remoteSessionId, 'remoteSessionId')
+    )
+  })
   handle(CH.store.conversationList, (_e, docId) => storeService.conversationList(assertString(docId, 'docId')))
   handle(CH.store.conversationGet, (_e, id) => storeService.conversationGet(assertString(id, 'id')))
   handle(CH.store.messageAppend, (_e, payload) => {
@@ -302,7 +333,7 @@ export function registerIpc(ctx: IpcContext): void {
   })
 
   // -------------------------------------------------------------- agent
-  handle(CH.agent.list, () => agentRegistry.list())
+  handle(CH.agent.list, () => agentRegistry.list().map(withCredentialState))
   handle(CH.agent.probe, (_e, agentId, force) => agentRegistry.probe(assertString(agentId, 'agentId'), Boolean(force)))
   handle(CH.agent.probeAll, (_e, force) => agentRegistry.probeAll(Boolean(force)))
   handle(CH.agent.upsert, (_e, payload) => {
@@ -314,15 +345,15 @@ export function registerIpc(ctx: IpcContext): void {
       protocol: (obj.protocol as 'cli') ?? 'cli',
       executable: obj.executable == null ? null : String(obj.executable),
       args: Array.isArray(obj.args) ? (obj.args as string[]) : [],
-      env: {},
+      env: parseEnvMap(obj.env),
       enabled: obj.enabled !== false,
       builtin: false
     })
-    return agentRegistry.list()
+    return agentRegistry.list().map(withCredentialState)
   })
   handle(CH.agent.remove, (_e, agentId) => {
     agentRegistry.remove(assertString(agentId, 'agentId'))
-    return agentRegistry.list()
+    return agentRegistry.list().map(withCredentialState)
   })
   handle(CH.agent.sessionCreate, (_e, request) => {
     const obj = assertObject(request, 'request')
@@ -358,6 +389,23 @@ export function registerIpc(ctx: IpcContext): void {
       typeof limit === 'number' ? limit : 30,
       agentId == null ? null : String(agentId)
     )
+  )
+  handle(CH.agent.historyRename, (_e, agentId, sessionId, title) => {
+    const text = assertString(title, 'title').trim()
+    if (text.length === 0) return
+    storeService.sessionTitleSet({
+      agentId: assertString(agentId, 'agentId'),
+      sessionId: assertString(sessionId, 'sessionId'),
+      title: text.slice(0, 80),
+      source: 'manual'
+    })
+  })
+  handle(CH.agent.historyName, (_e, agentId, sessionId, firstPrompt) =>
+    agentRuntime.nameSession({
+      agentId: assertString(agentId, 'agentId'),
+      sessionId: assertString(sessionId, 'sessionId'),
+      firstPrompt: firstPrompt == null ? null : String(firstPrompt)
+    })
   )
   handle(CH.agent.files, async (_e, dir, query, limit) => {
     const target = dir == null || String(dir).length === 0 ? null : String(dir)

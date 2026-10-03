@@ -11,6 +11,7 @@ import { registerReaderController } from '../../../state/readerBridge'
 import { alignElementsToText, useReaderSelection } from '../../../lib/readerSelection'
 import { useRevealRequest } from '../../../lib/revealRequest'
 import { markRange, useClearRevealOnReset } from '../../../lib/revealMark'
+import { anchorElementFor, useZoomAnchor } from '../../../lib/zoomAnchor'
 import { SelectionToolbar } from '../SelectionToolbar'
 
 interface Props {
@@ -113,6 +114,21 @@ export function DocxReaderView({ tab, model }: Props): JSX.Element {
     applyReveal(request.charStart, request.charEnd, { hold: request.hold, durationMs: request.durationMs })
   )
   useClearRevealOnReset(hostRef)
+
+  /**
+   * 缩放锚点：跳转高亮 / 用户选区那一段在缩放后**仍然居中、开头可见**。
+   * Word 用 CSS `zoom` 缩放，段落在视口里的位置会整体平移；不重新对齐就会漂出视口。
+   */
+  useZoomAnchor({
+    containerRef: scrollRef,
+    docId: model.docId,
+    layoutKey: String(zoom),
+    resolveRect: (anchor) => {
+      const root = scrollRef.current
+      const element = root ? anchorElementFor(root, model, anchor.charStart) : null
+      return element ? element.getBoundingClientRect() : null
+    }
+  })
 
   useEffect(() => {
     return registerReaderController({

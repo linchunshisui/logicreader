@@ -8,6 +8,18 @@ export type StartupBehavior = 'restore' | 'welcome' | 'file'
 export type GraphPrecision = 'skeleton' | 'structure' | 'panorama' | 'custom'
 export type ContextMode = 'fulltext' | 'graph'
 
+/**
+ * 密钥库里存放 DeepSeek API Key 的键名（设置 → Agent 里填的那一个）。
+ * 主进程建 dsh 会话时读它，并以 {@link DEEPSEEK_API_KEY_ENV} 注入子进程。
+ */
+export const DEEPSEEK_API_KEY_SECRET = 'deepseek.apiKey'
+
+/**
+ * dsh（DeepSeek Harness）读取 DeepSeek 官方密钥的环境变量名。
+ * 依据：`@deepseek-ai/dsh-llm-deepseek` 的 `DEFAULT_API_KEY_ENV`。
+ */
+export const DEEPSEEK_API_KEY_ENV = 'DEEPSEEK_API_KEY'
+
 export interface AgentSettings {
   /**
    * Agent 的工作目录策略：

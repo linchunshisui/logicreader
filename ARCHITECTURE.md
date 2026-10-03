@@ -61,7 +61,11 @@ DOM 选区
 | 有跳转入口就必须有反馈 | 无锚点 / 锚点失效 / 文档不可用各给一句明确提示；成功后在状态栏显示落点（`graph.jumpedTo`） |
 | **落点必须是"人能看懂的一段"** | 显示前用 `expandRevealRange` 收拾区间：边界落在拉丁词内部就补到词边界、去掉两头空白（**锚点本身不动**）。中文不扩（没有词间空格）。实际应用的区间写进 `data-reveal-range`，可被断言 |
 | 关系图跳转的高亮**常驻** | 请求上带 `hold`：直到下一次跳转或 `clearReveal()`（关面板）才收起；目录/查找/标注列表仍是 1.6 秒 `lr-flash` |
+| **跳转高亮跟着缩放/旋转走** | 落点只记"哪一页的哪一段"（字符区间），矩形由 `PdfPageView` 在文本层**每次重建完成后**按当前 `scale`/`rotation` 重新量。旧实现把"跳转那一刻"的像素矩形存进阅读器 state：缩放后页面重排、矩形停在原地 —— 用户看到的就是"高亮区域不随缩放变化"。判据：冒烟 `smoke.revealZoom`，高亮矩形与同一段文字的文本层矩形逐边相等（≤2px），且页面确实变大 |
+| **缩放以"当前文段"为中心** | 有跳转高亮或用户选区时，缩放（PDF 还含旋转）后要重新对齐：那一段仍居中、且**开头一定看得见**（文段比视口高时开头对齐顶部留边）。统一实现在 `lib/zoomAnchor`，PDF / Markdown / DOCX / 纯文本四家共用；锚点优先级 **高亮 > 选区**（store 里的选区可能是跳转前的旧选择）。判据：`smoke.revealZoom`（PDF 高亮）与 `smoke.anchorZoomText`（文本类阅读器的选区）都要求 `startVisible` 且居中偏差 ≤ 1/4 屏 |
 | 跳转要给出**局部上下文** | 文段旁并排 `GraphChainPanel`：被跳转节点的一度关系（指向它/由它指向），点任一条继续追；「在关系图中查看」回到图上居中并选中 |
+| 小图与清单要**双向可指** | 面板顶部的小图与下方清单指的是同一批节点：鼠标指到**清单某一行**时，小图要把那一行的节点**标出来并带进视野**（只平移、不改缩放），移开即收起；键盘聚焦行同样触发。与"单击小图 = 切换右侧信息"区分开：悬停**不改面板内容、不移动论文**。判据：冒烟 `smoke.graphJump` 的 `mapHoverOk`（悬停后出现 `data-preview-node`、卡片描边变粗、移开消失）与 `mapHoverPanOk`（先把小图拖走，悬停后该卡片必须回到窗口内） |
+| 小图：**跳转即定位，探路可回退** | ① **跳转过来直接定位到当前节点**：换中心节点时 `focusViewport` 居中 + 至少 `READABLE_ZOOM`（90%），不是"整张图缩成一小片"；② **临时视角必须能还回去**：悬停预览挪走的视图、或在空白处点一下（**没选中任何节点**）脱手，都要恢复"当前节点"的显示。判据：`smoke.graphJump` 的 `mapLocatedOk`（跳转后缩放 ≥90% 且中心卡片与窗口中心差 ≤24px）、`mapHoverRestoreOk`（悬停预览后 transform 回到预览前）、`mapTapRestoreOk`（空白处点一下后 transform 回到跳转定位那一份） |
 
 ### 1.5 论文与关系图的绑定、命名
 | 不变量 | 判据 |
@@ -95,6 +99,7 @@ DOM 选区
 | 恢复只动启动开关 | 只改 `webPreferences.sandbox` / 命令行开关 / 窗口重建，不触碰任何业务逻辑 |
 | **不存在自我提权路径** | 代码里不得再出现隐藏窗口调 PowerShell / `Start-Process -Verb RunAs` / `requireAdmin`：它既是安全软件判高危的行为模式，也是标准用户启动失败后的错误兜底（标准用户本来就能跑） |
 | **绝不停留在提权令牌下** | 启动时用 `whoami /groups` 的完整性级别 SID 判提权（`S-1-16-12288`/`16384`；**不要**用裸磁盘/SAM 探测），提示后用 `explorer.exe` 以普通权限重开自己并退出；重开一次仍提权时写 `elevate-retry.json` 标记、不再重开（防成环）。提权实例会独占 `userData/lockfile`，使之后所有非管理员启动在 Chromium 阶段静默失败（无窗口、无日志） |
+| **控制台管道断掉后不许再写控制台** | 被别的程序当子进程拉起时，父进程关掉 stdout 管道会让 `console.log` 异步抛 EPIPE；`try/catch` 兜不住 → uncaughtException → 处理器写日志 → 又 EPIPE，日志几分钟涨到几 MB。`util/ipc.ts` 里给 stdout/stderr 各挂一次 `error` 监听，EPIPE 后跳过控制台写入（**落盘的日志照旧**） |
 
 ---
 
@@ -111,9 +116,17 @@ DOM 选区
 | 写入边界是**拒绝**而不是询问 | 走到授权判定的写请求：目标越出工作区或含 `..` → 连授权卡片都不弹，直接拒绝（省得用户以为"点允许就能写外面"）。**另有第二条通道**：ACP 的 `fs/write_text_file` 按**会话创建时协商的能力位**（`canWrite`）判定 —— 会话允许就直接写，且**不再叠加**全局白名单（否则"自动档"会被静默阉掉，这是刻意的取舍） |
 | 危险命令一律转人工 | 命中危险列表（`rm -rf`、`del /s`、`--force` 推送、管道执行远程脚本…）时，即使 `auto` 也弹卡片 |
 | 工具的调用与结果必须**同 id** | 适配层（含 mock）要给 `tool-call` / `tool-result` 传同一个 id；否则界面永远停在"进行中"（不报错，只是永远转圈） |
+| **Agent 的输出一律按 markdown 渲染** | 模型回的就是 markdown：正文（本轮结束态）与**计划卡片**都走 `AgentMarkdown`（remark-gfm + rehype-katex + 懒加载 Shiki，与阅读器同一套插件，**不启用 HTML 直通**、外链走系统浏览器）。原来是原样输出源码 —— 用户看到的是 `### 标题`、`| 表头 |`、`**加粗**`。流式过程中保持纯文本（token 级增量下每字重解析 markdown 是白烧 CPU），`done` 时换成渲染版 |
+| **计划模式不是"每条回复都要审批"** | 计划档的约束是"别乱动东西"，不是"每次走一遍审批流程"：`planModeReminder` 要求模型**先判断任务是否需要计划**（只读问题直接答）；渲染进程的兜底也只在回答**确实像方案**时才弹卡片（`looksLikePlan`：太短不算 / 有方案小标题算 / ≥3 条分步且出现"步骤·阶段·先…再"才算）。旧行为是"本轮一结束就把最后一段当方案"，用户的原话是"死板" |
+| 计划卡片里的按钮**不许写死厂商名** | "让 XXX 继续完善"里的名字取自当前选中的 Agent（`displayName`）。实测踩过：面板里跑的是 DeepSeek Harness，按钮却写着"让 Claude 继续完善" |
+| **历史会话要给"人能看懂的名字"** | 命名优先级只有一份实现（`services/agent/session-title.ts` 的 `resolveSessionTitle`）：用户手改/AI 总结（`session_titles` 表，最高）→ Agent 自己给的标题 → 我们自己记的首条提问（`conversations.remote_session_id` 关联）→ Agent 给的首条提问。全都没有就显示"未命名会话 · 短 id"，**不许把整串 UUID 摆出来** |
+| **dsh 的标题与第一句提问要从它自己的日志读** | ACP 的 `session/list` **只回 sessionId + cwd**（实测 0.2.0-rc.2），但 dsh 把 `session/title`（含 LLM 生成的那份）与 `user/message` 写在 `~/.dsh/sessions/**/<id>/session.v4.jsonl.zstd`。那份日志是**多帧拼接**的 zstd，Node 只解第一帧 —— 按魔数 `28 B5 2F FD` 切帧逐个解，并且**只读开头 512KB**（标题与第一句在头几条记录里）。实现见 `services/agent/dsh-session-log.ts`，有单测 |
+| **通道之间不许互相"借用"历史** | ACP 列表拿不到就到此为止（空列表 + warn），**不要**落回 SDK 的 `listSessions` —— 实测会把另一个工具（Claude Code）的会话列在 dsh 名下，用户看到一堆毫不相干的条目。顺带：我们自己的内部任务（图谱抽取这类 `runOnce`）也会被 CLI 存成会话，历史列表里要按提示词特征**滤掉**（`isInternalSession`） |
+| 换 Agent 的入口只有 Agent 选择器 | （见上）输入区的"切换到 XXX"快捷芯片已下线 |
 | 模式随快照恢复，且**只向保守回退** | 旧快照缺 `permissionMode` 时回落 `manual`，绝不"继承"一个更宽的授权 |
 | 换 Agent = **换通道**：先释放旧会话 | `selectAgent` 必须先 `sessionDispose` 旧会话（SDK / app-server 都是**常驻**子进程，只把 sessionId 置空会留下一个不走的进程），再清掉会话态（消息 / 模型清单 / 命令 / 历史）—— 新通道没有旧会话的上下文，界面留着旧对话就是"答非所问"。旧会话仍在各自的持久化里（历史会话可续） |
-| 一键对切只给 **Claude Code ↔ Codex** | 两者是本工程的对标通道，来回比对是常态；按钮**只在对方可用时**出现（点了报错比不给更糟），切换后自动消失。其它 Agent（DSH / Gemini / 自建）只在 Agent 选择器里出现 |
+| **换 Agent 只有一条路：Agent 选择器** | 输入区上那个"切换到 XXX"快捷芯片已**下线**（用户明确不要）：Agent 选择器本来就把所有可用通道列全（含 DSH / Gemini / 自建），旁边再放一个"切换到某一家"的按钮只会重复、而且它指向谁完全取决于当前选中的是谁，读起来像噪声。切换语义不变：换 Agent = 换通道，先 `sessionDispose` 旧会话、再清会话态（见 agent.store.selectAgent） |
+| **Agent 的"能不能用"必须看得见且可修** | 设置 → Agent 有一份 Agent 管理器：显示每个 Agent 的协议 / 版本 / 可用性（附探测失败原因）/ 是否需要密钥，并且能改**可执行文件与启动参数**（保存后立即重探、同步刷新面板）。装好了却不可用时的排查入口只有这一个，不许让用户去翻日志 |
 
 ---
 
@@ -145,6 +158,25 @@ DOM 选区
 | 历史线程与 VS Code **同源** | `thread/list` 读的是 Codex 自己持久化的 rollout 记录（`~/.codex/sessions/...`），按 `cwd` 过滤；`updatedAt` 是**秒**，界面按毫秒消费 |
 | 斜杠命令 = 技能 | Codex 侧的名称是 `skills/list`；界面只展示与补全，不硬编码 |
 | 拿不到就如实报错 | 缺二进制 / 握手失败 → 能力标不可用并带上原因，日志可查。`resolveCodexExecutable` 的优先级：**用户配置 > PATH > VS Code 扩展自带**（`<ext>/bin/<platform>-<arch>/codex.exe`，只在前面都拿不到时才用）；内置注册项的 `executable` 是裸命令名 `codex`，所以"扩展自带"这条是 PATH 解析失败时的兜底，不是首选 |
+| **"不可用"是会过期的结论** | `agents.capability_json` 里只允许**长期复用成功的**能力；失败的结论只缓存 60 秒（`UNAVAILABLE_RETRY_MS`）—— 否则用户刚装好的工具会被一条旧缓存永久挡住（实测：16:38 留下的"未找到可执行文件：dsh"让新版每次启动都不再探测 dsh，界面里它直接消失）。另外：Agent 选择器与关系图下拉**都要把不可用的列出来**（灰掉 + 原因），不许静默隐藏 |
+
+### 1.10c Agent 接入：DeepSeek Harness（dsh）走 ACP
+
+> 调研与落地细节见 [docs/deepseek-harness.md](docs/deepseek-harness.md)（DSH 的入口模式、ACP v1 表面、
+> 密钥来源、模型与思考强度目录，以及本程序对应的实现位置）。
+
+| 不变量 | 判据 |
+| --- | --- |
+| DSH 的**首选通道是 ACP** | 内置项 `kind==='dsh'` → `protocol:'acp'` + `args:['--profile','acp']` → `AcpSession`。`--profile headless` 只在 ACP 建不起来时兜底（它只从位置参数读任务、没有 stdin） |
+| **回落 CLI 时不许带 ACP 参数** | `dsh` 的注册参数含 `--profile acp`，而 CLI spec 自己选 `--profile headless` —— 两个叠在一起 dsh 启动器直接报 `select a profile only once`。唯一实现是 `cli/cliLaunchPrefix()`：只摘"尾部正好等于注册参数"的那一段（`node <script>` 解释器前缀必须保留），有单测 |
+| **模型/思考强度目录必须来自 DSH 官方 provider** | `fallback-models.ts` 的 dsh 项只能是 `deepseek-v4-flash` / `deepseek-v4-pro` + `off`/`high`/`max`（默认 `high`）；旧版的 `deepseek-chat` / `deepseek-reasoner` 在 DSH 里不存在，照它选会在 `session/set_config_option` 上失败。真实清单以 `session/new` 返回的 `configOptions` 为准 |
+| **密钥只有一条通道** | Agent 子进程的环境变量统一由 `registry.resolveEnv()` 产出（内置默认 + 注册表 `env`，`secret:<key>` 走 safeStorage 密钥库）：dsh 的 `DEEPSEEK_API_KEY` 从"设置 → Agent → DeepSeek API Key"来。`agents.env_json` 从"只落库"变成"真的注入"；日志只允许打印**变量名**（`describeEnvNames`），不许打印值 |
+| **ACP 会话要能收尾与续聊** | 建会话时优先 `session/resume`（失败回落 `session/new` 并留痕）；远端会话 id 通过 `session` 事件交给界面；`dispose()` 先发 `session/close`（4 秒上限）再关连接杀进程。`session/list` 供历史会话清单（拿不到就当没有，不报错） |
+| **自带命令要按它自己的方式启动** | `.cmd` shim 里写了 `ELECTRON_RUN_AS_NODE` 时（DeepSeek Harness 桌面端就是这样），必须用**它指定的那个 exe** + `--expose-internals` + cli.js，并把 `ELECTRON_RUN_AS_NODE=1` 注入子进程（`parseShimContent`）；**不能**当 `node <script>` 跑（脚本在 app.asar 里）。判定只看可执行文件是否存在 —— asar 里的路径在普通 Node 里 `existsSync` 为假、在 Electron 里为真 |
+| **两条通道都要带"怎么启动"** | `capability.launchArgs` 里既有解释器前缀（`node <script>` / `<exe> --expose-internals <cli.js>`）也有注册参数；ACP 与 CLI 都必须用 `fullLaunchArgs()` 取全（CLI 那条再摘掉 ACP 的 `--profile`，见 `cliLaunchPrefix`）。旧实现 ACP 只取注册参数 —— shim 型 Agent 会被拉成 `<exe> --profile acp`，会话永远建不起来（活测照出来的） |
+| **找可执行文件要补两个来源** | ① 注册表里的 PATH（安装器改完 PATH，已运行的进程看不到快照）；② 应用自带的命令目录（dsh 桌面端按卸载表 `InstallLocation` → `resources\runtime\cli\bin`，或 `HKCU\Software\DeepSeekHarness\Command`）。cmd.exe 兜底路径必须用 `cmdCommandArgs` 的引号规则（`/s /c` 会剥一层引号） |
+| **配置项的取值按 Agent 的形态编码** | `session/set_config_option` 的 value 由 Agent 定：dsh 的 `model` 是 `[provider, model]` 路由且**只认 JSON 字符串**（实测裸模型名回 `unknown model option`，还会被客户端吞成 warn）。唯一实现是 `config-value.ts` 的 `encodeConfigValue` / `parseModelRoute`，有单测 + 对着真实 dsh 的 live 测试 |
+| 上游边界要如实写在文档里 | DSH 的 ACP **只给**标准语义更新，没有计划卡片 / 工具细节 / 分叉 / 附加目录 —— 界面上的能力差异来自协议，不是本程序的缺陷 |
 
 
 ### 1.11 文件改动：基线、差异、检查点
@@ -360,6 +392,11 @@ DOM 选区
 
 ## 4. 验证矩阵（每次改动后跑）
 
+> **先记住这一条**：`exe` 是**打包快照** —— 每次改动都必须以重新打包收尾
+> （`electron-vite build` → `electron-builder --dir` → `pnpm publish:local`）。
+> 只改源码 / 只跑 `out/` 等于没交付：用户双击的 `app.asar` 里还是旧 JS。
+> 判据：状态栏 `__LR_BUILD__` 时间戳是不是这一次（详见 避坑指南 §2.9 / §9.7）。
+
 > **两份产物，别搞混**：`out/` 是开发运行（`electron .`）与所有开发态冒烟用的；
 > `release/win-unpacked/`（exe + `resources/app.asar`）是**打包那一刻**的快照。
 > 改完代码要双击 exe 生效，必须再跑一次 electron-builder（详见 避坑指南 §2.9）。
@@ -430,22 +467,40 @@ $env:LR_SMOKE='26000'
 $env:LR_SMOKE_COMMAND='smoke.pdfSpread'
 & .\release\win-unpacked\LogicReader.exe <PDF 路径>
 # 期望日志：PDF_SPREAD_OK {"allPages":true,"sideBySide":true,"nextRowBelow":true,"fits":true,...}
+
+# 13) PDF 跳转高亮必须**跟着缩放走**（高亮矩形 == 当前文本层里同一段文字的矩形）
+$env:LR_SMOKE='26000'
+$env:LR_SMOKE_COMMAND='smoke.revealZoom'
+& .\release\win-unpacked\LogicReader.exe --no-sandbox --user-data-dir=<隔离画像> <PDF 路径>
+# 期望日志：REVEAL_ZOOM_OK {"grew":true,"before":{"dx":0,...,"startVisible":true,"centerDelta":8},...}
+
+# 14) 缩放时以"用户选中的文段"为中心、开头可视（Markdown / DOCX / 纯文本）
+$env:LR_SMOKE='26000'
+$env:LR_SMOKE_COMMAND='smoke.anchorZoomText'
+& .\release\win-unpacked\LogicReader.exe --no-sandbox --user-data-dir=<隔离画像> <Markdown / DOCX / txt 路径>
+# 期望日志：ANCHOR_ZOOM_TEXT_OK {"grew":true,"after":{"visible":true,"centerDelta":0,...}}
 ```
 
-> **11/12 两条 PDF 冒烟会改标签页的视图状态**（缩放 / 旋转 / 视图模式）——它们跑在哪个画像上，
+> **11/12/13 三条 PDF 冒烟会改标签页的视图状态**（缩放 / 旋转 / 视图模式；13 临时放大 1.5 倍后自行还原，
+> 但会发一次 `hold` 定位请求）；**14 会临时放大文本阅读器 30%、写一次选区，跑完自行还原** ——它们跑在哪个画像上，
 > 哪个画像的会话快照就会被改。别拿用户的真实目录当试验场：加 `--user-data-dir=<隔离画像>`
 > （同上面第 4~8 条的规矩），或者跑完把标签页的视图改回去。
 
 **判定标准**：`MAPPING_AUDIT ok>0 bad=0`、`MAP_COVERAGE_OK skipped=0`、`SELECTION_MATCH`；
 `GRAPH_BINDING_OK`（标题 = `文档名 · 逻辑关系图`、关图后论文还在、能再调取、关论文时图一起关）；
 `GRAPH_JUMP_IDLE_OK`（单击没跳走）＋ `GRAPH_JUMP_OK`（锚点区间 == 定位请求区间、`flash` 落在目标页、
-**`rangeOk` 高亮范围 == 收拾过的区间**、**`holdOk` 2.6 秒后高亮仍在**、**`chainOk` 文段旁的面板指向同一节点且有相连项**）；
+**`rangeOk` 高亮范围 == 收拾过的区间**、**`holdOk` 2.6 秒后高亮仍在**、**`chainOk` 文段旁的面板指向同一节点且有相连项**、
+**`mapHoverOk` 悬停清单行时小图把该节点标出来（描边变粗）且移开即收起**、**`mapHoverPanOk` 被拖出窗口的节点在悬停时回到窗口内**）；
+另在 `GRAPH_JUMP_OK` 里：`mapLocatedOk`（跳转后小图直接定位当前节点：缩放 ≥90%、中心偏差 ≤24px）、
+`mapHoverRestoreOk` / `mapTapRestoreOk`（未选中的预览与空白处点击都要把视图还给"当前节点"）；
 `AGENT_PAYLOAD_OK`（问题文本与上下文都含**完整**选区、且问题里没有裸露的文案键）；
 `GRAPH_EDGE_OK`（拖拽产生新连线、`persistedOk` 已落库、DOM 边数 +1、同方向重复被拒）；
 `GRAPH_IMAGE_OK`（PNG 角落 `alpha=0` 且 SVG 无底色矩形、JPG 角落逐通道等于界面画布底色、尺寸 = SVG×2 且有内容）；
 `AGENT_UI_OK`（空态与欢迎块一致、档位弹层 4 项且当前项打勾、点"自动"真的改到 store 并**重建了会话**、面板与菜单/侧边栏/状态栏都没有裸露的文案键 `chromeKeyLeaks=0`）；
 `PDF_ZOOM_ROTATE_OK`（`drift<=2`：fit 完成后旋转两圈，滚动容器宽度不变、缩放倍率不失控）；
 `PDF_SPREAD_OK`（双页模式全篇都在、两页左右并排、下一行在下方、一对页能装进视口）；
+`REVEAL_ZOOM_OK`（跳转高亮在缩放后仍与同一段文字的文本层矩形逐边相等，且页面确实变大、**开头可视且居中** —— 缩放前把像素存进 state 的旧实现必然报 `dw/dh` 差出上百像素）；
+`ANCHOR_ZOOM_TEXT_OK`（用户选中的文段在缩放后仍居中、开头可视 —— 不重新对齐的旧行为实测偏移 383→584、居中偏差 246px，超过 1/4 屏阈值即报 `FAIL`）；
 且 `main.log` 里有 `矢量文本层：page=N span=M 来源=... 自校验bad=0`。
 
 > 跳转与图片冒烟**必须用隔离的 userData**（`--user-data-dir`，把 `logicreader.db` / `session.json` 拷进去）：

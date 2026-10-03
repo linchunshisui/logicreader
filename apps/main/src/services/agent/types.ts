@@ -54,7 +54,11 @@ export interface ConfigOption {
   description?: string
   category: 'model' | 'thought_level' | 'model_config' | 'mode' | string
   type: 'select' | 'boolean' | string
-  currentValue: string | boolean | null
+  /**
+   * 当前值。**可能是数组**：dsh 的 `model` 项就是一个 `[provider, model]` 路由
+   * （实测报文见 config-value.ts）。界面只把它当展示用，编码由 encodeConfigValue 负责。
+   */
+  currentValue: string | boolean | unknown[] | null
   options?: ConfigOptionValue[]
 }
 
@@ -68,6 +72,12 @@ export interface AgentCapability {
   executable: string | null
   /** 解析后的启动参数（.cmd shim 会转换成 node <script>） */
   launchArgs: string[]
+  /**
+   * 启动这个可执行文件**必须**带的环境变量（来自 shim 里写死的声明）。
+   * 例：DeepSeek Harness 桌面端自带的 `dsh.cmd` 靠 `ELECTRON_RUN_AS_NODE=1`
+   * 让 Electron 当 Node 跑它的 cli.js —— 少了这个变量，命令起来就报错。
+   */
+  launchEnv?: Record<string, string>
   supportsAcp: boolean
   /** 官方 SDK 通道（能切授权模式 / 中断 / 回退检查点） */
   supportsSdk: boolean
@@ -203,6 +213,14 @@ export interface SessionOptions {
   agentId: string
   /** 工作目录（默认使用隔离的只读影子目录） */
   cwd: string
+  /**
+   * 额外注入给 Agent 子进程的环境变量（已由 runtime 解析过 `secret:` 引用）。
+   *
+   * 用途：dsh（DeepSeek Harness）这类自带模型路由的 harness 要从环境读 API Key
+   * （`DEEPSEEK_API_KEY`）；没有这条通道时用户无法在程序里给它配密钥。
+   * **日志只允许打印变量名，不允许打印值**（见 env.ts 的 describeEnvNames）。
+   */
+  env?: Record<string, string>
   modelId?: string | null
   thinkingEffort?: string | null
   contextMode: 'fulltext' | 'graph'

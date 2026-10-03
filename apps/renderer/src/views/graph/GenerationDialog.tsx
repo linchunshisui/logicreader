@@ -55,6 +55,27 @@ export function GenerationDialog({ open, docId, docTitle, onClose, onStart }: Pr
     void api.graph.presets().then((list) => setPresets(list as never)).catch(() => undefined)
   }, [open])
 
+  /**
+   * 打开时把 Agent 选上：**当前选中的 Agent 可用就用它，否则挑第一个可用的真实 Agent**。
+   *
+   * 为什么需要：`agentId` 只在组件首次挂载时初始化。对话框第一次被打开时能力探测往往还没回来
+   * （或用户换过 Agent），于是选择框停在"请选择 Agent"、估算退到 mock ——
+   * 机器上只装了 dsh 的用户看到的就是"下拉里有 dsh，但默认不选它、按钮是灰的"。
+   */
+  useEffect(() => {
+    if (!open) return
+    const available = agent.agents.filter((item) => item.capability?.available)
+    if (agentId && available.some((item) => item.id === agentId)) return
+    const preferred =
+      (agent.selectedAgentId && available.some((item) => item.id === agent.selectedAgentId)
+        ? agent.selectedAgentId
+        : undefined) ??
+      available.find((item) => item.id !== 'mock')?.id ??
+      available[0]?.id ??
+      null
+    if (preferred && preferred !== agentId) setAgentId(preferred)
+  }, [open, agent.agents, agent.selectedAgentId, agentId])
+
   useEffect(() => {
     if (!open) return
     const timer = setTimeout(() => {
@@ -82,6 +103,8 @@ export function GenerationDialog({ open, docId, docTitle, onClose, onStart }: Pr
     [agent.agents, agentId]
   )
   const availableAgents = agent.agents.filter((item) => item.capability?.available)
+  /** 探测到但不可用的（装了没找到路径等）：也列进下拉但禁用，并带上原因 —— 不然"看不见"比"报错"更难查 */
+  const unavailableAgents = agent.agents.filter((item) => item.capability && !item.capability.available)
   /**
    * 模型清单以「CLI 亲口说的真实清单」为准（与 Agent 面板同一来源），拿不到时退到能力探测的兜底档位名。
    * 兜底清单只有 opus/sonnet/haiku 档位名；用户把 Claude Code 指向第三方代理后，
@@ -185,6 +208,11 @@ export function GenerationDialog({ open, docId, docTitle, onClose, onStart }: Pr
               <option key={item.id} value={item.id}>
                 {item.displayName}
                 {item.capability?.version ? ' ' + item.capability.version : ''}
+              </option>
+            ))}
+            {unavailableAgents.map((item) => (
+              <option key={item.id} value={item.id} disabled>
+                {item.displayName} · {t('settings.agent.unavailable')}
               </option>
             ))}
           </select>

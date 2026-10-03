@@ -4,18 +4,28 @@ import { logMain } from '../../util/ipc'
 import { agentRegistry } from './registry'
 import { SdkAdapter, asSdkHandle, toPermissionDetail, type SdkCanUseTool } from './sdk'
 import { asCodexHandle, type CodexCapableHandle } from './codex'
+import { fullLaunchArgs } from './cli'
 import { mapSdkModel, type ModelView } from './model-view'
+import { cleanSessionTitle, isInternalSession, resolveSessionTitle, shortSessionId } from './session-title'
+import { indexDshSessionLogs, readDshSessionHint } from './dsh-session-log'
+import { describeEnvNames } from './env'
 
-/** ACP 启动参数：优先取注册表里配置的参数。 */
+/**
+ * ACP 启动参数：**解释器前缀 + 注册参数**。
+ *
+ * 旧实现只取注册参数（`--profile acp`），于是"自带入口脚本"的 Agent（dsh 桌面端那种
+ * `.cmd` shim 解析成 `<exe> --expose-internals <cli.js>`）会被拉成 `<exe> --profile acp` ——
+ * 少了入口脚本，会话永远建不起来。见 cli.ts 的 fullLaunchArgs。
+ */
 function registrationArgs(agentId: string, capability: AgentCapability): string[] {
   const registration = agentRegistry.get(agentId)
   const args = registration?.args ?? []
-  if (args.length > 0) return args
-  return capability.launchArgs
+  return fullLaunchArgs(capability.launchArgs, args)
 }
 
 import { fsService } from '../fs.service'
 import { settingsService } from '../settings.service'
+import { storeService } from '../store.service'
 import type { AgentCapability, AgentEvent, AgentSessionHandle, PermissionDetail, PromptInput, SessionOptions } from './types'
 
 export interface CreateSessionRequest {
@@ -120,6 +130,8 @@ export class AgentRuntime {
     const options: SessionOptions = {
       agentId: request.agentId,
       cwd: workspaceDir,
+      // 密钥与环境变量：内置默认（dsh 的 DEEPSEEK_API_KEY）+ 注册表里的 env（secret: 引用走密钥库）
+      env: agentRegistry.resolveEnv(request.agentId),
       modelId: request.modelId ?? capability.defaultModel,
       thinkingEffort: request.thinkingEffort ?? capability.defaultThoughtLevel,
       contextMode: request.contextMode,
@@ -196,7 +208,7 @@ export class AgentRuntime {
         })
       } catch (error) {
         logMain('warn', 'agent', 'ACP 会话建立失败，回退 CLI', String(error))
-        onEvent({ type: 'error', message: 'ACP 连接失败，已回退 CLI：' + (error instanceof Error ? error.message : String(error)), retryable: true })
+        onEvent({ type: 'error', message: 'ACP 连接失败，已回退 CLI：' + (error instanceof Error ? error.message : String(error)) + acpHint(request.agentId), retryable: true })
       }
     }
     if (!handle) {
@@ -208,7 +220,9 @@ export class AgentRuntime {
       capability,
       handle,
       contextMode: request.contextMode,
-      configOptions: capability.configOptions,
+      // ACP 通道在 session/new 时已经把**真实**配置项（模型 / 思考强度）拿回来了：
+      // 用它，界面上的选择器就不必停在兜底目录上（dsh 的路由与档位只在这里是真的）。
+      configOptions: acpConfigOptions(handle) ?? capability.configOptions,
       createdAt: Date.now(),
       permissionMode,
       workspaceDir,
@@ -233,9 +247,12 @@ export class AgentRuntime {
         String(canWrite) +
         ' 执行=' +
         String(canExecute) +
+        ' 注入环境变量=' +
+        // 只打变量名：值里可能有密钥（见 env.ts 的约定）
+        describeEnvNames(options.env ?? {}) +
         '）'
     )
-    return { sessionId, capability, configOptions: capability.configOptions, workspaceDir }
+    return { sessionId, capability, configOptions: session.configOptions, workspaceDir }
   }
 
   /**
@@ -247,6 +264,8 @@ export class AgentRuntime {
     prompt: string
     modelId?: string | null
     thinkingEffort?: string | null
+    /** 续聊这条远端会话再问（"总结命名"要用：ACP 没有读回放，只有续聊能带上上下文） */
+    resumeSessionId?: string | null
     contextMode?: 'fulltext' | 'graph'
     documentDir?: string | null
     signal?: { cancelled: boolean }
@@ -260,6 +279,7 @@ export class AgentRuntime {
       contextMode: request.contextMode ?? 'fulltext',
       modelId: request.modelId ?? null,
       thinkingEffort: request.thinkingEffort ?? null,
+      resumeSessionId: request.resumeSessionId ?? null,
       documentDir: request.documentDir ?? null,
       /**
        * 一次性任务的两个"无人值守"约定（§35 实测的坑）：
@@ -384,6 +404,15 @@ export class AgentRuntime {
         return []
       }
     }
+    /**
+     * ACP 通道**没有**"随时问一次模型清单"的方法：它的模型/思考强度来自 `session/new`
+     * 的 configOptions，会话创建时就已经交给界面了（见 createSession）。这里不是错误，
+     * 所以不写 warn —— 否则每建一个 ACP 会话都会在日志里留一条吓人的"没有模型清单能力"。
+     */
+    if (session?.capability.protocol === 'acp') {
+      logMain('debug', 'agent', 'ACP 会话的模型清单来自 session/new 的 configOptions，界面沿用会话创建时下发的那一份')
+      return []
+    }
     logMain('warn', 'agent', '取模型清单：该会话没有模型清单能力（sessionId=' + sessionId + '）')
     return []
   }
@@ -506,16 +535,154 @@ export class AgentRuntime {
       const capability = agentRegistry.capability(agentId)
       if (registration?.kind === 'codex' && capability?.protocol === 'app-server') {
         const { listCodexSessionsFor } = await import('./codex')
-        return listCodexSessionsFor({
+        const rows = await listCodexSessionsFor({
           executable: registration.executable,
           extraArgs: registration.args,
           cwd: target,
           limit
         })
+        return this.withSessionTitles(agentId, rows)
+      }
+      /**
+       * ACP 通道（dsh 的 `--profile acp`）自己持久化会话，并且从 0.2 起实现了
+       * `session/list` —— 拿得到就把它当"历史会话"来源，续聊才有东西可选。
+       * 拿不到（老版本 / 别的 ACP 工具没实现）就安静地落回 CLI 会话记录。
+       */
+      if (capability?.protocol === 'acp' && capability.executable && capability.supportsResume) {
+        const { listAcpSessions } = await import('./acp')
+        const rows = await listAcpSessions({
+          executable: capability.executable,
+          args: capability.launchArgs,
+          cwd: target,
+          env: agentRegistry.resolveEnv(agentId),
+          limit,
+          /**
+           * 给足时间：这一趟要**新起一个 ACP 进程**（面板里往往已经有一个在跑），
+           * 冷启动 + profile 载入实测能到十几秒，15 秒会偶发超时。
+           */
+          timeoutMs: 30_000
+        })
+        if (rows.length > 0) {
+          return this.withSessionTitles(
+            agentId,
+            rows.map((row) => ({
+            sessionId: row.sessionId,
+              summary: row.title ?? undefined,
+              customTitle: row.title ?? undefined,
+            cwd: row.cwd,
+            lastModified: row.updatedAt ? Date.parse(row.updatedAt) : undefined
+            }))
+          )
+        }
+        /**
+         * ACP 通道拿不到就**到此为止**，不要再落回 Claude 的会话记录。
+         *
+         * 实测踩到：dsh 这条 ACP 列表偶发失败时，落回 SDK 的 `listSessions` 会把
+         * **另一个工具（Claude Code）的会话**列在 dsh 名下 —— 用户看到一堆
+         * "你是严谨的文档逻辑结构抽取器…"，完全对不上。宁可空着说"还没有历史会话"。
+         */
+        return []
       }
     }
     const { listSessionsFor } = await import('./sdk')
-    return listSessionsFor(target, limit)
+    const rows = await listSessionsFor(target, limit)
+    return this.withSessionTitles(agentId, rows)
+  }
+
+  /**
+   * 给历史会话补一个**人能看懂的名字**（用户的原话：应该支持总结命名）。
+   *
+   * 各通道的原生字段参差不齐（dsh 的 `session/list` 只给 sessionId + cwd），
+   * 所以这里统一走 `resolveSessionTitle`：我们自己存的名字 → Agent 给的名字 →
+   * 我们自己记的"首条提问" → Agent 给的首条提问；全都没有就留空，
+   * 由界面显示"未命名会话 + 短 id"（`shortSessionId`），而不是把整串 UUID 摆出来。
+   */
+  private withSessionTitles(agentId: string | null, rows: unknown[]): unknown[] {
+    let hidden = 0
+    /**
+     * dsh 的会话日志索引（只建一次）：ACP 的 `session/list` 不给标题，
+     * 但 dsh 自己把**标题**与**第一句提问**写在 `~/.dsh/sessions/**` 的日志里
+     * （见 dsh-session-log.ts）。这里用它给"没名字"的会话补默认标题 ——
+     * 用户的要求就是"根据第一句提问给个默认标题"。
+     */
+    const dshLogs = agentId ? indexDshSessionLogs() : null
+    const out = rows.map((raw) => {
+      const row = raw as Record<string, unknown>
+      const sessionId = String(row.sessionId ?? '')
+      if (!sessionId) return raw
+      /**
+       * 内部任务（图谱抽取这类 `runOnce`）不算"历史会话"：CLI 会把它们也存下来，
+       * 列表里塞满"你是严谨的文档逻辑结构抽取器…"对用户毫无意义。命中就不列。
+       */
+      if (isInternalSession(row.firstPrompt as string | undefined) || isInternalSession(row.summary as string | undefined)) {
+        hidden += 1
+        return null
+      }
+      const stored = agentId ? storeService.sessionTitleGet(agentId, sessionId) : null
+      const ours = agentId ? storeService.conversationTitleForRemoteSession(agentId, sessionId) : null
+      let agentTitle = (row.customTitle as string | undefined) ?? (row.summary as string | undefined)
+      let firstPrompt = (row.firstPrompt as string | undefined) ?? null
+      if (!stored && !agentTitle && !ours && !firstPrompt && dshLogs) {
+        const file = dshLogs.get(sessionId)
+        if (file) {
+          const hint = readDshSessionHint(file)
+          agentTitle = hint.title ?? undefined
+          firstPrompt = hint.firstUserText
+        }
+      }
+      const resolved = resolveSessionTitle({
+        stored,
+        agentTitle,
+        ourTitle: ours,
+        firstPrompt
+      })
+      return {
+        ...row,
+        title: resolved.title,
+        titleSource: resolved.source,
+        // 桌面端会话的 id 带 `session-` 前缀，显示时去掉（"未命名会话 · 5db998b4" 比 "session-" 可读）
+        shortId: shortSessionId(sessionId.replace(/^session-/, ''))
+      }
+    })
+    if (hidden > 0) logMain('debug', 'agent', '历史会话里滤掉内部任务 ' + hidden + ' 条（图谱抽取等 runOnce 会话）')
+    return out.filter((item) => item !== null)
+  }
+
+  /**
+   * 让 Agent 用一句话给某个历史会话"总结命名"（用户点一下才发生，一次很小的模型调用）。
+   *
+   * 实现要点：**续聊那条会话**（`resumeSessionId`）再问标题 —— 这样模型手里有那段上下文，
+   * 而 ACP 通道没有"读回放"的能力（`session/load` 明确不支持），只有续聊能拿到上下文。
+   * 拿不到上下文（比如会话已被清理、或该 Agent 不支持 resume）时退回"用首条提问做标题"。
+   */
+  async nameSession(request: { agentId: string; sessionId: string; firstPrompt?: string | null }): Promise<string | null> {
+    const prompt = [
+      '请用**不超过 12 个字**的中文短语概括我们之前这段对话的主题，作为会话标题。',
+      '只输出标题本身：不要引号、不要标点结尾、不要解释、不要换行。'
+    ].join('\n')
+    try {
+      const { text } = await this.runOnce({
+        agentId: request.agentId,
+        prompt,
+        contextMode: 'fulltext',
+        resumeSessionId: request.sessionId,
+        timeoutMs: 90_000
+      })
+      const title = cleanSessionTitle(text, 24)
+      if (title) {
+        storeService.sessionTitleSet({ agentId: request.agentId, sessionId: request.sessionId, title, source: 'ai' })
+        logMain('info', 'agent', '会话总结命名：' + request.sessionId + ' → ' + title)
+        return title
+      }
+    } catch (error) {
+      logMain('warn', 'agent', '会话总结命名失败（回退用首条提问）：' + String(error))
+    }
+    const fallback = cleanSessionTitle(request.firstPrompt ?? null)
+    if (fallback) {
+      storeService.sessionTitleSet({ agentId: request.agentId, sessionId: request.sessionId, title: fallback, source: 'ai' })
+      return fallback
+    }
+    return null
   }
 
   /** 逐块回退：把某次改动里指定的块恢复成改动前（只有 SDK 通道有基线）。 */
@@ -760,3 +927,27 @@ function sdkToolKind(toolName: string): string {
 }
 
 export const agentRuntime = new AgentRuntime()
+
+/**
+ * ACP 握手失败时的补充提示。
+ *
+ * dsh 的 ACP 通道是"自带模型路由"的：密钥（`DEEPSEEK_API_KEY`）没配时它会在建会话阶段
+ * 直接报错，用户看到的就是一句英文异常 —— 这里补一句"去哪儿配"。
+ */
+function acpHint(agentId: string): string {
+  const registration = agentRegistry.get(agentId)
+  if (registration?.kind !== 'dsh') return ''
+  const configured = agentRegistry.hasCredentials(agentId)
+  return configured
+    ? '（dsh 提示：ACP 会话由 `dsh --profile acp` 提供，profile 首次使用会自动初始化；若一直失败，可在终端手动跑一次 `dsh --profile acp --help` 看它自己的报错）'
+    : '（dsh 提示：还没配 DeepSeek API Key —— 到「设置 → Agent」填一个，程序会以 DEEPSEEK_API_KEY 注入给 dsh）'
+}
+
+/**
+ * ACP 会话自己量到的配置项（模型 / 思考强度）。
+ * 只有 `AcpSession` 有 `options` 这个 getter —— 其它通道结构上拿不到，返回 null 表示"沿用能力清单"。
+ */
+function acpConfigOptions(handle: AgentSessionHandle): unknown[] | null {
+  const options = (handle as { options?: unknown }).options
+  return Array.isArray(options) && options.length > 0 ? options : null
+}

@@ -34,9 +34,16 @@ export function GraphChainPanel({ docId }: { docId: string }): JSX.Element | nul
    * 每次真正跳转（新的定位请求）都会把它清掉：跳转结果永远优先。
    */
   const [previewId, setPreviewId] = useState<string | null>(null)
+  /**
+   * 悬停预览的节点：鼠标指到下面的清单行（或键盘聚焦到它）时，上方小图把对应节点标出来。
+   * 与 `previewId`（单击选中、会**切换右侧信息**）区分开 —— 悬停只做"看见它在哪"，
+   * 不改面板内容、不移动论文，所以鼠标一扫而过不会把面板刷得乱七八糟。
+   */
+  const [hoverId, setHoverId] = useState<string | null>(null)
   const nonce = request?.nonce ?? 0
   useEffect(() => {
     setPreviewId(null)
+    setHoverId(null)
   }, [nonce])
 
   const chain = request?.chain
@@ -78,9 +85,14 @@ export function GraphChainPanel({ docId }: { docId: string }): JSX.Element | nul
       <button
         key={edge.id}
         className="lr-chain__row"
+        data-peer-node={peer.id}
         disabled={busy}
         onClick={() => void jumpToPeer(peer)}
         title={peer.title}
+        onMouseEnter={() => setHoverId(peer.id)}
+        onMouseLeave={() => setHoverId((current) => (current === peer.id ? null : current))}
+        onFocus={() => setHoverId(peer.id)}
+        onBlur={() => setHoverId((current) => (current === peer.id ? null : current))}
       >
         <span className="lr-chain__swatch" style={{ background: NODE_KIND_COLOR[peer.kind] ?? '#8a8a8a' }} />
         <span className="lr-chain__edge">
@@ -117,6 +129,7 @@ export function GraphChainPanel({ docId }: { docId: string }): JSX.Element | nul
           edges={graph.edges}
           positions={positions}
           busy={busy}
+          hoverId={hoverId}
           onInspect={(peer) => setPreviewId(peer.id)}
           onJump={(peer) => void jumpToPeer(peer)}
         />

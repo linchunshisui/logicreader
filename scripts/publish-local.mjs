@@ -18,14 +18,19 @@ if (!existsSync(join(src, 'LogicReader.exe'))) {
 }
 
 // robocopy 退出码 0-7 都算成功（>=8 才是失败），不能用 execFileSync 的默认判定
+//
+// **必须显式给重试次数**：robocopy 默认 `/R:1000000 /W:30` —— 目标里只要有文件被占用
+// （最常见的就是"应用还开着"，app.asar / exe 被独占），它会**静静地重试到天荒地老**，
+// 于是 `pnpm publish:local` 看起来像卡死（本轮实测：卡了 3 分钟还没有任何输出）。
+// 改成快速失败：重试 2 次、每次等 1 秒，失败就让退出码说话。
 let code = 0
 try {
-  execFileSync('robocopy', [src, dst, '/MIR', '/NFL', '/NDL', '/NJH', '/NP'], { stdio: 'inherit' })
+  execFileSync('robocopy', [src, dst, '/MIR', '/NFL', '/NDL', '/NJH', '/NP', '/R:2', '/W:1'], { stdio: 'inherit' })
 } catch (error) {
   code = typeof error.status === 'number' ? error.status : 8
 }
 if (code > 7) {
-  console.error('robocopy 失败，退出码 ' + code)
+  console.error('robocopy 失败，退出码 ' + code + '（目标文件被占用？先关掉正在运行的 LogicReader 再发布）')
   process.exit(1)
 }
 

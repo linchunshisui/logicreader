@@ -128,10 +128,10 @@ export async function resolveCodexExecutable(configured?: string | null): Promis
   if (bundled) {
     // 只有在 PATH / 用户配置都拿不到时才用它，所以这里会打日志，便于排查"到底跑的是哪一份"
     logMain('info', 'codex', '使用 VS Code 扩展自带的 codex：' + bundled)
-    return { command: bundled, prefixArgs: [], source: bundled, error: null }
+    return { command: bundled, prefixArgs: [], env: {}, source: bundled, error: null }
   }
   if (trimmed.length > 0) {
-    return { command: '', prefixArgs: [], source: null, error: '未找到可执行文件：' + trimmed }
+    return { command: '', prefixArgs: [], env: {}, source: null, error: '未找到可执行文件：' + trimmed }
   }
   return resolveAgentExecutable('codex', null)
 }

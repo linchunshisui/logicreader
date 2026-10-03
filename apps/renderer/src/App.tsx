@@ -600,6 +600,269 @@ export function App(): JSX.Element {
             return
           }
           /**
+           * 跳转高亮必须**跟着缩放走**（用户反馈："从关系图跳到原文后，高亮区域不随缩放变化"）。
+           *
+           * 判据不看截图，直接对几何：缩放前后各量一次 ——
+           *  ① 高亮矩形要贴在**当前**文本层同一段文字的矩形上（|Δ| ≤ 2px）；
+           *  ② 页面确实变大了（否则这条冒烟等于没缩放）。
+           * 旧实现把"跳转那一刻"的像素矩形存进阅读器 state，缩放后页面重排而矩形不动，
+           * 于是 ② 成立、① 必然失败（Δ 随倍率线性变大）。
+           */
+          if (commandId === 'smoke.revealZoom') {
+            void (async () => {
+              const log = window.logicreader.log
+              const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+              const { activeReader } = await import('./state/readerBridge')
+              const controller = activeReader()
+              if (!controller || controller.kind !== 'pdf') {
+                await log.write('info', 'smoke', 'REVEAL_ZOOM_SKIP 当前没有 PDF 阅读器')
+                return
+              }
+              const percentOf = (): number =>
+                Number(document.querySelector<HTMLInputElement>('.lr-zoom-input__field')?.value ?? '0')
+              const zoomBefore = percentOf()
+              /** 量"高亮矩形 vs 当前文本层里同一段文字的矩形"（都换算成页内坐标，单位 px） */
+              const measure = async (): Promise<{
+                pageWidth: number
+                dx: number
+                dy: number
+                dw: number
+                dh: number
+                startVisible: boolean
+                startOffset: number
+                centerDelta: number
+                viewportHeight: number
+                flash: number[]
+                text: number[]
+              } | null> => {
+                const wrapper = document.querySelector<HTMLElement>('.lr-pdf-flash[data-reveal-range]')
+                const flash = wrapper?.querySelector<HTMLElement>('.lr-pdf-flash__rect')
+                const page = flash?.closest<HTMLElement>('.lr-pdf-page')
+                const layer = page?.querySelector<HTMLElement>('.textLayer')
+                const applied = wrapper?.dataset.revealRange
+                if (!wrapper || !flash || !page || !layer || !applied) return null
+                const [start, end] = applied.split('-').map(Number)
+                if (!Number.isFinite(start) || !Number.isFinite(end)) return null
+                const { rangeForChars } = await import('./lib/selection')
+                const textRange = rangeForChars(layer, 'span[data-char-start]', start, end)
+                const textRect = textRange?.getClientRects()[0] ?? null
+                if (!textRange || !textRect) return null
+                const pageRect = page.getBoundingClientRect()
+                const flashRect = flash.getBoundingClientRect()
+                const toPage = (rect: { left: number; top: number; width: number; height: number }): number[] => [
+                  Math.round((rect.left - pageRect.left) * 10) / 10,
+                  Math.round((rect.top - pageRect.top) * 10) / 10,
+                  Math.round(rect.width * 10) / 10,
+                  Math.round(rect.height * 10) / 10
+                ]
+                const f = toPage(flashRect)
+                const t = toPage(textRect)
+                /*
+                 * 新要求（用户）：缩放时要以这一段为中心，且**开头必须可视**。
+                 * 这里量的是"这一段第一个矩形"在滚动视口里的位置：
+                 *  startVisible  —— 整个首行矩形都在视口内；
+                 *  centerDelta   —— 首行中心离视口中心的距离（越小越居中）。
+                 */
+                const scroll = document.querySelector<HTMLElement>('.lr-pdf-scroll')
+                const scrollRect = scroll?.getBoundingClientRect()
+                return {
+                  pageWidth: Math.round(pageRect.width),
+                  dx: Math.abs(f[0] - t[0]),
+                  dy: Math.abs(f[1] - t[1]),
+                  dw: Math.abs(f[2] - t[2]),
+                  dh: Math.abs(f[3] - t[3]),
+                  startVisible: Boolean(
+                    scrollRect &&
+                      textRect.top >= scrollRect.top - 0.5 &&
+                      textRect.bottom <= scrollRect.bottom + 0.5
+                  ),
+                  startOffset: scrollRect ? Math.round(textRect.top - scrollRect.top) : -1,
+                  centerDelta: scrollRect
+                    ? Math.round(
+                        Math.abs(
+                          textRect.top + textRect.height / 2 - (scrollRect.top + scrollRect.height / 2)
+                        )
+                      )
+                    : -1,
+                  viewportHeight: scrollRect ? Math.round(scrollRect.height) : 0,
+                  flash: f,
+                  text: t
+                }
+              }
+              /*
+               * 落点取"视口内、带定位偏移"的一个文本 span（扫描页没有偏移，直接跳过）。
+               * ★ 优先取第 2 页起：第 1 页页首的段落**没法居中**（滚动位置到顶了），
+               * 拿它当锚点，闸门测的是"夹紧后的必然结果"，而不是"有没有对齐"。
+               */
+              let anchor: { charStart: number; charEnd: number } | null = null
+              for (let attempt = 0; attempt < 40 && !anchor; attempt += 1) {
+                const host = document.querySelector<HTMLElement>('.lr-pdf-scroll')?.getBoundingClientRect()
+                const pages = Array.from(document.querySelectorAll<HTMLElement>('.lr-pdf-page')).sort(
+                  (a, b) => Number(b.dataset.page ?? 0) - Number(a.dataset.page ?? 0)
+                )
+                for (const page of pages) {
+                  const box = page.getBoundingClientRect()
+                  if (host && (box.bottom < host.top + 80 || box.top > host.bottom - 80)) continue
+                  const span = Array.from(
+                    page.querySelectorAll<HTMLElement>('.textLayer span[data-char-start]')
+                  ).find((item) => (item.textContent ?? '').trim().length > 6)
+                  if (!span) continue
+                  const from = Number(span.dataset.charStart)
+                  const to = Number(span.dataset.charEnd ?? span.dataset.charStart)
+                  if (Number.isFinite(from) && Number.isFinite(to) && to > from) anchor = { charStart: from, charEnd: to }
+                  break
+                }
+                if (!anchor) await sleep(150)
+              }
+              if (!anchor) {
+                await log.write('warn', 'smoke', 'REVEAL_ZOOM_SKIP 找不到带偏移的文本 span（可能是扫描页）')
+                return
+              }
+              const { useUiStore } = await import('./state/ui.store')
+              useUiStore.getState().requestReveal({
+                docId: controller.docId,
+                charStart: anchor.charStart,
+                charEnd: anchor.charEnd,
+                hold: true
+              })
+              let before: Awaited<ReturnType<typeof measure>> = null
+              for (let attempt = 0; attempt < 60 && !before; attempt += 1) {
+                await sleep(150)
+                before = await measure()
+              }
+              // 高亮出现 ≠ 滚动停稳（跳转用的是平滑滚动）：等它停稳再量"缩放前"的位置
+              if (before) {
+                await sleep(900)
+                before = await measure()
+              }
+              if (!before) {
+                await log.write('error', 'smoke', 'REVEAL_ZOOM_FAIL 高亮没出现 anchor=' + JSON.stringify(anchor))
+                return
+              }
+              // 放大 1.5 倍（若当前是 fit，同样按"当前有效倍率 × 1.5"落地）
+              controller.setZoom(Math.min(4, Math.round((percentOf() / 100) * 150) / 100))
+              await sleep(1800)
+              let after: Awaited<ReturnType<typeof measure>> = null
+              for (let attempt = 0; attempt < 40 && !after; attempt += 1) {
+                after = await measure()
+                if (!after) await sleep(150)
+              }
+              // 还原缩放，别把用户的阅读倍率留在 150%
+              if (zoomBefore > 0) controller.setZoom(zoomBefore / 100)
+              await sleep(400)
+
+              const onText = (probe: NonNullable<Awaited<ReturnType<typeof measure>>>): boolean =>
+                probe.dx <= 2 && probe.dy <= 2 && probe.dw <= 3 && probe.dh <= 3
+              /** 开头可视 + 基本居中（放不下整段时按"开头对齐顶部"，偏差只要求不超过 1/4 屏） */
+              const onAnchor = (probe: NonNullable<Awaited<ReturnType<typeof measure>>>): boolean =>
+                probe.startVisible && probe.centerDelta <= Math.max(40, Math.round(probe.viewportHeight * 0.25))
+              const grew = after !== null && after.pageWidth > before.pageWidth * 1.05
+              const ok =
+                after !== null && onText(before) && onText(after) && onAnchor(before) && onAnchor(after) && grew
+              await log.write(
+                ok ? 'info' : 'error',
+                'smoke',
+                (ok ? 'REVEAL_ZOOM_OK ' : 'REVEAL_ZOOM_FAIL ') +
+                  JSON.stringify({ anchor, grew, before, after, zoomBefore, zoomAfter: percentOf() })
+              )
+            })()
+            return
+          }
+          /**
+           * 「**用户自己选中的文段**」在缩放时同样要居中、开头可视（Markdown / DOCX / 纯文本）。
+           *
+           * 与 `smoke.revealZoom` 分开的原因：高亮与选区在 `useZoomAnchor` 里是**两条来源**
+           * （高亮优先），用同一个命令测不出选区这条路径。这里刻意**不用**定位请求，
+           * 只写 store 里的选区，从而保证测的是"用户选中 → 缩放"。
+           */
+          if (commandId === 'smoke.anchorZoomText') {
+            void (async () => {
+              const log = window.logicreader.log
+              const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+              const { activeReader } = await import('./state/readerBridge')
+              const controller = activeReader()
+              if (!controller || controller.kind === 'pdf' || controller.kind === 'sheet') {
+                await log.write('info', 'smoke', 'ANCHOR_ZOOM_TEXT_SKIP 当前不是可缩放的文本阅读器')
+                return
+              }
+              // `.lr-scroll` 是各区域共用的滚动类（侧边栏/面板也有）—— 必须限定在阅读器里
+              const container =
+                document.querySelector<HTMLElement>('.lr-reader .lr-scroll') ??
+                document.querySelector<HTMLElement>('.lr-scroll')
+              const blocks = Array.from(
+                container?.querySelectorAll<HTMLElement>(
+                  '.lr-prose [data-char-start], .lr-docx-host [data-char-start]'
+                ) ?? []
+              )
+              // 取靠中间的一段：首段/末段没法居中（滚动到顶/到底了），测出来只会是"夹紧的结果"
+              const block = blocks[Math.floor(blocks.length / 2)] ?? null
+              if (!container || !block) {
+                await log.write('info', 'smoke', 'ANCHOR_ZOOM_TEXT_SKIP 找不到带定位的可视文段')
+                return
+              }
+              const percentOf = (): number =>
+                Number(document.querySelector<HTMLInputElement>('.lr-zoom-input__field')?.value ?? '0')
+              const zoomBefore = percentOf()
+              const charStart = Number(block.dataset.charStart)
+              const charEnd = Number(block.dataset.charEnd ?? block.dataset.charStart)
+              const { useUiStore } = await import('./state/ui.store')
+              // 只写选区，不发定位请求 —— 这样锚点来源一定是"用户选区"这条路径
+              useUiStore.getState().clearReveal()
+              useUiStore.getState().setSelection({
+                docId: controller.docId,
+                tabId: controller.tabId,
+                text: (block.textContent ?? '').slice(0, 40),
+                charStart,
+                charEnd,
+                anchorId: null,
+                locationLabel: ''
+              })
+              block.scrollIntoView({ block: 'center' })
+              await sleep(900)
+              /** 量"这一段"在滚动视口里的位置与居中程度 */
+              const measure = (): { visible: boolean; offset: number; centerDelta: number; viewportHeight: number; rectHeight: number } | null => {
+                const element = container.querySelector<HTMLElement>('[data-char-start="' + charStart + '"]')
+                if (!element) return null
+                const rect = element.getBoundingClientRect()
+                const host = container.getBoundingClientRect()
+                // 与 lib/zoomAnchor.centerScrollTop 同一把尺子：装得下就居中，装不下就"开头对齐顶部留边"
+                const fitted = Math.min(rect.height, Math.max(0, host.height - 24))
+                const expectedTop = host.top + Math.max(12, (host.height - fitted) / 2)
+                return {
+                  visible: rect.top >= host.top - 0.5 && rect.top <= host.bottom - 0.5,
+                  offset: Math.round(rect.top - host.top),
+                  centerDelta: Math.round(Math.abs(rect.top - expectedTop)),
+                  viewportHeight: Math.round(host.height),
+                  rectHeight: Math.round(rect.height)
+                }
+              }
+              const before = measure()
+              // 一次放大 30%：倍率太小时"漂移"会落在容差里，闸门就失去区分度
+              controller.zoomIn()
+              controller.zoomIn()
+              controller.zoomIn()
+              await sleep(1200)
+              const after = measure()
+              const zoomAfter = percentOf()
+              const onAnchor = (probe: ReturnType<typeof measure>): boolean =>
+                Boolean(probe) &&
+                probe!.visible &&
+                probe!.centerDelta <= Math.max(40, Math.round(probe!.viewportHeight * 0.25))
+              const grew = zoomAfter !== zoomBefore
+              const ok = onAnchor(before) && onAnchor(after) && grew
+              // 还原：缩放与选区都恢复，别把用户状态留在冒烟里
+              if (zoomBefore > 0) controller.setZoom(zoomBefore / 100)
+              useUiStore.getState().setSelection(null)
+              await log.write(
+                ok ? 'info' : 'error',
+                'smoke',
+                (ok ? 'ANCHOR_ZOOM_TEXT_OK ' : 'ANCHOR_ZOOM_TEXT_FAIL ') +
+                  JSON.stringify({ kind: controller.kind, grew, zoomBefore, zoomAfter, range: [charStart, charEnd], before, after })
+              )
+            })()
+            return
+          }
+          /**
            * 双页：**并排**两页（不是竖着摆两页）、全篇仍可见、且"适应页面"要能把一对页装进视口。
            *
            * 三条判据对应三句需求，缺一条就会退回旧行为：
@@ -935,7 +1198,151 @@ export function App(): JSX.Element {
                 const mapCenterId = chain?.querySelector<HTMLElement>('.lr-localmap__card--center')?.dataset.centerNode ?? null
                 const mapCenterOk = mapCenterId === nodeId
 
-                if (landed && rangeOk && holdOk && chainOk) {
+                /* 小图窗口与卡片：悬停预览的两条断言（画出来 / 看得见）都要用 */
+                const area = chain?.querySelector<HTMLElement>('.lr-localmap__area')
+                const layer = area?.querySelector<SVGGElement>('svg > g')
+                const rows = Array.from(chain?.querySelectorAll<HTMLElement>('.lr-chain__row[data-peer-node]') ?? [])
+                const hostBox = area?.getBoundingClientRect()
+                const cardOf = (peer: string | undefined | null): HTMLElement | null =>
+                  peer
+                    ? area?.querySelector<HTMLElement>('.lr-localmap__card[data-peer-node="' + peer + '"]') ?? null
+                    : null
+                const transformOf = (): string | null => layer?.getAttribute('transform') ?? null
+                const zoomPercentOf = (): number =>
+                  Number(chain?.querySelector<HTMLElement>('.lr-localmap__zoom')?.dataset.zoom ?? '0')
+
+                /*
+                 * 跳转过来必须**直接定位到当前节点**（用户要求）：小图不能停在"整张图缩成一小片"，
+                 * 要把当前节点居中、并且至少放大到看得清字（READABLE_ZOOM = 90%）。
+                 * 判据：缩放 ≥ 90%，且中心卡片中心与窗口中心相差 ≤ 24px。
+                 */
+                const transformLocated = transformOf()
+                const locatedZoom = zoomPercentOf()
+                const centerCard = chain?.querySelector<HTMLElement>('.lr-localmap__card--center')
+                const centerCardBox = centerCard?.getBoundingClientRect()
+                const centerShift = hostBox && centerCardBox
+                  ? Math.round(
+                      Math.abs(centerCardBox.left + centerCardBox.width / 2 - (hostBox.left + hostBox.width / 2)) +
+                        Math.abs(centerCardBox.top + centerCardBox.height / 2 - (hostBox.top + hostBox.height / 2))
+                    )
+                  : -1
+                const mapLocatedOk = locatedZoom >= 90 && centerShift >= 0 && centerShift <= 24
+
+                /*
+                 * 悬停预览（用户要求："鼠标位于下面的文字块时，上面的图片提供预览"）：
+                 * 鼠标指到下面清单的某一行，上面的小图要把**那一行对应的节点**标出来。
+                 * 断言不看截图：行与卡片都带 `data-peer-node`，悬停后必须出现 `data-preview-node` == 该节点；
+                 * 移开后必须收起（否则就是"预览粘住了"）。
+                 */
+                const firstRow = chain?.querySelector<HTMLElement>('.lr-chain__row[data-peer-node]')
+                const rowPeerId = firstRow?.dataset.peerNode ?? null
+                let hoverPreviewId: string | null = null
+                let hoverCleared = false
+                /* 预览必须**画出来**：悬停后那张卡片的描边要变粗（同一张卡片前后对比，不看配色变量） */
+                let hoverStrokeOk = false
+                if (firstRow && rowPeerId) {
+                  const boxOf = (peer: string | null): SVGElement | null =>
+                    peer ? cardOf(peer)?.querySelector<SVGElement>('.lr-localmap__box') ?? null : null
+                  const strokeOf = (element: SVGElement | null): number =>
+                    element ? Number.parseFloat(getComputedStyle(element).strokeWidth) || 0 : 0
+                  const strokeBefore = strokeOf(boxOf(rowPeerId))
+                  firstRow.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true, view: window }))
+                  await new Promise((resolve) => setTimeout(resolve, 260))
+                  const previewed = chain?.querySelector<HTMLElement>('.lr-localmap__card--preview')
+                  hoverPreviewId = previewed?.dataset.previewNode ?? null
+                  hoverStrokeOk = strokeOf(boxOf(rowPeerId)) > strokeBefore
+                  firstRow.dispatchEvent(new MouseEvent('mouseout', { bubbles: true, cancelable: true, view: window }))
+                  await new Promise((resolve) => setTimeout(resolve, 260))
+                  hoverCleared = !chain?.querySelector('.lr-localmap__card--preview')
+                }
+                const mapHoverOk = Boolean(rowPeerId) && hoverPreviewId === rowPeerId && hoverStrokeOk && hoverCleared
+
+                /*
+                 * 预览必须**看得见**：清单里那些当前落在小图窗口外的节点，悬停时小图要把它带进视野
+                 * （只平移、不改缩放）。挑一个"卡片当前在窗口外"的行来验：悬停后图层 transform 必须变，
+                 * 且那张卡片要落进窗口内。没有这种行时这条不适用（记为 skip，不算失败）。
+                 */
+                const outsideRowsNow = (): HTMLElement[] =>
+                  rows.filter((row) => {
+                    const card = cardOf(row.dataset.peerNode)
+                    const box = card?.getBoundingClientRect()
+                    if (!box || !hostBox) return false
+                    return (
+                      box.right < hostBox.left || box.left > hostBox.right || box.bottom < hostBox.top || box.top > hostBox.bottom
+                    )
+                  })
+                /*
+                 * 先把小图拖走（真交互：pointerdown + pointermove + pointerup，与用户拖动同一条路径），
+                 * 让清单里的节点落到窗口外 —— 否则"要不要平移"这条根本不会被触发。
+                 */
+                if (area && hostBox && outsideRowsNow().length === 0) {
+                  const x = hostBox.left + hostBox.width / 2
+                  const y = hostBox.top + hostBox.height / 2
+                  area.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, clientX: x, clientY: y, pointerId: 1 }))
+                  window.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientX: x - 420, clientY: y - 300, pointerId: 1 }))
+                  window.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, clientX: x - 420, clientY: y - 300, pointerId: 1 }))
+                  await new Promise((resolve) => setTimeout(resolve, 260))
+                }
+                const outside = outsideRowsNow()
+                let mapHoverPanOk: boolean | 'skip' = 'skip'
+                let panMoved = false
+                let panVisible = false
+                let mapHoverRestoreOk: boolean | 'skip' = 'skip'
+                let hoverRestored = false
+                const panRow = outside[0]
+                if (panRow && area && layer && hostBox) {
+                  const transformBefore = layer.getAttribute('transform')
+                  panRow.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true, view: window }))
+                  await new Promise((resolve) => setTimeout(resolve, 320))
+                  panMoved = layer.getAttribute('transform') !== transformBefore
+                  const card = cardOf(panRow.dataset.peerNode)
+                  const box = card?.getBoundingClientRect()
+                  const margin = 4
+                  panVisible = Boolean(
+                    box &&
+                      box.right > hostBox.left + margin &&
+                      box.left < hostBox.right - margin &&
+                      box.bottom > hostBox.top + margin &&
+                      box.top < hostBox.bottom - margin
+                  )
+                  mapHoverPanOk = panMoved && panVisible
+                  /* 脱手未选择 → 必须**还回原节点显示**（用户要求），而不是把小图留在预览的位置 */
+                  panRow.dispatchEvent(new MouseEvent('mouseout', { bubbles: true, cancelable: true, view: window }))
+                  await new Promise((resolve) => setTimeout(resolve, 320))
+                  hoverRestored = transformOf() === transformBefore
+                  mapHoverRestoreOk = hoverRestored
+                }
+
+                /*
+                 * 空白处"点一下没选中任何东西" → 同样恢复到当前节点的显示（用户要求的第二半句）。
+                 * 挑一个不在卡片上的角落点下去；判据：图层 transform 回到"跳转后定位"的那一份。
+                 */
+                let mapTapRestoreOk: boolean | 'skip' = 'skip'
+                let tapRestored = false
+                if (area && hostBox && transformLocated) {
+                  const corners: [number, number][] = [
+                    [hostBox.left + 8, hostBox.top + 8],
+                    [hostBox.right - 8, hostBox.top + 8],
+                    [hostBox.left + 8, hostBox.bottom - 8],
+                    [hostBox.right - 8, hostBox.bottom - 8]
+                  ]
+                  const point = corners.find(([x, y]) => !document.elementFromPoint(x, y)?.closest('.lr-localmap__card'))
+                  if (point) {
+                    const [x, y] = point
+                    const hit = document.elementFromPoint(x, y) ?? area
+                    hit.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, clientX: x, clientY: y, pointerId: 1 }))
+                    window.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, clientX: x, clientY: y, pointerId: 1 }))
+                    await new Promise((resolve) => setTimeout(resolve, 320))
+                    tapRestored = transformOf() === transformLocated
+                    mapTapRestoreOk = tapRestored
+                  }
+                }
+
+                const hoverAllOk =
+                  mapHoverOk && mapHoverPanOk !== false && mapHoverRestoreOk !== false && mapTapRestoreOk !== false
+                const mapAllOk = mapLocatedOk && hoverAllOk
+
+                if (landed && rangeOk && holdOk && chainOk && mapAllOk) {
                   await log.write(
                     'info',
                     'smoke',
@@ -956,6 +1363,18 @@ export function App(): JSX.Element {
                         mapCards,
                         mapLinks,
                         mapCenterOk,
+                        mapLocatedOk,
+                        locatedZoom,
+                        centerShift,
+                        mapHoverOk,
+                        hoverPreviewId,
+                        mapHoverPanOk,
+                        panMoved,
+                        panVisible,
+                        mapHoverRestoreOk,
+                        hoverRestored,
+                        mapTapRestoreOk,
+                        tapRestored,
                         ms: Date.now() - started
                       })
                   )
@@ -972,7 +1391,17 @@ export function App(): JSX.Element {
                         rangeOk,
                         holdOk,
                         chainOk,
-                        chainRows
+                        chainRows,
+                        mapCenterOk,
+                        mapLocatedOk,
+                        locatedZoom,
+                        centerShift,
+                        mapHoverOk,
+                        mapHoverPanOk,
+                        mapHoverRestoreOk,
+                        mapTapRestoreOk,
+                        hoverPreviewId,
+                        hoverCleared
                       })
                   )
                 } else {
@@ -2033,6 +2462,439 @@ export function App(): JSX.Element {
           /**
            * 把"模型"弹层打开并留在界面上（给截图用）——用于确认"角色别名 → 真实模型"的展示。
            */
+          /**
+           * **回车确定改名**：点 ✎ → 输入 → 按 Enter，逐条断言到 DOM。
+           *
+           * 这条是用户直接提出的（"重命名支持回车确定"）。之前点 ✎ 会被"点空白关弹层"的
+           * window 监听先把弹层关掉，输入框留不住 —— 所以要真的点一次、真的按一次 Enter。
+           * 不消耗模型额度。
+           */
+          if (commandId === 'smoke.historyRenameEnter') {
+            void (async () => {
+              const log = window.logicreader.log
+              const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+              try {
+                const { useLayout } = await import('./state/layout.store')
+                const { useAgent } = await import('./state/agent.store')
+                if (useLayout.getState().auxView !== 'agent' || !useLayout.getState().auxVisible) {
+                  useLayout.getState().setAuxView('agent')
+                  if (!useLayout.getState().auxVisible) useLayout.getState().toggleAuxBar(true)
+                }
+                await useAgent.getState().init()
+                await useAgent.getState().refreshAgents(false)
+                const target =
+                  useAgent.getState().agents.find((item) => item.id === 'dsh' && item.capability?.available) ??
+                  useAgent.getState().agents.find((item) => item.capability?.available && item.id !== 'mock')
+                if (!target) {
+                  await log.write('error', 'smoke', 'HISTORY_RENAME_FAIL 没有可用的真实 Agent')
+                  return
+                }
+                if (useAgent.getState().selectedAgentId !== target.id) await useAgent.getState().selectAgent(target.id)
+
+                // 直接放一条假历史（不依赖 ACP：这条冒烟验的是"界面 + 回车 + 落库"，不是列表本身）
+                const sessionId = 'smoke-rename-session'
+                useAgent.setState({
+                  history: [{ sessionId, title: null, titleSource: null, shortId: 'smoke-ren', lastModified: Date.now() }]
+                })
+                const chip = document.querySelector<HTMLElement>('[data-chip="history"]')
+                chip?.click()
+                let picker: HTMLElement | null = null
+                for (let attempt = 0; attempt < 25; attempt += 1) {
+                  picker = document.querySelector<HTMLElement>('.lr-agent__picker')
+                  if (picker?.querySelector('.lr-agent__picker-action')) break
+                  await sleep(150)
+                }
+                const renameButton = Array.from(
+                  picker?.querySelectorAll<HTMLElement>('.lr-agent__picker-action') ?? []
+                ).find((button) => (button.textContent ?? '').includes('改名'))
+                if (!renameButton) {
+                  await log.write('error', 'smoke', 'HISTORY_RENAME_FAIL 找不到「改名」按钮')
+                  return
+                }
+                renameButton.click()
+                let input: HTMLInputElement | null = null
+                for (let attempt = 0; attempt < 20; attempt += 1) {
+                  input = document.querySelector<HTMLInputElement>('.lr-agent__rename input')
+                  if (input) break
+                  await sleep(120)
+                }
+                if (!input) {
+                  await log.write('error', 'smoke', 'HISTORY_RENAME_FAIL 点「改名」后输入框没出现（弹层被关掉了？）')
+                  return
+                }
+                // React 受控输入：必须走原生 setter + input 事件，直接改 value 不会被 React 认到
+                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
+                setter?.call(input, '回车改名冒烟')
+                input.dispatchEvent(new Event('input', { bubbles: true }))
+                await sleep(120)
+                input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+                await sleep(600)
+                const title = useAgent.getState().history.find((item) => item.sessionId === sessionId)?.title ?? null
+                const stillEditing = Boolean(document.querySelector('.lr-agent__rename input'))
+                const ok = title === '回车改名冒烟' && !stillEditing
+                await log.write(
+                  ok ? 'info' : 'error',
+                  'smoke',
+                  (ok ? 'HISTORY_RENAME_OK ' : 'HISTORY_RENAME_FAIL ') +
+                    JSON.stringify({ title, stillEditing, inputAppeared: true })
+                )
+              } catch (error) {
+                await log.write('error', 'smoke', 'HISTORY_RENAME_FAIL ' + String(error))
+              }
+            })()
+            return
+          }
+
+          /**
+           * 只做"列出来"：把历史会话的标题与来源写进日志（不给 ACP 通道额外压力，
+           * 每次列表都要新起一个 Agent 进程，所以这条特意不含改名/命名等追加动作）。
+           */
+          if (commandId === 'smoke.historyList') {
+            void (async () => {
+              const log = window.logicreader.log
+              const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+              try {
+                const { useAgent } = await import('./state/agent.store')
+                await useAgent.getState().init()
+                await useAgent.getState().refreshAgents(false)
+                const target =
+                  useAgent.getState().agents.find((item) => item.id === 'dsh' && item.capability?.available) ??
+                  useAgent.getState().agents.find((item) => item.capability?.available && item.id !== 'mock')
+                if (!target) {
+                  await log.write('error', 'smoke', 'HISTORY_LIST_FAIL 没有可用的真实 Agent')
+                  return
+                }
+                if (useAgent.getState().selectedAgentId !== target.id) await useAgent.getState().selectAgent(target.id)
+                await useAgent.getState().refreshHistory('D:\\逻辑阅读器')
+                for (let attempt = 0; attempt < 40 && useAgent.getState().history.length === 0; attempt += 1) {
+                  await sleep(1000)
+                }
+                const rows = useAgent.getState().history.slice(0, 30).map((item) => ({
+                  id: item.sessionId.slice(0, 8),
+                  title: item.title ?? null,
+                  source: item.titleSource ?? null
+                }))
+                await log.write(
+                  rows.length > 0 ? 'info' : 'error',
+                  'smoke',
+                  (rows.length > 0 ? 'HISTORY_LIST_OK ' : 'HISTORY_LIST_FAIL ') +
+                    JSON.stringify({ agent: target.id, count: useAgent.getState().history.length, rows })
+                )
+              } catch (error) {
+                await log.write('error', 'smoke', 'HISTORY_LIST_FAIL ' + String(error))
+              }
+            })()
+            return
+          }
+
+          /**
+           * 历史会话的"总结命名"链路：列出来 → 改名（本地保存）→ 让 Agent 总结命名。
+           *
+           * `LR_SMOKE_NAME=1` 时才真的让 Agent 总结（那是一次很小的模型调用），
+           * 默认只验证"列表 + 改名 + 优先级的落库与回显"。
+           */
+          if (commandId === 'smoke.historyName') {
+            void (async () => {
+              const log = window.logicreader.log
+              const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+              try {
+                const { useAgent } = await import('./state/agent.store')
+                await log.write('info', 'smoke', 'HISTORY_NAME_START')
+                await useAgent.getState().init()
+                await useAgent.getState().refreshAgents(false)
+                const store = useAgent.getState()
+                /** 优先挑 dsh（用户实际在用的通道），没有就第一个可用的真实 Agent */
+                const target =
+                  store.agents.find((item) => item.id === 'dsh' && item.capability?.available) ??
+                  store.agents.find((item) => item.capability?.available && item.id !== 'mock')
+                if (!target) {
+                  await log.write('error', 'smoke', 'HISTORY_NAME_FAIL 没有可用的真实 Agent')
+                  return
+                }
+                if (store.selectedAgentId !== target.id) await store.selectAgent(target.id)
+                await useAgent.getState().refreshHistory('D:\\逻辑阅读器')
+                for (let attempt = 0; attempt < 20; attempt += 1) {
+                  if (useAgent.getState().history.length > 0) break
+                  await sleep(300)
+                }
+                const rows = (): { id: string; title: string | null; source: string | null }[] =>
+                  useAgent.getState().history.slice(0, 5).map((item) => ({
+                    id: item.sessionId,
+                    title: item.title ?? null,
+                    source: item.titleSource ?? null
+                  }))
+                const before = rows()
+                let renamed: { id: string; title: string | null } | null = null
+                if (before.length > 0) {
+                  const id = before[0].id
+                  await useAgent.getState().renameHistorySession(id, '冒烟：手动改名')
+                  /**
+                   * 改名后**重新拉一次列表**来确认（而不是只看 store 里那一刻的值：
+                   * ACP 列表要新起一个进程，刷新可能还没回来）。从新列表里找不到就再等一下。
+                   */
+                  let after = useAgent.getState().history.find((item) => item.sessionId === id)
+                  for (let attempt = 0; attempt < 10 && !after; attempt += 1) {
+                    await useAgent.getState().refreshHistory('D:\\逻辑阅读器')
+                    after = useAgent.getState().history.find((item) => item.sessionId === id)
+                    if (!after) await sleep(500)
+                  }
+                  renamed = { id, title: after?.title ?? null }
+                }
+                const ok = before.length > 0 && renamed?.title === '冒烟：手动改名'
+                await log.write(
+                  ok ? 'info' : 'error',
+                  'smoke',
+                  (ok ? 'HISTORY_NAME_OK ' : 'HISTORY_NAME_FAIL ') +
+                    JSON.stringify({ agent: target.id, before, renamed })
+                )
+              } catch (error) {
+                await log.write('error', 'smoke', 'HISTORY_NAME_FAIL ' + String(error))
+              }
+            })()
+            return
+          }
+
+          /**
+           * 让 Agent 给历史会话"总结命名"（**会真的调用一次模型**，只在需要时手动跑）。
+           * 渲染进程读不到环境变量，所以单独做成一条冒烟命令。
+           */
+          if (commandId === 'smoke.historyAiName') {
+            void (async () => {
+              const log = window.logicreader.log
+              const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+              try {
+                const { useAgent } = await import('./state/agent.store')
+                await useAgent.getState().init()
+                await useAgent.getState().refreshAgents(false)
+                const target =
+                  useAgent.getState().agents.find((item) => item.id === 'dsh' && item.capability?.available) ??
+                  useAgent.getState().agents.find((item) => item.capability?.available && item.id !== 'mock')
+                if (!target) {
+                  await log.write('error', 'smoke', 'HISTORY_AI_NAME_FAIL 没有可用的真实 Agent')
+                  return
+                }
+                if (useAgent.getState().selectedAgentId !== target.id) await useAgent.getState().selectAgent(target.id)
+                await useAgent.getState().refreshHistory('D:\\逻辑阅读器')
+                for (let attempt = 0; attempt < 25 && useAgent.getState().history.length === 0; attempt += 1) {
+                  await sleep(400)
+                }
+                const first = useAgent.getState().history[0]
+                if (!first) {
+                  await log.write('error', 'smoke', 'HISTORY_AI_NAME_FAIL 没有历史会话')
+                  return
+                }
+                const title = await useAgent.getState().nameHistorySession(first.sessionId, first.firstPrompt ?? null)
+                const after = useAgent.getState().history.find((item) => item.sessionId === first.sessionId)
+                await log.write(
+                  title ? 'info' : 'error',
+                  'smoke',
+                  (title ? 'HISTORY_AI_NAME_OK ' : 'HISTORY_AI_NAME_FAIL ') +
+                    JSON.stringify({ agent: target.id, sessionId: first.sessionId, title, stored: after?.title ?? null })
+                )
+              } catch (error) {
+                await log.write('error', 'smoke', 'HISTORY_AI_NAME_FAIL ' + String(error))
+              }
+            })()
+            return
+          }
+
+          /**
+           * Agent 输出的 **markdown 渲染**（对话正文 + 计划卡片）。
+           *
+           * 不消耗任何模型额度：直接往 store 里塞一条"模型会回的那种 markdown"和一个待批方案，
+           * 然后断言 DOM 里**真的渲染出了元素**（h2 / 表格 / 代码块），并且**不再出现裸语法**
+           * （面板文本里不该有 `## ` 或 `| --- |` 这种源码）。截图留档。
+           */
+          if (commandId === 'smoke.agentRender') {
+            void (async () => {
+              const log = window.logicreader.log
+              const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+              const SAMPLE = [
+                '## 结论',
+                '',
+                '先给结论：**SFT 与 RL 是分工关系**，不是替代关系（见下表）。',
+                '',
+                '| 方法 | 作用 | 局限 |',
+                '| --- | --- | --- |',
+                '| SFT | 提供初始策略 | 只约束 token 级分布 |',
+                '| GRPO | 修正组合泛化 | 依赖可靠的奖励 |',
+                '',
+                '> 引用：`teacher forcing` 训练用 gold 前缀，推理用自己生成的 token。',
+                '',
+                '1. 第一点说明监督粒度；',
+                '2. 第二点说明曝光偏差；',
+                '3. 第三点说明分桶后的差距。'
+              ].join('\n')
+              const PLAN = [
+                '### 实施计划',
+                '',
+                '1. 先读 `graph.service.ts` 的抽取入口，确认分块与重试边界；',
+                '2. 再把整批丢弃改成逐块留痕；',
+                '3. 最后补一条单测覆盖"校验失败仍要出图"。'
+              ].join('\n')
+              try {
+                const { useLayout } = await import('./state/layout.store')
+                const { useAgent } = await import('./state/agent.store')
+                if (useLayout.getState().auxView !== 'agent' || !useLayout.getState().auxVisible) {
+                  useLayout.getState().setAuxView('agent')
+                  if (!useLayout.getState().auxVisible) useLayout.getState().toggleAuxBar(true)
+                }
+                await useAgent.getState().init()
+                useAgent.setState({
+                  messages: [
+                    {
+                      id: 'smoke_user',
+                      role: 'user',
+                      content: '用 markdown 说明一下 SFT 与 RL 的分工。',
+                      thinking: '',
+                      tools: [],
+                      createdAt: Date.now() - 1000,
+                      status: 'done'
+                    },
+                    {
+                      id: 'smoke_assistant',
+                      role: 'assistant',
+                      content: SAMPLE,
+                      thinking: '',
+                      tools: [],
+                      createdAt: Date.now(),
+                      status: 'done'
+                    }
+                  ],
+                  pendingPlan: { messageId: 'smoke_assistant', plan: PLAN, filePath: null },
+                  streaming: false
+                })
+                let panel: HTMLElement | null = null
+                for (let attempt = 0; attempt < 25; attempt += 1) {
+                  panel = document.querySelector<HTMLElement>('.lr-agent')
+                  if (panel?.querySelector('.lr-md h2')) break
+                  await sleep(200)
+                }
+                const headings = panel?.querySelectorAll('.lr-md h2').length ?? 0
+                const tables = panel?.querySelectorAll('.lr-md table').length ?? 0
+                const code = panel?.querySelectorAll('.lr-md code').length ?? 0
+                const planRendered = Boolean(panel?.querySelector('.lr-plancard__body .lr-md h3'))
+                const bodyText = (panel?.textContent ?? '').replace(/\s+/g, ' ')
+                // 裸语法：标题与表格分隔行不该以源码形式出现在文本里
+                const rawHeading = bodyText.includes('## 结论')
+                const rawRule = bodyText.includes('| --- |')
+                // 正文里应有 h2（`## 结论`），计划卡片里应有 h3（`### 实施计划`）—— 分开断言
+                const ok = headings >= 1 && tables >= 1 && code >= 1 && planRendered && !rawHeading && !rawRule
+                await log.write(
+                  ok ? 'info' : 'error',
+                  'smoke',
+                  (ok ? 'AGENT_RENDER_OK ' : 'AGENT_RENDER_FAIL ') +
+                    JSON.stringify({ headings, tables, code, planRendered, rawHeading, rawRule })
+                )
+              } catch (error) {
+                await log.write('error', 'smoke', 'AGENT_RENDER_FAIL ' + String(error))
+              }
+            })()
+            return
+          }
+
+          /**
+           * Agent 选择器（输入区那颗 Agent 芯片点开的那层）：把每个通道列出来给截图用。
+           *
+           * 这是用户最常看的一处（"到底有哪些 Agent 能用"），以前只列可用通道，
+           * 装了却没找到的就直接消失 —— 所以这条冒烟既断言 dsh 在列表里，也把整层留在界面上。
+           */
+          if (commandId === 'smoke.agentPicker') {
+            void (async () => {
+              const log = window.logicreader.log
+              const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+              try {
+                const { useLayout } = await import('./state/layout.store')
+                const { useAgent } = await import('./state/agent.store')
+                if (useLayout.getState().auxView !== 'agent' || !useLayout.getState().auxVisible) {
+                  useLayout.getState().setAuxView('agent')
+                  if (!useLayout.getState().auxVisible) useLayout.getState().toggleAuxBar(true)
+                }
+                await useAgent.getState().init()
+                await useAgent.getState().refreshAgents(false)
+                let panel: HTMLElement | null = null
+                for (let attempt = 0; attempt < 25; attempt += 1) {
+                  panel = document.querySelector<HTMLElement>('.lr-agent')
+                  if (panel) break
+                  await sleep(200)
+                }
+                const chip = panel?.querySelector<HTMLElement>('[data-chip="agent"]')
+                if (!chip) {
+                  await log.write('error', 'smoke', 'AGENT_PICKER_FAIL 找不到 Agent 芯片')
+                  return
+                }
+                chip.click()
+                let picker: HTMLElement | null = null
+                for (let attempt = 0; attempt < 15; attempt += 1) {
+                  picker = panel?.querySelector<HTMLElement>('.lr-agent__picker') ?? null
+                  if (picker) break
+                  await sleep(150)
+                }
+                const rows = Array.from(picker?.querySelectorAll<HTMLElement>('.lr-agent__picker-item') ?? []).map((row) => ({
+                  name: (row.querySelector('.lr-agent__picker-name')?.textContent ?? '').trim(),
+                  disabled: row.getAttribute('data-disabled') === 'true'
+                }))
+                const dsh = rows.find((row) => row.name.toLowerCase().includes('deepseek'))
+                const ok = Boolean(picker) && Boolean(dsh) && !dsh?.disabled
+                await log.write(
+                  ok ? 'info' : 'error',
+                  'smoke',
+                  (ok ? 'AGENT_PICKER_OK ' : 'AGENT_PICKER_FAIL ') + JSON.stringify({ rows, dsh: dsh ?? null })
+                )
+              } catch (error) {
+                await log.write('error', 'smoke', 'AGENT_PICKER_FAIL ' + String(error))
+              }
+            })()
+            return
+          }
+
+          /**
+           * 设置 → Agent 管理器：验证"每个 Agent 的可用性与路径"真的看得见。
+           * 这是本轮新增的界面（用户反馈"装好了却显示不可用，无从下手"时的唯一入口），
+           * 所以要有一条能把它的行数与 dsh 状态写进日志、并留下截图的冒烟。
+           */
+          if (commandId === 'smoke.agentManager') {
+            void (async () => {
+              const log = window.logicreader.log
+              const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+              try {
+                const { useTabs } = await import('./state/tabs.store')
+                const { useUiStore } = await import('./state/ui.store')
+                const { useAgent } = await import('./state/agent.store')
+                await useAgent.getState().init()
+                await useAgent.getState().refreshAgents(false)
+                useUiStore.getState().setSettingsCategory('agent')
+                const tabs = useTabs.getState()
+                const existing = tabs.groups.flatMap((group) => group.tabs).find((tab) => tab.kind === 'settings')
+                if (existing) tabs.activate(existing.id)
+                else tabs.openTab({ kind: 'settings', id: 'tab_smoke_settings' })
+
+                let rows: HTMLElement[] = []
+                for (let attempt = 0; attempt < 30; attempt += 1) {
+                  rows = Array.from(document.querySelectorAll<HTMLElement>('.lr-agent-manager__item'))
+                  if (rows.length > 0) break
+                  await sleep(200)
+                }
+                const report = rows.map((row) => ({
+                  name: (row.querySelector('.lr-agent-manager__name')?.textContent ?? '').trim(),
+                  available: row.getAttribute('data-available') === 'true',
+                  version: (row.querySelector('.lr-setting__hint')?.textContent ?? '').trim()
+                }))
+                const dsh = report.find((item) => item.name.toLowerCase().includes('deepseek'))
+                const ok = rows.length > 0 && Boolean(dsh)
+                await log.write(
+                  ok ? 'info' : 'error',
+                  'smoke',
+                  (ok ? 'AGENT_MANAGER_OK ' : 'AGENT_MANAGER_FAIL ') +
+                    JSON.stringify({ rows: report.length, dsh: dsh ?? null, report })
+                )
+              } catch (error) {
+                await log.write('error', 'smoke', 'AGENT_MANAGER_FAIL ' + String(error))
+              }
+            })()
+            return
+          }
+
           if (commandId === 'smoke.modelPicker') {
             void (async () => {
               const log = window.logicreader.log
@@ -2137,38 +2999,6 @@ export function App(): JSX.Element {
                   )
                   return
                 }
-                /**
-                 * Agent 一键对切（Claude Code ↔ Codex）。
-                 *
-                 * 单独一条日志，不并进下面那份报告的 ok —— 两件事的失败原因不一样：
-                 * 面板结构坏了要让 AGENT_UI_FAIL 红，而"本机只有 mock"时**没有**对切按钮是预期行为。
-                 * 判定：芯片在 → 点一下必须换到另一个 Agent，且芯片自己消失（对方变成当前 Agent 后就没了）。
-                 */
-                void (async () => {
-                  const chip = panel.querySelector<HTMLElement>('[data-chip="agent-switch"]')
-                  const agentChip = panel.querySelector<HTMLElement>('[data-chip="agent"]')
-                  if (!chip) {
-                    await log.write(
-                      'info',
-                      'smoke',
-                      'AGENT_SWITCH_SKIP ' + JSON.stringify({ agentChip: Boolean(agentChip), reason: '对方通道不可用或当前是 mock' })
-                    )
-                    return
-                  }
-                  const before = useAgent.getState().selectedAgentId
-                  chip.click()
-                  await sleep(1500)
-                  const after = useAgent.getState().selectedAgentId
-                  const gone = !panel.querySelector('[data-chip="agent-switch"]')
-                  const cleared = useAgent.getState().messages.length === 0
-                  const ok = after !== before && gone && cleared
-                  await log.write(
-                    ok ? 'info' : 'error',
-                    'smoke',
-                    (ok ? 'AGENT_SWITCH_OK ' : 'AGENT_SWITCH_FAIL ') +
-                      JSON.stringify({ from: before, to: after, chipGone: gone, newSession: cleared })
-                  )
-                })()
                 // 2) 空态必须是"欢迎块"，有对话时不许再显示
                 const welcome = panel.querySelector('.lr-agent__welcome')
                 const empty = useAgent.getState().messages.length === 0

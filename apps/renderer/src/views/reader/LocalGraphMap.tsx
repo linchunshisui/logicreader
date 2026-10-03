@@ -43,6 +43,11 @@ interface Props {
   /** 全局画布那份坐标（关系图 store 的 positions）；缺项时退回节点自带的 x/y */
   positions: Record<string, { x: number; y: number }>
   busy: boolean
+  /**
+   * 悬停预览的节点：鼠标指向**下方清单里的某一行**时，图上把对应节点标出来。
+   * 与 `onInspect`（单击切换右侧信息）区分开：悬停只做"看见它在哪"，不改内容、不移动论文。
+   */
+  hoverId?: string | null
   /** 单击：只在右侧把信息切到这个节点（不移动论文） */
   onInspect: (node: GraphNode) => void
   /** 双击（或回车）：跳到这个节点的原文 */
@@ -60,7 +65,16 @@ function truncate(text: string, limit: number): string {
   return text.length > limit ? text.slice(0, limit) + '…' : text
 }
 
-export function LocalGraphMap({ centerId, nodes, edges, positions, busy, onInspect, onJump }: Props): JSX.Element | null {
+export function LocalGraphMap({
+  centerId,
+  nodes,
+  edges,
+  positions,
+  busy,
+  hoverId,
+  onInspect,
+  onJump
+}: Props): JSX.Element | null {
   const { t, i18n } = useTranslation()
   const locale = i18n.language
   const [mode, setMode] = useState<ViewMode>('whole')
@@ -110,21 +124,30 @@ export function LocalGraphMap({ centerId, nodes, edges, positions, busy, onInspe
   }, [world, centerId])
 
   /**
-   * 焦点跑到窗口外了（比如顺着逻辑链跳到很远的一段）才把它拉回视野中间。
+   * **跳转过来就直接定位到当前节点**（用户要求）：换中心节点（= 一次跳转）时，
+   * 把它居中并保证至少放大到看得清字（`focusViewport`：用户已经放得更大就只居中、不回缩）。
+   * 旧实现只在"焦点跑到窗口外"时才居中，于是跳过来看到的是**整张图缩成一小片**，找不到当前节点。
    *
    * **只对"中心节点变了"这件事做一次**（`handledFocusRef` 记住处理过哪个节点）：
    * 否则用户一拖动、焦点离开窗口，effect 就会把视图拽回去 —— 那正是"锁定在某个节点上"的来源。
    * 用户手动拖动 / 缩放之后，视图归用户管，直到下一次真的换了中心节点。
    */
   const handledFocusRef = useRef<string | null>(null)
+  /** 悬停预览"挪动前"的视口：null = 这一轮预览没动过视图，或者用户已经选中、不必恢复 */
+  const previewReturnRef = useRef<Viewport | null>(null)
   useEffect(() => {
     if (!viewport || !focusPoint || size.width === 0) return
     if (handledFocusRef.current === centerId) return
     handledFocusRef.current = centerId
-    const screen = toScreen(viewport, focusPoint)
-    const inside = screen.x > 0 && screen.x < size.width && screen.y > 0 && screen.y < size.height
-    if (inside) return
-    setViewport((current) => (current ? centerOn(current, focusPoint.x, focusPoint.y, size.width, size.height) : current))
+    /*
+     * 跳转 = 新的"原节点显示"：旧的预览恢复目标作废。
+     * 不然顺着清单跳走时，"悬停预览的恢复"会在同一个 commit 里把视图拽回**跳之前**的位置
+     * （本 effect 声明在前、先跑，恢复 effect 随后覆盖 —— 两者打架）。
+     */
+    previewReturnRef.current = null
+    setViewport((current) =>
+      current ? focusViewport(current, focusPoint.x, focusPoint.y, size.width, size.height) : current
+    )
   }, [centerId, focusPoint, viewport, size.width, size.height])
 
   const zoomBy = useCallback(
@@ -133,6 +156,44 @@ export function LocalGraphMap({ centerId, nodes, edges, positions, busy, onInspe
     },
     [size.width, size.height]
   )
+
+  /**
+   * 悬停预览：鼠标指到**下面清单的某一行**时，把那一行对应的节点带进视野。
+   * 只平移、**不改缩放** —— 预览是"看一眼它在哪"，不该动用户刚调好的倍率。
+   * 预览是**临时的**：`previewReturnRef` 记住挪动前的视口，鼠标一离开（没点选任何节点）
+   * 就把它恢复回去 —— 用户要求"若未选择而脱手则恢复原节点显示"。
+   * 与焦点 effect 同一套做法：记住"已经为哪个节点做过一次"，否则用户一拖动就会被拽回来。
+   */
+  const handledHoverRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!hoverId) {
+      handledHoverRef.current = null
+      return
+    }
+    if (mode !== 'whole' || !viewport || size.width === 0) return
+    if (handledHoverRef.current === hoverId) return
+    const point = world.get(hoverId)
+    if (!point) return
+    handledHoverRef.current = hoverId
+    const center = { x: point.x + GRAPH_NODE_WIDTH / 2, y: point.y + GRAPH_NODE_HEIGHT / 2 }
+    const screen = toScreen(viewport, center)
+    const margin = 12
+    const inside =
+      screen.x > margin && screen.x < size.width - margin && screen.y > margin && screen.y < size.height - margin
+    if (inside) return
+    // 记住"预览之前"的视口（只在第一行触发预览时记一次：连续扫过几行也只回得到原处）
+    if (!previewReturnRef.current) previewReturnRef.current = viewport
+    setViewport((current) => (current ? centerOn(current, center.x, center.y, size.width, size.height) : current))
+  }, [hoverId, mode, viewport, world, size.width, size.height])
+
+  /** 脱手未选择 → 把预览挪走的视图还回去（用户要求："若未选择而脱手则恢复原节点显示"） */
+  useEffect(() => {
+    if (hoverId) return
+    const previous = previewReturnRef.current
+    if (!previous) return
+    previewReturnRef.current = null
+    setViewport(previous)
+  }, [hoverId])
 
   const fitNow = useCallback((): void => {
     if (bounds && size.width > 0) setViewport(fitViewport(bounds, size.width, size.height))
@@ -179,10 +240,19 @@ export function LocalGraphMap({ centerId, nodes, edges, positions, busy, onInspe
       draggedRef.current = true
       setViewport((current) => (current ? { ...current, tx: start.tx + dx, ty: start.ty + dy } : current))
     }
-    const onUp = (): void => {
+    const onUp = (up: PointerEvent): void => {
       window.removeEventListener('pointermove', onMove)
       window.removeEventListener('pointerup', onUp)
       window.removeEventListener('pointercancel', onUp)
+      /*
+       * 脱手时**什么也没选中**（没拖动，松手的地方也不是卡片）→ 恢复"当前节点"的显示。
+       * 用户要求："若未选择而脱手则恢复原节点显示" —— 在空白处点一下就把视角送回当前节点，
+       * 不用再去找工具栏里的「定位当前节点」。
+       */
+      if (draggedRef.current || busy) return
+      const target = up.target as Element | null
+      if (target?.closest?.('.lr-localmap__card')) return
+      locateNow()
     }
     window.addEventListener('pointermove', onMove)
     window.addEventListener('pointerup', onUp)
@@ -237,18 +307,27 @@ export function LocalGraphMap({ centerId, nodes, edges, positions, busy, onInspe
      */
     const inspect = (): void => {
       if (input.focus || draggedRef.current) return
+      /* 选中了 → 预览不再是"临时的"，别再把人送回去 */
+      previewReturnRef.current = null
       onInspect(input.node)
     }
     const open = (): void => {
       if (busy || draggedRef.current) return
+      previewReturnRef.current = null
       onJump(input.node)
     }
     return (
       <g
         key={input.node.id}
-        className={'lr-localmap__card ' + (input.focus ? 'lr-localmap__card--center' : 'lr-localmap__card--peer')}
+        className={
+          'lr-localmap__card ' +
+          (input.focus ? 'lr-localmap__card--center' : 'lr-localmap__card--peer') +
+          /* 悬停预览：与点击选中区分开 —— 只是"标出来"，不换内容、不跳转 */
+          (input.node.id === hoverId ? ' lr-localmap__card--preview' : '')
+        }
         data-center-node={input.focus ? input.node.id : undefined}
         data-peer-node={input.focus ? undefined : input.node.id}
+        data-preview-node={input.node.id === hoverId ? input.node.id : undefined}
         style={{ ['--lm-color']: color } as CSSProperties}
         /*
          * 双击在**所有**卡片上都有效，包括中心卡片：

@@ -238,15 +238,39 @@ export function planModeReminder(locale: 'zh-CN' | 'en-US'): string {
   if (locale === 'en-US') {
     return [
       '[Permission mode: plan]',
+      '- First judge whether this task actually needs a plan. Read-only requests (explain, search, summarize, answer) get a direct answer — do not invent steps or a plan just to follow a process.',
+      '- Only when the user asks you to change files/run commands, or the work genuinely takes several steps with trade-offs, present a short ordered plan (goal, steps, files to touch, risks) and stop for approval.',
       '- Do not modify files and do not run state-changing commands.',
-      '- First output a short, ordered plan (goal, steps, files to touch, risks), then stop and wait for the user.'
     ].join('\n')
   }
   return [
     '【授权模式：计划】',
+    '- 先判断这个任务**是否真的需要计划**：只是解释、检索、总结、回答这类**只读**请求，就直接给出结论，不要编步骤、也不要为了走流程而写方案；',
+    '- 只有当用户要求你改动文件 / 执行命令，或这件事确实分多步且有取舍时，才先给出简短有序的方案（目标、步骤、会改到哪些文件、风险），然后停下等用户确认；',
     '- 不要修改文件，也不要执行会改变状态的命令；',
-    '- 先给出简短有序的方案（目标、步骤、会改到哪些文件、风险），然后停下等用户确认。'
   ].join('\n')
+}
+
+/**
+ * 这段回答**看起来像一份方案**吗？（计划模式下的兜底判定；纯函数、有单测）
+ *
+ * 用途：有些通道（ACP / CLI）的模型不会调 `ExitPlanMode`，界面以前的兜底是
+ * "这一轮结束就把最后一段回答当成方案弹卡片" —— 于是**任何**回答都会变成待批准计划
+ * （用户对计划模式"死板"的直接观感就是这么来的）。
+ * 现在只在回答确实长得像方案时才弹：
+ *  1. 太短的不算（< 40 字：一两句话的答复不是方案）；
+ *  2. 带"方案 / 计划 / 步骤 / 实施 / 打算 / Plan / Approach / Steps"这类小标题的算；
+ *  3. 或者有明显分步结构（≥3 条列表）且正文里出现"步骤 / 阶段 / 先…再"这类词。
+ *
+ * 长度阈值只卡"分步结构"那一条分支：中文很密，一段 100 字的方案已经写全了目标与三步，
+ * 拿英文的长度直觉（120+）去卡会把真方案判成普通回答（第一版就是这么翻车的，有单测兜着）。
+ */
+export function looksLikePlan(text: string): boolean {
+  const body = (text ?? '').trim()
+  if (body.length < 40) return false
+  if (/^#{1,4}\s*.*?(方案|计划|步骤|实施|打算|Plan|Approach|Steps|Implementation)/im.test(body)) return true
+  const bullets = body.match(/^\s*(?:\d+[.)、]|[-*])\s+/gm) ?? []
+  return body.length >= 80 && bullets.length >= 3 && /(步骤|阶段|第一步|Step\s*1|先.{0,12}再)/i.test(body)
 }
 
 /**

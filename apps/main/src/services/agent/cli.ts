@@ -181,10 +181,54 @@ export const CLI_SPECS: Record<string, CliSpec> = {
   },
 
   dsh: {
-    // 一次性 headless 任务：提示词作为任务参数
+    /**
+     * 一次性 headless 任务：`dsh --profile headless "<task>"`（官方文档的入口模式之一：
+     * "Run one fresh persisted session, print the final answer, and exit"）。
+     *
+     * 两个必须记住的边界：
+     *  1. headless profile **只从位置参数读任务**，没有 stdin 通道 —— 所以这里
+     *     `supportsStdin: false`，且要走 Windows 命令行长度预算（见 ARGV_PROMPT_LIMIT）；
+     *     长文档（整篇 / 分块）永远应该走 `--profile acp`，那是真正的长任务通道。
+     *  2. 本 spec 自己负责选 profile，**不要**再叠加注册表里给 ACP 用的 `--profile acp`：
+     *     否则命令行会出现两个 `--profile`，dsh 启动器直接报
+     *     `select a profile only once`（见 cliLaunchPrefix 的说明）。
+     */
     supportsStdin: false,
     buildArgs: (input) => ['--profile', 'headless', input.text]
   }
+}
+
+/**
+ * 拼"回落到纯粹 CLI 通道"时的前置参数。
+ *
+ * 背景：注册表里给 `dsh` 配的启动参数是 `--profile acp`（走 ACP 通道）。ACP 起不来而回落到
+ * CLI 时，`CliSpec.buildArgs` 会自己再选一次 profile，两个 `--profile` 叠在一起会让 dsh
+ * 启动器直接报错（`InvalidArgumentError: select a profile only once`），
+ * 表现就是"用 dsh 时 CLI 兜底永远不可用、只看到一句看不懂的报错"。
+ *
+ * 规则：只有当 `launchArgs` 的**尾部**正好等于注册参数时才把它们摘掉（解释器前缀，例如
+ * `node <script>`，必须保留）；对不上就原样返回，不去猜。
+ */
+export function cliLaunchPrefix(launchArgs: string[], registrationArgs: string[]): string[] {
+  const args = Array.isArray(launchArgs) ? launchArgs : []
+  if (registrationArgs.length === 0) return args
+  if (args.length <= registrationArgs.length) return args
+  const tail = args.slice(args.length - registrationArgs.length)
+  const matches = tail.every((value, index) => value === registrationArgs[index])
+  return matches ? args.slice(0, args.length - registrationArgs.length) : args
+}
+
+/**
+ * 启动某个 Agent 时**真正要用的完整参数**：解释器前缀 + 注册参数。
+ *
+ * 为什么单列一个函数：`capability.launchArgs` 里既有"怎么启动"（shim 解析出来的
+ * `--expose-internals <cli.js>`、`node <script>`），也有"注册参数"（`--profile acp`）。
+ * ACP 那条路以前只取注册参数，于是 shim 型 Agent 会被拉成
+ * `DeepSeek Harness.exe --profile acp`（少了它自己的入口脚本）—— 起不来。
+ * ACP 与 CLI 两条路都必须把"怎么启动"带上；区别只在于 CLI 那条要额外摘掉 ACP 的 profile。
+ */
+export function fullLaunchArgs(launchArgs: string[], registrationArgs: string[]): string[] {
+  return [...cliLaunchPrefix(launchArgs, registrationArgs), ...registrationArgs]
 }
 
 export interface CliAdapterOptions {
@@ -224,8 +268,10 @@ export class CliSession implements AgentSessionHandle {
         message:
           '提示词过长（' +
           input.text.length +
-          ' 字符），当前 Agent 只支持通过命令行参数接收提示词。' +
-          '请改用支持 stdin 的 Agent（如 Claude Code），或降低关系图的精度档位/分块大小。',
+          ' 字符），当前 Agent 只支持通过命令行参数接收提示词' +
+          '（dsh 的 headless profile 就是这样：任务只能作为位置参数）。' +
+          '请改用支持 stdin 的 Agent（如 Claude Code），或走 ACP 通道（dsh --profile acp 没有这个上限），' +
+          '或降低关系图的精度档位/分块大小。',
         retryable: false
       })
       return
@@ -234,7 +280,12 @@ export class CliSession implements AgentSessionHandle {
     const args = [...this.prefixArgs, ...this.spec.buildArgs(promptInput, this.options)]
     logMain('info', 'agent', '启动 CLI：' + this.executable + ' ' + args.slice(0, 6).join(' ') + (args.length > 6 ? ' …' : ''))
 
-    const child = spawnAgent(this.executable, args, { cwd: this.options.cwd, timeoutMs: 20 * 60 * 1000 })
+    const child = spawnAgent(this.executable, args, {
+      cwd: this.options.cwd,
+      // 环境变量是 Agent 拿密钥的唯一通道（dsh 的 DEEPSEEK_API_KEY 就走这里）
+      env: this.options.env,
+      timeoutMs: 20 * 60 * 1000
+    })
     this.child = child
 
     // 通过 stdin 投递提示词，规避 Windows 命令行长度上限

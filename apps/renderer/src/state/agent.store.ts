@@ -4,6 +4,7 @@ import {
   DEFAULT_PERMISSION_MODE,
   normalizePermissionMode,
   permissionModeReminder,
+  looksLikePlan,
   decidePermission,
   classifyPermission,
   type AgentCapabilityView,
@@ -141,6 +142,10 @@ interface AgentState {
   ensureModels: () => Promise<void>
   refreshCommands: (sessionId: string) => Promise<void>
   refreshHistory: (dir: string | null) => Promise<void>
+  /** 给历史会话改名（本地保存，最高优先级） */
+  renameHistorySession: (sessionId: string, title: string) => Promise<void>
+  /** 让 Agent 用一句话给这条历史会话"总结命名"（续聊它再问一次，很小的调用） */
+  nameHistorySession: (sessionId: string, firstPrompt?: string | null) => Promise<string | null>
   /** "@ 文件引用"的候选查询（主进程有缓存，可以随输入频繁调） */
   queryFiles: (dir: string | null, query: string) => Promise<WorkspaceFileView[]>
   /** 选一个历史会话续聊：关掉当前会话，下一次提问带上 resume */
@@ -438,6 +443,42 @@ export const useAgent = create<AgentState>((set, get) => ({
     } catch {
       set({ history: [] })
     }
+  },
+
+  /**
+   * 历史会话的两个命名动作。两者都写进主进程的 `session_titles` 表（按 agent + 会话 id 存），
+   * 之后再列历史时优先级最高 —— 这就是"直观明了地知道里面是什么"的落点。
+   */
+  renameHistorySession: async (sessionId, title) => {
+    const agentId = get().selectedAgentId
+    if (!agentId) return
+    const text = title.trim()
+    if (text.length === 0) return
+    await api.agent.historyRename(agentId, sessionId, text).catch(() => undefined)
+    /**
+     * **就地更新这一行**，不重新拉整张列表：ACP 通道列一次会话要新起一个 Agent 进程
+     * （实测十几秒），回车之后干等十几秒才看到名字变化，体验很差（而且用户会以为没生效）。
+     * 真正的持久化已经写进 `session_titles`，下次列表刷新自然一致。
+     */
+    set({
+      history: get().history.map((item) =>
+        item.sessionId === sessionId ? { ...item, title: text, titleSource: 'stored' as const } : item
+      )
+    })
+  },
+
+  nameHistorySession: async (sessionId, firstPrompt) => {
+    const agentId = get().selectedAgentId
+    if (!agentId) return null
+    const title = await api.agent.historyName(agentId, sessionId, firstPrompt ?? null).catch(() => null)
+    if (title) {
+      set({
+        history: get().history.map((item) =>
+          item.sessionId === sessionId ? { ...item, title, titleSource: 'stored' as const } : item
+        )
+      })
+    }
+    return title
   },
 
   queryFiles: async (dir, query) => {
@@ -783,6 +824,17 @@ function handleEvent(
       break
     }
     case 'session':
+      /**
+       * 记住远端会话 id ↔ 我们自己这条会话的对应关系。
+       * 历史列表要用它把"我们记下的首条提问"当成名字 —— 很多通道（dsh 的 ACP）
+       * 在 `session/list` 里**只回 id 与 cwd**，不给任何标题（见 runtime.withSessionTitles）。
+       */
+      if (payload.remoteSessionId) {
+        const conversationId = get().conversationId
+        if (conversationId) {
+          void api.store.conversationSetRemoteSession(conversationId, payload.remoteSessionId).catch(() => undefined)
+        }
+      }
       if (payload.activeModel) {
         set({ activeModel: payload.activeModel })
         logDebug('实际运行模型：' + payload.activeModel)
@@ -830,14 +882,17 @@ function handleEvent(
       )
       set({ messages, streaming: false })
       /**
-       * 计划档的兜底：本轮结束且还没有待批计划时，把最后一条助手回答当作方案。
+       * 计划档的兜底：本轮结束且还没有待批计划时，**只有当这段回答确实像方案**才弹卡片。
+       *
        * 实测模型有时只输出方案、不调 ExitPlanMode —— 那种情况下用户不该"没得批"。
+       * 但反过来（本轮用户反馈的"死板"）：计划模式下问一句只读问题，回答也被当成方案弹卡片。
+       * 判定交给纯函数 `looksLikePlan`（太短的、没有方案小标题也没有分步结构的一律不弹）。
        */
       const state = get()
       if (state.permissionMode === 'plan' && !state.pendingPlan) {
         const last = [...messages].reverse().find((message) => message.role === 'assistant')
         const text = last?.content.trim() ?? ''
-        if (last && text.length > 0) {
+        if (last && looksLikePlan(text)) {
           set({ pendingPlan: { messageId: last.id, plan: text, filePath: null } })
         }
       }

@@ -46,7 +46,8 @@ export function markRange(
 /**
  * 跳转上下文结束时（逻辑链面板被关掉 → `revealRequest` 置空）清掉常驻高亮。
  *
- * PDF 阅读器不在这里处理：它的高亮是页面上的矩形覆盖层，由自己 `setFlashRects(null)` 清。
+ * PDF 阅读器不在这里处理：它的高亮是页面上的矩形覆盖层，由自己 `setFlashTarget(null)` 清
+ * （矩形本身还要求跟着缩放/旋转走，见 PdfPageView 的 `flashRects`）。
  */
 export function useClearRevealOnReset(containerRef: RefObject<HTMLElement | null>): void {
   const request = useUiStore((state) => state.revealRequest)

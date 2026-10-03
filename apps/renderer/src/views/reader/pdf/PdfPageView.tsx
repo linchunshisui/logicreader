@@ -7,6 +7,7 @@ import { getPdfLayout, pdfjsLib, resolveDestPage } from '../../../lib/pdfjs'
 import { persistedPageMapping, TEXT_LAYER_MAPPING_VERSION, type PageMapping } from '../../../lib/textLayerMapping'
 import { attachOffsets, mappingMatchesModel, renderOfficialTextLayer } from '../../../lib/pdfTextLayer'
 import { applySmartDark, collectImageRegions, cssFilterFor } from './darkMode'
+import { rangeForChars } from '../../../lib/selection'
 
 export interface PageAnnotationMark {
   id: string
@@ -36,11 +37,14 @@ interface Props {
   /** 布局缓存就绪计数：解析完成后 +1，用于给"提前渲染"的页面补写定位属性 */
   layoutTick?: number
   /**
-   * 跳转落点的高亮矩形（页内坐标，1.6 秒后由阅读器清空）。
+   * 跳转落点（**字符区间**，不是像素矩形）。
+   *
+   * 阅读器只告诉"哪一页的哪一段"，矩形由本组件在文本层每次重建完成后按**当前缩放 / 旋转**
+   * 重新量出来 —— 缩放后高亮自然跟着页面走。旧实现把跳转那一刻的像素存在阅读器里，
+   * 缩放后页面重新排版、矩形却停在原地，就是用户看到的"高亮区域不随缩放变化"。
    * 用矩形而不是"整页闪一下"：fit-width 下一页比视口高，整页高亮说不清落在哪一段。
+   * 区间同时写进 `data-reveal-range`，便于断言"落在正确的、完整的词上"（无需读像素）。
    */
-  flashRects?: { x: number; y: number; width: number; height: number }[] | null
-  /** 已应用的高亮区间：写进 DOM 便于"跳转是否落在正确的、完整的词上"这类断言（无需读像素） */
   flashRange?: { charStart: number; charEnd: number } | null
   /** 查找命中：在文本层上高亮全部匹配 */
   searchQuery?: string
@@ -69,6 +73,8 @@ export function PdfPageView(props: Props): JSX.Element {
   const [size, setSize] = useState<{ width: number; height: number }>({ width: 0, height: 0 })
   const [visible, setVisible] = useState(pageNumber <= 2)
   const [status, setStatus] = useState<'idle' | 'rendering' | 'ready' | 'error'>('idle')
+  /** 跳转落点的高亮矩形（页内像素）：按**当前缩放 / 旋转**实时量出，不用跳转那一刻的旧值 */
+  const [flashRects, setFlashRects] = useState<{ x: number; y: number; width: number; height: number }[] | null>(null)
 
   // 懒渲染：进入视口附近才处理
   useEffect(() => {
@@ -166,6 +172,13 @@ export function PdfPageView(props: Props): JSX.Element {
             container: textLayerDiv,
             viewport: cssViewport
           })
+          /*
+           * 标记"这一层是按哪个缩放 / 旋转渲染出来的"：缩放锚点（lib/zoomAnchor）靠它判断
+           * 新布局是否就绪 —— 文本层是异步重建的，早一步量到的是**旧几何**，
+           * 而那正是"缩放后高亮/落点漂走"的来源。
+           */
+          textLayerDiv.dataset.renderScale = String(scale)
+          textLayerDiv.dataset.renderRotation = String(rotation)
           // 我们只补一件事：字符偏移
           const model = useDocuments.getState().models[docId] ?? null
           const persisted = persistedPageMapping(model, pageNumber)
@@ -275,6 +288,53 @@ export function PdfPageView(props: Props): JSX.Element {
     }
   }, [visible, doc, docId, pageNumber, scale, rotation, darkMode, imagePolicy, brightness])
 
+  /**
+   * 跳转落点高亮：**每次文本层重建完成后按当前缩放/旋转重新量一次**。
+   *
+   * 只认字符区间（`flashRange`），不认跳转那一刻的像素 —— 缩放 / 旋转都会重建文本层，
+   * 量出来的矩形自然跟着页面走（这是"高亮区域不随缩放变化"的根治点）。
+   * 渲染中先保留上一份矩形（比"闪掉再回来"稳），文本层或偏移表还没就绪时按 100ms 重试；
+   * 始终量不到（扫描页、无偏移表的旧缓存）就交给阅读器降级为"闪整页"。
+   */
+  const flashStart = props.flashRange?.charStart ?? null
+  const flashEnd = props.flashRange?.charEnd ?? null
+  useEffect(() => {
+    if (flashStart === null || flashEnd === null) {
+      setFlashRects(null)
+      return
+    }
+    if (status !== 'ready') return
+    let cancelled = false
+    let attempt = 0
+    const measure = (): void => {
+      if (cancelled) return
+      const layer = textLayerRef.current
+      const page = containerRef.current
+      const range = layer ? rangeForChars(layer, 'span[data-char-start]', flashStart, flashEnd) : null
+      if (range && page) {
+        const pageRect = page.getBoundingClientRect()
+        const rects = Array.from(range.getClientRects())
+          .map((rect) => ({
+            x: rect.left - pageRect.left,
+            y: rect.top - pageRect.top,
+            width: rect.width,
+            height: rect.height
+          }))
+          .filter((rect) => rect.width > 0 && rect.height > 0)
+        if (rects.length > 0) {
+          setFlashRects(rects)
+          return
+        }
+      }
+      attempt += 1
+      if (attempt <= 20) window.setTimeout(measure, 100)
+    }
+    measure()
+    return () => {
+      cancelled = true
+    }
+  }, [flashStart, flashEnd, status, scale, rotation, props.layoutTick])
+
   // 查找命中高亮（在文本层 span 内做子串高亮）
   useEffect(() => {
     const textLayerDiv = textLayerRef.current
@@ -320,13 +380,13 @@ export function PdfPageView(props: Props): JSX.Element {
       <canvas ref={canvasRef} className="lr-pdf-canvas" style={{ filter }} />
       <div className="textLayer" ref={textLayerRef} data-page={pageNumber} />
       <div className="lr-pdf-links" ref={linkLayerRef} />
-      {props.flashRects && props.flashRects.length > 0 ? (
+      {flashRects && flashRects.length > 0 && flashStart !== null ? (
         <div
           className="lr-pdf-flash"
-          data-reveal-range={props.flashRange ? props.flashRange.charStart + '-' + props.flashRange.charEnd : undefined}
+          data-reveal-range={flashStart + '-' + String(flashEnd)}
           aria-hidden
         >
-          {props.flashRects.map((rect, index) => (
+          {flashRects.map((rect, index) => (
             <div
               key={index}
               className="lr-pdf-flash__rect"

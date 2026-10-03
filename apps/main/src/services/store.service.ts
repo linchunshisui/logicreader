@@ -135,6 +135,22 @@ const SCHEMA = [
     created_at      INTEGER NOT NULL
   )`,
   'CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, created_at)',
+  /**
+   * 会话标题：历史会话列表的"人能看懂的名字"。
+   *
+   * 为什么要我们自己存：各通道给的名字参差不齐 —— Claude 有 summary/firstPrompt，
+   * 而 dsh 的 ACP `session/list` **只回 sessionId 与 cwd**（实测），
+   * 于是界面上只能显示一串 UUID（用户的原话："应支持总结命名，直观明了的知道内容是什么"）。
+   * 这里存两类来源：用户手改（`manual`）与让 Agent 总结出来的（`ai`）。
+   */
+  `CREATE TABLE IF NOT EXISTS session_titles (
+    agent_id   TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    title      TEXT NOT NULL,
+    source     TEXT,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, session_id)
+  )`,
   `CREATE TABLE IF NOT EXISTS annotations (
     id          TEXT PRIMARY KEY,
     doc_id      TEXT NOT NULL,
@@ -685,6 +701,100 @@ export class StoreService {
     return this.requireDb().prepare('SELECT * FROM agents ORDER BY display_name ASC').all()
   }
 
+  // ------------------------------------------------------- 会话标题（历史列表用）
+  /**
+   * 记一个会话标题。来源：
+   *  - `manual`：用户自己改的（最高优先级，永远盖过其它来源）；
+   *  - `ai`：让 Agent 用一句话概括出来的（"总结命名"）。
+   */
+  sessionTitleSet(payload: Record<string, unknown>): void {
+    const row = {
+      agent_id: str(payload.agentId),
+      session_id: str(payload.sessionId),
+      title: str(payload.title),
+      source: payload.source == null ? 'manual' : str(payload.source),
+      updated_at: num(payload.updatedAt, Date.now())
+    }
+    if (!this.db) {
+      this.fallbackMutate((s) => {
+        const list = s.sessionTitles ?? (s.sessionTitles = [])
+        const idx = list.findIndex((item) => item.agent_id === row.agent_id && item.session_id === row.session_id)
+        if (idx >= 0) list[idx] = row
+        else list.push(row)
+      })
+      return
+    }
+    this.requireDb()
+      .prepare(
+        `INSERT INTO session_titles (agent_id, session_id, title, source, updated_at)
+         VALUES (?,?,?,?,?)
+         ON CONFLICT(agent_id, session_id) DO UPDATE SET title=excluded.title, source=excluded.source, updated_at=excluded.updated_at`
+      )
+      .run(row.agent_id, row.session_id, row.title, row.source, row.updated_at)
+  }
+
+  sessionTitleList(agentId?: string | null): unknown[] {
+    if (!this.db) {
+      const list = this.fallbackRead().sessionTitles ?? []
+      return agentId ? list.filter((item) => item.agent_id === agentId) : list
+    }
+    return agentId
+      ? this.requireDb().prepare('SELECT * FROM session_titles WHERE agent_id = ?').all(agentId)
+      : this.requireDb().prepare('SELECT * FROM session_titles').all()
+  }
+
+  /** 取一个会话存下来的标题（没有就 null）。 */
+  sessionTitleGet(agentId: string, sessionId: string): string | null {
+    if (!agentId || !sessionId) return null
+    if (!this.db) {
+      const hit = (this.fallbackRead().sessionTitles ?? []).find(
+        (item) => item.agent_id === agentId && item.session_id === sessionId
+      )
+      const title = hit ? String(hit.title ?? '').trim() : ''
+      return title.length > 0 ? title : null
+    }
+    const row = this.requireDb()
+      .prepare('SELECT title FROM session_titles WHERE agent_id = ? AND session_id = ?')
+      .get(agentId, sessionId) as { title?: unknown } | undefined
+    const title = row ? String(row.title ?? '').trim() : ''
+    return title.length > 0 ? title : null
+  }
+
+  /**
+   * 我们自己的会话（conversations.title 里存着"用户第一条提问的前 40 字"）按远端会话 id 反查。
+   * 这条链要靠 conversations.remote_session_id —— 会话一建立就会写进去（见 setConversationRemoteSession）。
+   */
+  conversationTitleForRemoteSession(agentId: string, remoteSessionId: string): string | null {
+    const match = (rows: Record<string, unknown>[]): string | null => {
+      const hit = rows.find(
+        (item) => item.remote_session_id === remoteSessionId && item.agent_id === agentId && typeof item.title === 'string'
+      )
+      const title = hit ? String(hit.title ?? '').trim() : ''
+      return title.length > 0 ? title : null
+    }
+    if (!this.db) return match(this.fallbackRead().conversations)
+    const rows = this.requireDb()
+      .prepare('SELECT title FROM conversations WHERE agent_id = ? AND remote_session_id = ? ORDER BY updated_at DESC LIMIT 1')
+      .all(agentId, remoteSessionId) as Record<string, unknown>[]
+    const title = rows.length > 0 ? String(rows[0].title ?? '').trim() : ''
+    return title.length > 0 ? title : null
+  }
+
+  /** 把远端会话 id 写到我们自己的会话行上（仅在还没有值时写，别覆盖）。 */
+  setConversationRemoteSession(conversationId: string, remoteSessionId: string): void {
+    if (!conversationId || !remoteSessionId) return
+    if (!this.db) {
+      this.fallbackMutate((s) => {
+        const row = s.conversations.find((item) => item.id === conversationId)
+        if (row && !row.remote_session_id) row.remote_session_id = remoteSessionId
+      })
+      return
+    }
+    this.requireDb()
+      .prepare('UPDATE conversations SET remote_session_id = ? WHERE id = ? AND (remote_session_id IS NULL OR remote_session_id = \'\')')
+      .run(remoteSessionId, conversationId)
+  }
+
   // ------------------------------------------------------------ key/value
   setSetting(key: string, value: string): void {
     if (!this.db) {
@@ -779,11 +889,24 @@ interface FallbackShape {
   conversations: Record<string, unknown>[]
   messages: Record<string, unknown>[]
   agents: Record<string, unknown>[]
+  /** 会话标题（按 agent + 远端会话 id 存；用户手改或让 Agent 总结命名） */
+  sessionTitles: Record<string, unknown>[]
   kv: Record<string, string>
 }
 
 function emptyFallback(): FallbackShape {
-  return { documents: [], blocks: [], anchors: [], annotations: [], graphs: [], conversations: [], messages: [], agents: [], kv: {} }
+  return {
+    documents: [],
+    blocks: [],
+    anchors: [],
+    annotations: [],
+    graphs: [],
+    conversations: [],
+    messages: [],
+    agents: [],
+    sessionTitles: [],
+    kv: {}
+  }
 }
 
 function upsertBy<T extends object>(list: T[], key: string, value: T): void {

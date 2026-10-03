@@ -1,6 +1,7 @@
 /** ACP 会话实现：进程 + 协议握手 + 提示词流。 */
 import { logMain } from '../../util/ipc'
 import { AcpClient } from './acp'
+import { describeConfigValue, encodeConfigValue } from './config-value'
 import { killTree, spawnAgent } from './exec'
 import type { AgentEvent, AgentSessionHandle, ConfigOption, PromptInput, SessionOptions } from './types'
 
@@ -35,6 +36,8 @@ export class AcpSession implements AgentSessionHandle {
   static async create(create: AcpSessionCreateOptions): Promise<AcpSession> {
     const child = spawnAgent(create.executable, create.args, {
       cwd: create.options.cwd,
+      // dsh 这类 harness 的模型密钥从环境变量读（DEEPSEEK_API_KEY），少了它握手就会失败
+      env: create.options.env,
       timeoutMs: 0
     })
     const client = new AcpClient({
@@ -53,17 +56,44 @@ export class AcpSession implements AgentSessionHandle {
       terminal: false
     })
     logMain('info', 'acp', 'Agent 握手完成：' + JSON.stringify(init).slice(0, 400))
-    const result = await client.newSession(create.options.cwd)
-    session.remoteId = result.sessionId
-    session.configOptions = (result.configOptions ?? []) as ConfigOption[]
+    /**
+     * 续聊优先：给了远端会话 id 就先试 `session/resume`（dsh 0.2+ 支持）——
+     * 失败（Agent 不支持 / id 过期 / 工作目录对不上）时**回落新建**并留痕，
+     * 不让"续聊"变成"这个 Agent 用不了"。
+     */
+    let resumed = false
+    if (create.options.resumeSessionId) {
+      try {
+        const result = await client.resumeSession(create.options.resumeSessionId, create.options.cwd)
+        session.remoteId = result.sessionId
+        session.configOptions = (result.configOptions ?? []) as ConfigOption[]
+        resumed = true
+        logMain('info', 'acp', '已续聊远端会话：' + result.sessionId)
+      } catch (error) {
+        logMain('warn', 'acp', '续聊失败，改为新建会话：' + String(error))
+      }
+    }
+    if (!session.remoteId) {
+      const result = await client.newSession(create.options.cwd)
+      session.remoteId = result.sessionId
+      session.configOptions = (result.configOptions ?? []) as ConfigOption[]
+    }
+    // 让界面拿得到远端会话 id（续聊要用它；SDK / app-server 通道早就在发这个事件）
+    create.onEvent({ type: 'session', remoteSessionId: session.remoteId, resumed })
     if (session.configOptions.length > 0) {
-      create.onEvent({
-        type: 'plan',
-        entries: session.configOptions.map((option) => ({
-          content: '配置项：' + option.name + ' (' + option.category + ')',
-          status: String(option.currentValue ?? '')
-        }))
-      })
+      /**
+       * 这里曾经发一条 `plan` 事件把配置项"顶"给界面 —— 但渲染进程根本不消费 `plan`，
+       * 等于白发一次。真实的配置项改由 `runtime.createSession` 的返回值下发（那是界面读的地方）。
+       * 只留一行日志，方便排查"模型/思考强度为什么是这一档"。
+       */
+      logMain(
+        'info',
+        'acp',
+        '会话配置项=' +
+          session.configOptions
+            .map((option) => option.id + ':' + describeConfigValue(option.currentValue))
+            .join(', ')
+      )
     }
     // 应用用户选择的模型与思考强度
     if (create.options.modelId) await session.applyConfig('model', create.options.modelId)
@@ -80,10 +110,27 @@ export class AcpSession implements AgentSessionHandle {
   }
 
   private async applyConfig(category: string, value: string): Promise<void> {
-    const option = this.configOptions.find((item) => item.category === category || item.id === category)
+    const option = this.findOption(category)
     if (!option || !this.remoteId) return
-    const next = await this.client.setConfigOption(this.remoteId, option.id, value)
+    /**
+     * 取值要按**该选项自己的形态**编码：dsh 的 `model` 是 `[provider, model]` 路由，
+     * 只认这条 JSON 的字符串（裸模型名会被回 `unknown model option`，然后被客户端吞掉）。
+     */
+    const next = await this.client.setConfigOption(this.remoteId, option.id, encodeConfigValue(option, value))
     if (next) this.configOptions = next
+  }
+
+  /**
+   * 找配置项。**按 id 或 category 都认**，并且对思考强度补一个别名：
+   * ACP 规范里"思考强度"的 category 是 `thought_level`，但 DSH 这一档的 id 叫
+   * `reasoning_effort` —— 只按 category 匹配时，它一旦不自报 `thought_level`，
+   * 用户选的档位就会被静默丢掉（看起来像"改了没用"）。
+   */
+  private findOption(category: string): ConfigOption | undefined {
+    const aliases = category === 'thought_level' ? ['reasoning_effort'] : []
+    return this.configOptions.find(
+      (item) => item.category === category || item.id === category || aliases.includes(item.id)
+    )
   }
 
   async prompt(input: PromptInput): Promise<void> {
@@ -109,13 +156,25 @@ export class AcpSession implements AgentSessionHandle {
 
   async dispose(): Promise<void> {
     this.disposed = true
+    // 先请 Agent 自己收敛（会话级 close：drain 更新、落盘、释放该会话的子代理），
+    // 再关连接、杀进程 —— 不关的话持久化会话可能停在半截，续聊时就少一轮上下文。
+    if (this.remoteId) {
+      await this.client.closeSession(this.remoteId).catch((error) => {
+        logMain('debug', 'acp', '关闭会话失败（忽略）：' + String(error))
+      })
+    }
     this.client.dispose()
     killTree(this.child)
   }
 
   async setConfigOption(optionId: string, value: string | boolean): Promise<void> {
     if (!this.remoteId) return
-    const next = await this.client.setConfigOption(this.remoteId, optionId, value)
+    const option = this.configOptions.find((item) => item.id === optionId)
+    const next = await this.client.setConfigOption(
+      this.remoteId,
+      optionId,
+      option ? encodeConfigValue(option, value) : value
+    )
     if (next) this.configOptions = next
   }
 }

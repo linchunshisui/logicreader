@@ -227,6 +227,156 @@
   word-break: break-all;
 }
 
+/* Agent 管理器（设置 → Agent）：把"找得到 / 找不到可执行文件"摊开给人看 */
+/* Agent 输出的 markdown：沿用阅读器的 prose 规则（表格 / 引用 / 代码块都现成），
+   只按"窄栏对话流"收紧字号与间距 —— 面板只有 400 来像素，阅读器那套 1.8 行高太松 */
+.lr-md {
+  line-height: 1.62;
+  font-size: var(--lr-fs-sm);
+  overflow-wrap: anywhere;
+  /* 容器可能带着旧样式（计划卡片/消息体原来是 pre-wrap 的纯文本），
+     渲染成 markdown 之后必须交回正常排版 —— 否则源码里的换行会额外撑出一段空白 */
+  white-space: normal;
+}
+
+.lr-md > *:first-child {
+  margin-top: 0;
+}
+
+.lr-md > *:last-child {
+  margin-bottom: 0;
+}
+
+.lr-md h1 {
+  font-size: 1.28em;
+}
+
+.lr-md h2 {
+  font-size: 1.16em;
+}
+
+.lr-md h3 {
+  font-size: 1.06em;
+}
+
+.lr-md table {
+  font-size: 0.92em;
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.lr-md pre,
+.lr-md .lr-prose__code-shiki {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.lr-md code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.lr-plancard__body .lr-md {
+  font-size: var(--lr-fs-sm);
+}
+
+.lr-agent-manager {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 0 4px;
+  border-top: 1px solid var(--vscode-textSeparator-foreground);
+}
+
+.lr-agent-manager__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.lr-agent-manager__title {
+  font-size: var(--lr-fs-sm);
+  font-weight: 600;
+}
+
+.lr-agent-manager__error {
+  color: var(--vscode-errorForeground, #f14c4c);
+  font-size: var(--lr-fs-xs);
+}
+
+.lr-agent-manager__item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--vscode-textSeparator-foreground);
+  border-left: 3px solid var(--vscode-descriptionForeground, #8a8a8a);
+  border-radius: 4px;
+}
+
+.lr-agent-manager__item[data-available='true'] {
+  border-left-color: var(--vscode-testing-iconPassed, #4caf50);
+}
+
+.lr-agent-manager__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: var(--lr-fs-sm);
+}
+
+.lr-agent-manager__name {
+  font-weight: 600;
+}
+
+.lr-agent-manager__badge {
+  padding: 1px 6px;
+  border: 1px solid var(--vscode-textSeparator-foreground);
+  border-radius: 999px;
+  font-size: var(--lr-fs-xs);
+  opacity: 0.8;
+}
+
+.lr-agent-manager__status {
+  font-size: var(--lr-fs-xs);
+  opacity: 0.75;
+}
+
+.lr-agent-manager__status[data-ok='true'] {
+  color: var(--vscode-testing-iconPassed, #4caf50);
+  opacity: 1;
+}
+
+.lr-agent-manager__fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+  gap: 8px;
+}
+
+.lr-agent-manager__fields label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: var(--lr-fs-xs);
+  opacity: 0.85;
+}
+
+.lr-agent-manager__fields input,
+.lr-agent-manager__fields textarea {
+  width: 100%;
+  font-family: var(--lr-font-mono);
+  font-size: var(--lr-fs-xs);
+  resize: vertical;
+}
+
+.lr-agent-manager__actions {
+  display: flex;
+  gap: 8px;
+}
+
 .lr-setting__note {
   margin: 10px 0;
   opacity: 0.7;
@@ -769,6 +919,21 @@
 
 .lr-localmap__card--peer:focus-visible {
   outline: none;
+}
+
+/*
+ * 悬停预览：鼠标指到下面清单的某一行时，图上把对应节点标出来。
+ * 与 `--center`（当前中心）和 `--peer:hover`（鼠标直接在图里）都区分开：
+ * 用聚焦色 + 外发光，节点离得远、被缩得很小时也一眼能找到。
+ */
+.lr-localmap__card--preview .lr-localmap__box {
+  fill: var(--vscode-list-hoverBackground);
+  stroke: var(--vscode-focusBorder);
+  stroke-width: 2.4;
+}
+
+.lr-localmap__card--preview .lr-localmap__bar {
+  filter: drop-shadow(0 0 4px var(--vscode-focusBorder));
 }
 
 .lr-localmap__inner {
@@ -1493,11 +1658,41 @@
   background: var(--vscode-list-hoverBackground);
 }
 
+/* 不可用的 Agent：列出来但不给点，原因写在第二行（别再"静默消失"） */
+.lr-agent__picker-item[data-disabled='true'] {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.lr-agent__picker-item[data-disabled='true']:hover {
+  background: transparent;
+}
+
 /* 历史会话行：主按钮 + 右侧“分叉” */
 .lr-agent__picker-row {
   display: flex;
   align-items: stretch;
   gap: 4px;
+}
+
+/* 历史会话：就地改名（输入框 + 保存/取消） */
+.lr-agent__rename {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 0;
+}
+
+.lr-agent__rename input {
+  width: 100%;
+  font-size: var(--lr-fs-sm);
+}
+
+.lr-agent__rename-actions {
+  display: flex;
+  gap: 6px;
 }
 
 .lr-agent__picker-row .lr-agent__picker-item {

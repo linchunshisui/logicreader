@@ -107,6 +107,8 @@ const api: LogicReaderApi = {
     graphPatch: (graphId, patch) => invoke<void>(CH.store.graphPatch, graphId, patch),
     graphDelete: (graphId) => invoke<void>(CH.store.graphDelete, graphId),
     conversationUpsert: (payload) => invoke<void>(CH.store.conversationUpsert, payload),
+    conversationSetRemoteSession: (conversationId, remoteSessionId) =>
+      invoke<void>(CH.store.conversationRemoteSession, conversationId, remoteSessionId),
     conversationList: (docId) => invoke<unknown[]>(CH.store.conversationList, docId),
     conversationGet: (id) => invoke<unknown | null>(CH.store.conversationGet, id),
     messageAppend: (payload) => invoke<void>(CH.store.messageAppend, payload),
@@ -131,6 +133,9 @@ const api: LogicReaderApi = {
     probeModels: (agentId) => invoke<AgentModelView[]>(CH.agent.probeModels, agentId),
     commands: (sessionId) => invoke<{ name: string; description?: string; argumentHint?: string }[]>(CH.agent.commands, sessionId),
     history: (dir, limit, agentId) => invoke<AgentSessionInfoView[]>(CH.agent.history, dir, limit ?? 30, agentId ?? null),
+    historyRename: (agentId, sessionId, title) => invoke<void>(CH.agent.historyRename, agentId, sessionId, title),
+    historyName: (agentId, sessionId, firstPrompt) =>
+      invoke<string | null>(CH.agent.historyName, agentId, sessionId, firstPrompt ?? null),
     files: (dir, query, limit) => invoke<WorkspaceFileView[]>(CH.agent.files, dir, query ?? '', limit ?? 12),
     workdir: (documentDir) => invoke<string>(CH.agent.workdir, documentDir),
     revertHunks: (sessionId, toolUseId, indices) =>

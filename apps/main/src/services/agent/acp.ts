@@ -5,6 +5,7 @@
 import type { ChildProcess } from 'node:child_process'
 import { createId } from '@logicreader/shared'
 import { logMain } from '../../util/ipc'
+import { killTree, spawnAgent } from './exec'
 import type { AgentEvent, ConfigOption, PermissionDetail } from './types'
 
 export const ACP_PROTOCOL_VERSION = 1
@@ -213,6 +214,13 @@ export class AcpClient {
         break
       }
       default:
+        /**
+         * 没消费的更新留一条 debug 痕迹。
+         * 实测 dsh 0.2 每轮会发 `usage_update`（上下文用量 `used` / `size`）——
+         * 它跟本程序"每条消息的输入/输出 token"不是一回事，硬映射会把"上下文占用"说成"这轮输入"，
+         * 所以宁可先不显示，但要能在日志里看见它来过（排查"为什么不显示用量"时有用）。
+         */
+        if (kind.length > 0) logMain('debug', 'acp', '未消费的会话更新：' + kind)
         break
     }
   }
@@ -226,13 +234,14 @@ export class AcpClient {
     }
   }
 
-  request<T = unknown>(method: string, params: Record<string, unknown>): Promise<T> {
+  /** `timeoutMs` 只覆盖**这一次**请求（例如关闭会话时不该等满 10 分钟）。 */
+  request<T = unknown>(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<T> {
     const id = this.nextId++
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id)
         reject(new Error('ACP 请求超时：' + method))
-      }, this.options.timeoutMs ?? 120000)
+      }, timeoutMs ?? this.options.timeoutMs ?? 120000)
       this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject, method, timer })
       this.send({ jsonrpc: '2.0', id, method, params })
     })
@@ -252,6 +261,21 @@ export class AcpClient {
   async newSession(cwd: string, mcpServers: unknown[] = []): Promise<{ sessionId: string; configOptions?: ConfigOption[] }> {
     const result = await this.request<{ sessionId: string; configOptions?: ConfigOption[] }>('session/new', { cwd, mcpServers })
     return result
+  }
+
+  /**
+   * 续聊：ACP v1 的 `session/resume`。
+   * 与 `session/new` 的区别是它复用磁盘上已持久化的会话（dsh 0.2+ 支持 list/resume/close），
+   * 所以「续聊」能带上原来的上下文。Agent 没声明这个能力时会以方法未实现报错，由调用方回落新建。
+   */
+  async resumeSession(sessionId: string, cwd: string): Promise<{ sessionId: string; configOptions?: ConfigOption[] }> {
+    return this.request<{ sessionId: string; configOptions?: ConfigOption[] }>('session/resume', { sessionId, cwd })
+  }
+
+  /** 关闭**单个**会话（ACP v1 `session/close`），不关整条连接。 */
+  async closeSession(sessionId: string): Promise<void> {
+    // 超时压到 4 秒：这是"退出/换 Agent"路径上的收尾动作，不能把界面卡住
+    await this.request('session/close', { sessionId }, 4000)
   }
 
   async prompt(sessionId: string, text: string): Promise<{ stopReason: string }> {
@@ -286,5 +310,63 @@ export class AcpClient {
       pending.reject(new Error('会话已关闭'))
     }
     this.pending.clear()
+  }
+}
+
+/** `session/list` 的一行（只保留界面真正消费的字段）。 */
+export interface AcpSessionSummary {
+  sessionId: string
+  title?: string | null
+  updatedAt?: string | null
+  cwd?: string
+}
+
+/**
+ * 一次性列出某工作目录下的历史会话（ACP `session/list`）。
+ *
+ * 起一个**临时** ACP 连接、问完就关：只有实现了 `session/list` 的 Agent（dsh 0.2+ 的
+ * `--profile acp`）会给结果；别的 ACP 工具会以"方法未实现"报错，这里安静地返回空数组，
+ * 界面照旧显示"没有历史会话"，不会把整块面板打挂。
+ *
+ * 与 Codex 的 `thread/list` 是同一个位置的两条实现，都只为"续聊"服务。
+ */
+export async function listAcpSessions(options: {
+  executable: string
+  args: string[]
+  cwd: string
+  env?: Record<string, string>
+  limit?: number
+  timeoutMs?: number
+}): Promise<AcpSessionSummary[]> {
+  const child = spawnAgent(options.executable, options.args, { cwd: options.cwd, env: options.env, timeoutMs: 0 })
+  const client = new AcpClient({
+    child,
+    onEvent: () => undefined,
+    requestPermission: async () => null,
+    readTextFile: async () => '',
+    writeTextFile: async () => undefined,
+    allowWrite: false,
+    timeoutMs: options.timeoutMs ?? 15000
+  })
+  try {
+    await client.initialize({})
+    const result = await client.request<{ sessions?: unknown[] }>('session/list', { cwd: options.cwd })
+    const rows = Array.isArray(result?.sessions) ? result.sessions : []
+    return rows
+      .map((row) => row as Record<string, unknown>)
+      .map((row) => ({
+        sessionId: String(row.sessionId ?? ''),
+        title: row.title == null ? null : String(row.title),
+        updatedAt: row.updatedAt == null ? null : String(row.updatedAt),
+        cwd: row.cwd == null ? undefined : String(row.cwd)
+      }))
+      .filter((row) => row.sessionId.length > 0)
+      .slice(0, options.limit ?? 30)
+  } catch (error) {
+    logMain('debug', 'acp', '列历史会话失败（该 Agent 可能不支持 session/list）：' + String(error))
+    return []
+  } finally {
+    client.dispose()
+    killTree(child)
   }
 }

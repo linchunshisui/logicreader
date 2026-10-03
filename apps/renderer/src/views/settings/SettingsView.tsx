@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { CMD } from '@logicreader/shared'
+import { CMD, DEEPSEEK_API_KEY_SECRET } from '@logicreader/shared'
 import { useSettings } from '../../state/settings.store'
 import { api } from '../../lib/api'
 import { executeCommand } from '../../state/commands.store'
 import { notify } from '../../state/notifications.store'
 import { useUiStore } from '../../state/ui.store'
+import { AgentManager } from './AgentManager'
 
 type CategoryId = 'appearance' | 'reader' | 'agent' | 'graph' | 'storage' | 'about'
 
@@ -33,6 +34,16 @@ export function SettingsView(): JSX.Element {
     }
   }, [])
   const [stats, setStats] = useState<Record<string, number> | null>(null)
+  /** dsh（DeepSeek Harness）的密钥：只存在系统加密的密钥库里，界面上只显示"有没有"。 */
+  const [deepseekKey, setDeepseekKey] = useState('')
+  const [hasDeepseekKey, setHasDeepseekKey] = useState(false)
+
+  useEffect(() => {
+    void api.settings
+      .hasSecret(DEEPSEEK_API_KEY_SECRET)
+      .then(setHasDeepseekKey)
+      .catch(() => setHasDeepseekKey(false))
+  }, [])
 
   const row = (label: string, control: JSX.Element, hint?: string): JSX.Element => (
     <div className="lr-setting" key={label}>
@@ -243,6 +254,46 @@ export function SettingsView(): JSX.Element {
                   <span className="lr-setting__hint">{settings.agent.allowedWriteDirs.length}</span>
                 </div>
               )}
+              {row(
+                t('settings.agent.deepseekKey'),
+                <div className="lr-setting__inline">
+                  <input
+                    type="password"
+                    autoComplete="off"
+                    spellCheck={false}
+                    placeholder={hasDeepseekKey ? t('settings.agent.deepseekKeySaved') : t('settings.agent.deepseekKeyPlaceholder')}
+                    value={deepseekKey}
+                    onChange={(event) => setDeepseekKey(event.target.value)}
+                  />
+                  <button
+                    className="lr-button lr-button--secondary"
+                    disabled={deepseekKey.trim().length === 0}
+                    onClick={async () => {
+                      const value = deepseekKey.trim()
+                      if (value.length === 0) return
+                      await api.settings.setSecret(DEEPSEEK_API_KEY_SECRET, value)
+                      setDeepseekKey('')
+                      setHasDeepseekKey(true)
+                      notify(t('settings.agent.deepseekKeySaved'), 'success')
+                    }}
+                  >
+                    {t('common.save')}
+                  </button>
+                  {hasDeepseekKey ? (
+                    <button
+                      className="lr-button lr-button--secondary"
+                      onClick={async () => {
+                        await api.settings.deleteSecret(DEEPSEEK_API_KEY_SECRET)
+                        setHasDeepseekKey(false)
+                      }}
+                    >
+                      {t('settings.agent.deepseekKeyClear')}
+                    </button>
+                  ) : null}
+                </div>,
+                t('settings.agent.deepseekKeyHint')
+              )}
+              <AgentManager />
               <p className="lr-setting__note">{t('settings.agent.keyStorage')}</p>
             </>
           ) : null}

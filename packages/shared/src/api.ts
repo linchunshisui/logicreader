@@ -21,7 +21,8 @@ export interface AgentConfigOption {
   description?: string
   category: string
   type: string
-  currentValue: string | boolean | null
+  /** 可能是数组：dsh 的 `model` 项是 `[provider, model]` 路由（见 services/agent/config-value.ts）。 */
+  currentValue: string | boolean | unknown[] | null
   options?: AgentConfigOptionValue[]
 }
 
@@ -64,9 +65,19 @@ export interface AgentRegistrationView {
   protocol: string
   executable: string | null
   args: string[]
+  /**
+   * 追加给该 Agent 子进程的环境变量。
+   * 值支持 `secret:<key>` 形态 —— 从系统加密的密钥库取（例如 `{"DEEPSEEK_API_KEY":"secret:deepseek.apiKey"}`）。
+   */
+  env?: Record<string, string>
   enabled: boolean
   builtin: boolean
   capability: AgentCapabilityView | null
+  /**
+   * 需要密钥的 Agent（目前只有 dsh）是否已经拿到密钥。
+   * `null` = 这个 Agent 不需要密钥；`false` = 需要但没配（界面要提示去哪儿配）。
+   */
+  credentialOk?: boolean | null
 }
 
 export interface AgentRegistrationInput {
@@ -76,6 +87,8 @@ export interface AgentRegistrationInput {
   protocol: string
   executable: string | null
   args: string[]
+  /** 见 {@link AgentRegistrationView.env}：值可以是字面量，也可以是 `secret:<key>` 引用。 */
+  env?: Record<string, string>
   enabled?: boolean
 }
 
@@ -142,6 +155,16 @@ export interface AgentSessionInfoView {
   customTitle?: string
   gitBranch?: string
   cwd?: string
+  /**
+   * 界面直接显示的名字（主进程按 `resolveSessionTitle` 定好优先级）。
+   * 各通道给的原生字段参差不齐 —— dsh 的 `session/list` 只回 sessionId + cwd，
+   * 所以"我们自己存的名字 / 我们记的首条提问"也要参与，最终给一个能看懂的名字。
+   */
+  title?: string | null
+  /** 这个名字是哪来的（`stored` = 用户手改或 AI 总结；`agent` / `ours` / `prompt`） */
+  titleSource?: 'stored' | 'agent' | 'ours' | 'prompt' | null
+  /** 没有名字时界面显示的短 id（前 8 位） */
+  shortId?: string
 }
 
 /** 一次文件改动的结构化差异（主进程算好，渲染进程只负责画） */
@@ -248,6 +271,11 @@ export interface LogicReaderApi {
     graphPatch(graphId: string, patch: unknown): Promise<void>
     graphDelete(graphId: string): Promise<void>
     conversationUpsert(payload: unknown): Promise<void>
+    /**
+     * 把远端会话 id 写到我们自己的会话行上（历史列表靠它把"我们的首条提问"当成标题）。
+     * 只在还没有值时写，不覆盖。
+     */
+    conversationSetRemoteSession(conversationId: string, remoteSessionId: string): Promise<void>
     conversationList(docId: string): Promise<unknown[]>
     conversationGet(id: string): Promise<unknown | null>
     messageAppend(payload: unknown): Promise<void>
@@ -283,6 +311,10 @@ export interface LogicReaderApi {
    * （两者都与 VS Code 扩展共用同一份数据）。
    */
   history(dir: string | null, limit?: number, agentId?: string | null): Promise<AgentSessionInfoView[]>
+  /** 给某个历史会话改名（存本地；最高优先级，盖过 Agent 自己给的名字） */
+  historyRename(agentId: string, sessionId: string, title: string): Promise<void>
+  /** 让 Agent 用一句话给某个历史会话"总结命名"（续聊那条会话再问，一次很小的调用） */
+  historyName(agentId: string, sessionId: string, firstPrompt?: string | null): Promise<string | null>
   /** 工作区文件索引（"@ 文件引用"用；主进程缓存，遵守 respectGitIgnore） */
   files(dir: string | null, query?: string, limit?: number): Promise<WorkspaceFileView[]>
   /** 把文件回退到某个检查点（用户消息）之前；dryRun 只预演不改盘 */

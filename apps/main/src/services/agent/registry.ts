@@ -9,9 +9,12 @@ import { readVersion, resolveAgentExecutable } from './exec'
 import { settingsService } from '../settings.service'
 import { MockAdapter } from './mock'
 import { SdkAdapter } from './sdk'
-import { CLI_SPECS, CliSession } from './cli'
+import { CLI_SPECS, CliSession, cliLaunchPrefix } from './cli'
 import { CodexAdapter } from './codex'
 import { buildModelConfigOptions } from './model-view'
+import { DEEPSEEK_API_KEY_ENV, mergeAgentEnv } from './env'
+// 兜底模型清单位于 fallback-models.ts（那里不依赖 electron，单测可直接钉住 dsh 的目录）
+import { FALLBACK_MODELS } from './fallback-models'
 import type { AgentAdapter, AgentCapability, AgentKind, AgentRegistration, AgentSessionHandle, AgentEvent, PromptInput, SessionOptions, ConfigOption, ModelOption } from './types'
 
 /** 内置定义：三家主力 Agent + Gemini + 离线 Mock。 */
@@ -74,28 +77,6 @@ export const BUILTIN_DEFINITIONS: AgentRegistration[] = [
     builtin: true
   }
 ]
-
-/** 探测不到 ACP 配置项时的回退目录（规划书 §5.5.3.4）。 */
-const FALLBACK_MODELS: Record<AgentKind, ModelOption[]> = {
-  'claude-code': [
-    // 不传 --model，沿用用户 Claude Code 自身的模型配置
-    { id: 'default', name: '默认（跟随 CLI 配置）' },
-    { id: 'sonnet', name: 'Sonnet', thoughtLevels: [{ id: 'low', name: '低' }, { id: 'medium', name: '中' }, { id: 'high', name: '高' }], defaultThoughtLevel: 'medium' },
-    { id: 'opus', name: 'Opus', thoughtLevels: [{ id: 'low', name: '低' }, { id: 'medium', name: '中' }, { id: 'high', name: '高' }, { id: 'max', name: '最高' }], defaultThoughtLevel: 'high' },
-    { id: 'haiku', name: 'Haiku', thoughtLevels: [{ id: 'low', name: '低' }, { id: 'medium', name: '中' }], defaultThoughtLevel: 'low' },
-    { id: 'opusplan', name: 'Opus Plan' }
-  ],
-  codex: [
-    { id: 'gpt-5-codex', name: 'gpt-5-codex', thoughtLevels: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'].map((id) => ({ id, name: id })), defaultThoughtLevel: 'medium' },
-    { id: 'gpt-5', name: 'gpt-5', thoughtLevels: ['none', 'low', 'medium', 'high'].map((id) => ({ id, name: id })), defaultThoughtLevel: 'medium' }
-  ],
-  dsh: [
-    { id: 'deepseek-chat', name: 'deepseek-chat' },
-    { id: 'deepseek-reasoner', name: 'deepseek-reasoner', thoughtLevels: [{ id: 'low', name: '低' }, { id: 'medium', name: '中' }, { id: 'high', name: '高' }], defaultThoughtLevel: 'medium' }
-  ],
-  gemini: [{ id: 'default', name: 'Default' }],
-  custom: [{ id: 'default', name: 'Default' }]
-}
 
 export class AgentRegistry {
   private registrations = new Map<string, AgentRegistration>()
@@ -219,11 +200,34 @@ export class AgentRegistry {
     return documentDir
   }
 
+  /**
+   * 该 Agent 子进程要带的环境变量（内置默认 + 用户配置，`secret:` 引用走密钥库）。
+   *
+   * 会话（CLI / ACP / 探测用的 `--version`）都从这里取，保证"设置里填的密钥"
+   * 与"真正传给子进程的密钥"同源 —— 之前 `agents.env_json` 是**只落库、不生效**的。
+   */
+  resolveEnv(id: string): Record<string, string> {
+    const registration = this.registrations.get(id)
+    if (!registration) return {}
+    const getSecret = (key: string): string | null => settingsService.getSecret(key)
+    // shim 自己声明的启动环境（如 ELECTRON_RUN_AS_NODE）放在最前：它属于"怎么启动"，
+    // 但用户仍然可以在 Agent 的 env 里显式覆盖（例如换成另一个 Node）。
+    return { ...(this.capabilities.get(id)?.launchEnv ?? {}), ...mergeAgentEnv(registration.kind, registration.env, getSecret) }
+  }
+
+  /** 该 Agent 是否已经拿到密钥（只对需要密钥的 Agent 有意义，用于界面提示）。 */
+  hasCredentials(id: string): boolean | null {
+    const registration = this.registrations.get(id)
+    if (!registration) return null
+    if (registration.kind !== 'dsh') return null
+    return Object.prototype.hasOwnProperty.call(this.resolveEnv(id), DEEPSEEK_API_KEY_ENV)
+  }
+
   async probe(id: string, force = false): Promise<AgentCapability> {
     const registration = this.registrations.get(id)
     if (!registration) throw new Error('未知的 Agent：' + id)
     const cached = this.capabilities.get(id)
-    if (cached && !force) return cached
+    if (cached && !force && cacheUsable(cached)) return cached
 
     if (registration.protocol === 'mock') {
       const adapter = new MockAdapter(id)
@@ -291,6 +295,7 @@ export class AgentRegistry {
         version: null,
         executable: null,
         launchArgs: [],
+        launchEnv: {},
         supportsAcp: false,
         supportsSdk: false,
         supportsResume: false,
@@ -302,7 +307,9 @@ export class AgentRegistry {
         configOptions: [],
         defaultModel: null,
         defaultThoughtLevel: null,
-        error: resolved.error ?? '不可用',
+        error: resolved.error
+          ? resolved.error + unavailableHint(registration.kind)
+          : '不可用' + unavailableHint(registration.kind),
         probedAt: Date.now(),
         builtin: registration.builtin
       }
@@ -311,7 +318,16 @@ export class AgentRegistry {
       return capability
     }
 
-    const version = await readVersion(resolved.command, [...resolved.prefixArgs, '--version'], process.cwd())
+    /**
+     * 探测这一趟要带的环境变量：内置/用户配置（`resolveEnv`）**加上 shim 自己声明的启动环境**。
+     *
+     * 后者必须在这里显式并进来：`resolveEnv` 会读"已缓存的能力"里的 `launchEnv`，而**首次探测时
+     * 那份能力还不存在** —— 少了 `ELECTRON_RUN_AS_NODE=1`，dsh 桌面端那个 exe 会当 GUI 程序启动，
+     * `--version` 一个字节都不输出（实测：启动时 `dsh=` 空白，手动"重新探测"又变成 0.2.0-rc.2，
+     * 就是这个原因）。会话路径不受影响 —— 那时能力已经缓存，`resolveEnv` 自然带上了。
+     */
+    const env = { ...this.resolveEnv(id), ...resolved.env }
+    const version = await readVersion(resolved.command, [...resolved.prefixArgs, '--version'], process.cwd(), env)
     const models = FALLBACK_MODELS[registration.kind] ?? FALLBACK_MODELS.custom
     const isAcp = registration.protocol === 'acp'
     const capability: AgentCapability = {
@@ -323,6 +339,8 @@ export class AgentRegistry {
       version,
       executable: resolved.command,
       launchArgs: [...resolved.prefixArgs, ...registration.args],
+      // shim 里写死的启动环境（dsh 桌面端的 ELECTRON_RUN_AS_NODE 就走这里）
+      launchEnv: resolved.env,
       supportsAcp: isAcp,
       supportsSdk: false,
       supportsPermissionModeSwitch: false,
@@ -410,6 +428,33 @@ function parseJson<T>(value: unknown, fallback: T): T {
   }
 }
 
+/**
+ * "探测失败"的结论只缓存这么久，过期就重新探测。
+ *
+ * 为什么必须要这条：能力缓存是按协议持久化的（`agents.capability_json`），
+ * 而"未找到可执行文件"是个**会过期的结论** —— 用户完全可能刚把这个工具装上。
+ * 本轮实况：库里那条 16:38 的 dsh 缓存写着 `未找到可执行文件：dsh`，
+ * 于是**新版也不再探测它**，界面上永远看不到 DeepSeek Harness。
+ * 成功的结论不受影响（一直复用，要刷新就点"重新探测"）。
+ */
+const UNAVAILABLE_RETRY_MS = 60 * 1000
+
+function cacheUsable(capability: AgentCapability): boolean {
+  if (capability.available) return true
+  return Date.now() - capability.probedAt < UNAVAILABLE_RETRY_MS
+}
+
+/**
+ * "探测不到可执行文件"时的补充提示。
+ * 只说**怎么做**，不猜用户机器上装了什么 —— 提示要能直接照着做。
+ */
+function unavailableHint(kind: AgentKind): string {
+  if (kind === 'dsh') {
+    return '。安装：npm i -g @deepseek-ai/dsh（装好后本程序会自动探测；也可在 Agent 管理器里手动指定可执行文件路径）'
+  }
+  return ''
+}
+
 /** CLI / ACP 统一适配器：优先 ACP，失败或未配置时回退 CLI。 */
 class CliOrAcpAdapter implements AgentAdapter {
   readonly kind: AgentKind
@@ -441,7 +486,14 @@ class CliOrAcpAdapter implements AgentAdapter {
       throw new Error(capability.error ?? 'Agent 不可用')
     }
     const spec = CLI_SPECS[this.registration.kind] ?? CLI_SPECS.dsh
-    return new CliSession(options.sessionId ?? createId('sess'), capability.executable, capability.launchArgs, spec, options, onEvent)
+    /**
+     * 回落到 CLI 时要把"注册表里给 ACP 用的参数"摘掉：`dsh` 的内置参数是
+     * `--profile acp`，而 CLI spec 会自己选 `--profile headless`，两个叠在一起 dsh
+     * 启动器直接报 `select a profile only once`（详见 cli.ts 的 cliLaunchPrefix）。
+     */
+    const prefixArgs = cliLaunchPrefix(capability.launchArgs, this.registration.args)
+    const sessionOptions: SessionOptions = { ...options, env: { ...this.registry.resolveEnv(this.registration.id), ...(options.env ?? {}) } }
+    return new CliSession(sessionOptions.sessionId ?? createId('sess'), capability.executable, prefixArgs, spec, sessionOptions, onEvent)
   }
 }
 

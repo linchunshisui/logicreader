@@ -16,18 +16,9 @@ import { useUiStore } from '../../state/ui.store'
 import { executeCommand } from '../../state/commands.store'
 import { notify } from '../../state/notifications.store'
 import { IconAgent, IconChevronDown, IconChevronRight, IconPlus } from '../../workbench/icons'
+import { AgentMarkdown } from './AgentMarkdown'
 
 type Popover = 'none' | 'mode' | 'model' | 'effort' | 'history' | 'agent'
-
-/**
- * 一键对切的目标：Claude Code ↔ Codex。
- *
- * 这两个是本工程的对标通道（各自走官方通道：Claude = 官方 SDK，Codex = 官方 app-server），
- * 用户来回比对是常态，而原来只能"设置 → Agent 管理器"里改，太深。
- * 只在这两者之间给按钮，不做成一排 Agent 快捷方式 —— 其它 Agent（DSH / Gemini / 自建）
- * 仍然只在下面的 Agent 选择器里出现。
- */
-const CROSS_SWITCH: Record<string, string> = { 'claude-code': 'codex', codex: 'claude-code' }
 
 /** 协议 → 选择器里那行小字（告诉用户这条通道是怎么接的）。 */
 const PROTOCOL_KEY: Record<string, string> = {
@@ -57,6 +48,17 @@ export function AgentSidebarView(): JSX.Element {
   const [popover, setPopover] = useState<Popover>('none')
   /** 斜杠面板里当前选中的下标（键盘导航用） */
   const [slashIndex, setSlashIndex] = useState(0)
+  /** 历史会话：正在改名的会话 id 与草稿；以及"总结命名"进行中的会话 id */
+  const [renamingId, setRenamingId] = useState<string | null>(null)
+  const [renameDraft, setRenameDraft] = useState('')
+  const [namingId, setNamingId] = useState<string | null>(null)
+
+  const commitRename = async (sessionId: string): Promise<void> => {
+    const text = renameDraft.trim()
+    setRenamingId(null)
+    if (text.length === 0) return
+    await useAgent.getState().renameHistorySession(sessionId, text)
+  }
 
   const activeTab = tabs.activeTab()
   const docId = activeTab && (activeTab.kind === 'reader' || activeTab.kind === 'graph') ? activeTab.docId : null
@@ -105,16 +107,11 @@ export function AgentSidebarView(): JSX.Element {
     [agent.agents, agent.selectedAgentId]
   )
   const availableAgents = agent.agents.filter((item) => item.capability?.available)
-
-  /**
-   * 一键对切的目标（Claude Code ↔ Codex）：对方**可用**时才出现。
-   * 不可用就不给按钮 —— 给一个点了报错的按钮比不给更糟。
-   */
-  const crossTarget = useMemo(() => {
-    const counterpart = agent.selectedAgentId ? CROSS_SWITCH[agent.selectedAgentId] : undefined
-    if (!counterpart) return null
-    return agent.agents.find((item) => item.id === counterpart && item.capability?.available) ?? null
-  }, [agent.agents, agent.selectedAgentId])
+  /** 探测到但**不可用**的（装了没找到路径 / 缺依赖）：列出来并说明原因，不再静默隐藏 */
+  const unavailableAgents = useMemo(
+    () => agent.agents.filter((item) => item.capability && !item.capability.available),
+    [agent.agents]
+  )
 
   /**
    * 模型清单以 `resolvedModels`（CLI 亲口说的那份）为准，退到能力清单。
@@ -474,35 +471,135 @@ export function AgentSidebarView(): JSX.Element {
                     </button>
                   ))
                 )}
+                {/**
+                 * **不可用的也要列出来**（灰掉、不可点、把原因写在下面）。
+                 * 以前这里只显示可用通道，"装了却没找到"就变成一片沉默 —— 用户根本不知道
+                 * 程序有没有看见那个工具（本轮的真实现象：库里一条过期的"未找到可执行文件"
+                 * 让 dsh 直接从列表里消失）。原因通常就是路径没被找到，去设置 → Agent 管理器能修。
+                 */}
+                {unavailableAgents.map((item) => (
+                  <div className="lr-agent__picker-item" key={item.id} data-disabled="true" title={item.capability?.error ?? undefined}>
+                    <span className="lr-agent__picker-glyph" aria-hidden="true">
+                      ⊘
+                    </span>
+                    <span className="lr-agent__picker-body">
+                      <span className="lr-agent__picker-name">
+                        {item.displayName}
+                        <span className="lr-agent__picker-desc"> · {t('settings.agent.unavailable')}</span>
+                      </span>
+                      <span className="lr-agent__picker-desc">{item.capability?.error ?? t('agent.notFound')}</span>
+                    </span>
+                  </div>
+                ))}
               </div>
             ) : null}
             {popover === 'history' ? (
               <div className="lr-agent__picker">
                 <div className="lr-agent__picker-head">
                   <span>{t('agent.historyTitle')}</span>
-                  <span className="lr-agent__picker-hint">{t('agent.historyHint')}</span>
+                  {/**
+                   * 提示按**当前通道**说：以前写死成"与 VS Code 共用同一份 Claude Code 会话记录"，
+                   * 选 dsh 时那句话就是错的（用户直接指出来的）。
+                   */}
+                  <span className="lr-agent__picker-hint">
+                    {t(
+                      capability?.protocol === 'app-server'
+                        ? 'agent.historyHintCodex'
+                        : capability?.protocol === 'acp'
+                          ? 'agent.historyHintAcp'
+                          : capability?.protocol === 'sdk'
+                            ? 'agent.historyHintSdk'
+                            : 'agent.historyHint'
+                    )}
+                  </span>
                 </div>
                 {agent.history.length === 0 ? (
                   <div className="lr-agent__picker-empty">{t('agent.historyEmpty')}</div>
                 ) : (
                   agent.history.map((item) => (
                     <div className="lr-agent__picker-row" key={item.sessionId}>
-                      <button
-                        className="lr-agent__picker-item"
-                        onClick={() => {
-                          setPopover('none')
-                          void agent.resumeSession(item.sessionId)
-                        }}
-                      >
-                        <span className="lr-agent__picker-body">
-                          <span className="lr-agent__picker-name">
-                            {(item.customTitle || item.summary || item.firstPrompt || item.sessionId).slice(0, 90)}
-                          </span>
-                          <span className="lr-agent__picker-desc">
-                            {formatWhen(item.lastModified)}
-                            {item.gitBranch ? ' · ' + item.gitBranch : ''}
+                      {renamingId === item.sessionId ? (
+                        /**
+                         * 改名：就地输入（**Enter 确定** / Esc 取消）。
+                         * `onMouseDown` 要挡住：面板对"点到空白处"的监听挂在 window 上，
+                         * 不挡的话点进输入框就会先把整个弹层关掉（本轮就是这个 bug，
+                         * 输入框根本留不住，回车自然也谈不上）。
+                         */
+                        <span
+                          className="lr-agent__picker-body lr-agent__rename"
+                          onMouseDown={(event) => event.stopPropagation()}
+                        >
+                          <input
+                            autoFocus
+                            value={renameDraft}
+                            placeholder={t('agent.historyRenamePlaceholder')}
+                            onFocus={(event) => event.target.select()}
+                            onChange={(event) => setRenameDraft(event.target.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === 'Enter') {
+                                event.preventDefault()
+                                void commitRename(item.sessionId)
+                              } else if (event.key === 'Escape') {
+                                event.preventDefault()
+                                setRenamingId(null)
+                              }
+                            }}
+                          />
+                          <span className="lr-agent__rename-actions">
+                            <button className="lr-chip" onClick={() => void commitRename(item.sessionId)}>
+                              {t('common.save')}
+                            </button>
+                            <button className="lr-chip" onClick={() => setRenamingId(null)}>
+                              {t('common.cancel')}
+                            </button>
                           </span>
                         </span>
+                      ) : (
+                        <button
+                          className="lr-agent__picker-item"
+                          onClick={() => {
+                            setPopover('none')
+                            void agent.resumeSession(item.sessionId)
+                          }}
+                        >
+                          <span className="lr-agent__picker-body">
+                            <span className="lr-agent__picker-name">
+                              {item.title ?? t('agent.historyUntitled', { id: item.shortId ?? item.sessionId.slice(0, 8) })}
+                            </span>
+                            <span className="lr-agent__picker-desc">
+                              {formatWhen(item.lastModified)}
+                              {item.titleSource === 'stored' ? ' · ' + t('agent.historyNamed') : ''}
+                              {item.gitBranch ? ' · ' + item.gitBranch : ''}
+                            </span>
+                          </span>
+                        </button>
+                      )}
+                      {/* 总结命名：让 Agent 续聊这条会话、用一句话概括它（很小的调用） */}
+                      <button
+                        className="lr-agent__picker-action"
+                        title={t('agent.historyNameHint')}
+                        disabled={namingId === item.sessionId}
+                        onMouseDown={(event) => event.stopPropagation()}
+                        onClick={() => {
+                          setNamingId(item.sessionId)
+                          void agent
+                            .nameHistorySession(item.sessionId, item.firstPrompt ?? null)
+                            .finally(() => setNamingId(null))
+                        }}
+                      >
+                        {namingId === item.sessionId ? t('agent.historyNaming') : t('agent.historyName')}
+                      </button>
+                      {/* 改名：自己起一个更好记的名字 */}
+                      <button
+                        className="lr-agent__picker-action"
+                        title={t('agent.historyRenameHint')}
+                        onMouseDown={(event) => event.stopPropagation()}
+                        onClick={() => {
+                          setRenamingId(item.sessionId)
+                          setRenameDraft(item.title ?? '')
+                        }}
+                      >
+                        {t('agent.historyRename')}
                       </button>
                       {/* 分叉：复制这条会话的历史另起一条线，原会话不动（与"续聊"是两回事） */}
                       <button
@@ -601,24 +698,6 @@ export function AgentSidebarView(): JSX.Element {
           </button>
 
           {/* 一键对切 Claude Code ↔ Codex：对方可用时才出现，切过去就自动消失 */}
-          {crossTarget ? (
-            <button
-              className="lr-agent__chip"
-              data-chip="agent-switch"
-              data-active="true"
-              title={t('agent.switchToHint', { name: crossTarget.displayName })}
-              onMouseDown={(event) => event.stopPropagation()}
-              onClick={() => {
-                setPopover('none')
-                void agent.selectAgent(crossTarget.id).then(() => {
-                  notify(t('agent.switched', { name: crossTarget.displayName }), 'success')
-                })
-              }}
-            >
-              {t('agent.switchTo', { name: crossTarget.displayName })}
-            </button>
-          ) : null}
-
           <button
             className="lr-agent__mode"
             data-mode={agent.permissionMode}
@@ -634,6 +713,7 @@ export function AgentSidebarView(): JSX.Element {
 
           <button
             className="lr-agent__chip"
+            data-chip="history"
             title={t('agent.historyTitle')}
             onMouseDown={(event) => event.stopPropagation()}
             onClick={() => {
@@ -643,17 +723,6 @@ export function AgentSidebarView(): JSX.Element {
             }}
           >
             {t('agent.historyButton')}
-          </button>
-
-          {/* 计划模式一键进入：它是最常用的"先看方案再动手"，埋进档位弹层太深 */}
-          <button
-            className="lr-agent__chip"
-            data-active={agent.permissionMode === 'plan'}
-            title={t('agent.planButtonHint')}
-            onMouseDown={(event) => event.stopPropagation()}
-            onClick={() => void agent.setPermissionMode(agent.permissionMode === 'plan' ? 'manual' : 'plan')}
-          >
-            {t('agent.planButton')}
           </button>
 
           <div className="lr-agent__composer-spacer" />
@@ -836,7 +905,18 @@ function MessageEntry({
             </div>
           ))}
           {message.content.length > 0 ? (
-            <div className="lr-entry__text lr-selectable">{message.content}</div>
+            /**
+             * 正文按 markdown 渲染（模型回的就是 markdown）。
+             * 流式过程中保持纯文本：token 级增量下每来一个字都重新解析 markdown 是白烧 CPU，
+             * 而用户此刻只关心"字在往外冒"；本轮结束（done）就换成渲染好的版本。
+             */
+            message.status === 'streaming' ? (
+              <div className="lr-entry__text lr-selectable">{message.content}</div>
+            ) : (
+              <div className="lr-entry__md lr-selectable">
+                <AgentMarkdown text={message.content} />
+              </div>
+            )
           ) : message.status === 'streaming' && message.tools.length === 0 && message.thinking.length === 0 ? (
             <div className="lr-entry__note">{t('agent.statusWorking')}</div>
           ) : null}
@@ -1049,6 +1129,11 @@ function PlanReviewCard({ plan }: { plan: { messageId: string; plan: string; fil
   const [busy, setBusy] = useState(false)
   const request = agent.permissions.find((item) => item.kind === 'plan')
   /**
+   * 按钮文案里的 Agent 名字：以前写死成 "让 Claude 继续完善" ——
+   * 换成 dsh / Codex 之后那句就成了错话（本轮实测：面板里跑的是 DeepSeek Harness，按钮还写着 Claude）。
+   */
+  const agentName = agent.agents.find((item) => item.id === agent.selectedAgentId)?.displayName ?? t('activity.agent')
+  /**
    * 没有权限请求时（模型没调 ExitPlanMode 的兜底路径）也要能批准：
    * 那种情况下"批准"就是切档动手，不需要放行任何工具调用。
    */
@@ -1079,13 +1164,16 @@ function PlanReviewCard({ plan }: { plan: { messageId: string; plan: string; fil
           </span>
         ) : null}
       </div>
-      <div className="lr-plancard__body lr-scroll lr-selectable">{plan.plan || t('agent.planEmpty')}</div>
+      {/* 方案正文按 markdown 渲染：模型给的就是 `###` / 表格 / 列表，源码直出等于没排版 */}
+      <div className="lr-plancard__body lr-scroll lr-selectable">
+        {plan.plan ? <AgentMarkdown text={plan.plan} /> : t('agent.planEmpty')}
+      </div>
       <div className="lr-plancard__actions">
         <button className="lr-button" disabled={busy} onClick={() => void decide(true)}>
           {t('agent.planApprove')}
         </button>
         <button className="lr-button lr-button--secondary" disabled={busy} onClick={() => void decide(false)}>
-          {t('agent.planReject')}
+          {t('agent.planReject', { name: agentName })}
         </button>
       </div>
     </div>

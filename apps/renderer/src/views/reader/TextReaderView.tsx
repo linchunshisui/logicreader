@@ -11,6 +11,7 @@ import { api } from '../../lib/api'
 import { useReaderSelection } from '../../lib/readerSelection'
 import { useRevealRequest } from '../../lib/revealRequest'
 import { markRange, useClearRevealOnReset } from '../../lib/revealMark'
+import { anchorElementFor, useZoomAnchor } from '../../lib/zoomAnchor'
 import { SelectionToolbar } from './SelectionToolbar'
 
 interface Props {
@@ -96,6 +97,21 @@ export function TextReaderView({ tab, model }: Props): JSX.Element {
     applyReveal(request.charStart, request.charEnd, { hold: request.hold, durationMs: request.durationMs })
   )
   useClearRevealOnReset(containerRef)
+
+  /**
+   * 缩放锚点：跳转高亮 / 用户选区那一段在缩放后**仍然居中、开头可见**。
+   * 纯文本按字号缩放 → 上面的行数变多，目标段会整体下移；不重新对齐就会漂出视口。
+   */
+  useZoomAnchor({
+    containerRef,
+    docId: model.docId,
+    layoutKey: String(zoom),
+    resolveRect: (anchor) => {
+      const root = containerRef.current
+      const element = root ? anchorElementFor(root, model, anchor.charStart) : null
+      return element ? element.getBoundingClientRect() : null
+    }
+  })
 
   const persistSelection = useCallback(async () => {
     const selection = useUiStore.getState().selection

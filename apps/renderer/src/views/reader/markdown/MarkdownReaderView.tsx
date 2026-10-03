@@ -14,6 +14,7 @@ import { registerReaderController } from '../../../state/readerBridge'
 import { alignElementsToText, useReaderSelection } from '../../../lib/readerSelection'
 import { useRevealRequest } from '../../../lib/revealRequest'
 import { markRange, useClearRevealOnReset } from '../../../lib/revealMark'
+import { anchorElementFor, useZoomAnchor } from '../../../lib/zoomAnchor'
 import { SelectionToolbar } from '../SelectionToolbar'
 import { CodeBlock } from './CodeBlock'
 
@@ -174,6 +175,21 @@ export function MarkdownReaderView({ tab, model }: Props): JSX.Element {
     applyReveal(request.charStart, request.charEnd, { hold: request.hold, durationMs: request.durationMs })
   )
   useClearRevealOnReset(scrollRef)
+
+  /**
+   * 缩放锚点：跳转高亮 / 用户选区那一段在缩放后**仍然居中、开头可见**。
+   * Markdown 按字号缩放 → 上面的内容重排、行高全变；不重新对齐就会漂出视口。
+   */
+  useZoomAnchor({
+    containerRef: scrollRef,
+    docId: model.docId,
+    layoutKey: String(zoom),
+    resolveRect: (anchor) => {
+      const root = scrollRef.current
+      const element = root ? anchorElementFor(root, model, anchor.charStart) : null
+      return element ? element.getBoundingClientRect() : null
+    }
+  })
 
   useEffect(() => {
     return registerReaderController({
