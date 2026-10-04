@@ -226,6 +226,12 @@ export class StoreService {
       for (const sql of SCHEMA) this.db.exec(sql)
       ensureColumn(this.db, 'graphs', 'doc_hash', 'TEXT')
       ensureColumn(this.db, 'graphs', 'title', 'TEXT')
+      ensureColumn(this.db, 'graphs', StoreService.GEN_CONFIG_COLUMN, 'TEXT')
+      /**
+       * 消息的核心诉求摘要（历史回放显示"用户真正想问的那句"，实际提问保持完整原文——两者分开存）。
+       * 旧库补列后历史消息 summary 为 NULL，回放退回显示 content。
+       */
+      ensureColumn(this.db, 'messages', 'summary', 'TEXT')
       logMain('info', 'store', 'SQLite 主库已就绪：' + file)
     } catch (error) {
       this.db = null
@@ -421,7 +427,18 @@ export class StoreService {
     this.requireDb().prepare('DELETE FROM annotations WHERE id = ?').run(id)
   }
 
-  // ---------------------------------------------------------------- graphs
+  // ----------------------------------------------------------- graphs
+  /**
+   * 生成配置扩展列（`graphs.gen_config_json`）：generation 里那些"后加"的字段
+   * （chunkTokens / edgeKinds / concurrency / entityThreshold / nodeLimit / sectionIds / fromPage）。
+   *
+   * 为什么单独放一列而不是塞进 stats_json：stats 是"统计结果"、generation 是"复现配置"，
+   * 两者生命周期不同（统计会被预估消费，配置会被增量重试复现），混在一起将来清理谁都碍事。
+   * 旧库没有这一列 —— `ensureColumn` 补上后历史图的 `gen_config_json` 为 NULL，
+   * 重试会落回"请求字段"语义（与旧行为一致，不比之前差）。
+   */
+  private static readonly GEN_CONFIG_COLUMN = 'gen_config_json'
+
   graphSave(graph: LogicGraph): void {
     const now = Date.now()
     if (!this.db) {
@@ -433,21 +450,32 @@ export class StoreService {
     const db = this.requireDb()
     db.exec('BEGIN')
     try {
+      const genConfig = graph.generation ?? ({} as LogicGraph['generation'])
+      const genConfigJson = JSON.stringify({
+        chunkTokens: genConfig.chunkTokens ?? null,
+        edgeKinds: genConfig.edgeKinds ?? null,
+        concurrency: genConfig.concurrency ?? null,
+        entityThreshold: genConfig.entityThreshold ?? null,
+        nodeLimit: genConfig.nodeLimit ?? null,
+        sectionIds: genConfig.sectionIds ?? null,
+        fromPage: genConfig.fromPage ?? null
+      })
       db.prepare(
-        `INSERT INTO graphs (id, doc_id, doc_hash, title, agent_id, agent_name, model_id, thinking_effort, prompt_version, precision, scope, status, created_at, updated_at, stats_json, ignored_edges_json, error)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        `INSERT INTO graphs (id, doc_id, doc_hash, title, agent_id, agent_name, model_id, thinking_effort, prompt_version, precision, scope, status, created_at, updated_at, stats_json, ignored_edges_json, error, ${StoreService.GEN_CONFIG_COLUMN})
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET doc_id=excluded.doc_id, doc_hash=excluded.doc_hash, title=excluded.title,
            agent_id=excluded.agent_id, agent_name=excluded.agent_name,
            model_id=excluded.model_id, thinking_effort=excluded.thinking_effort, prompt_version=excluded.prompt_version,
            precision=excluded.precision, scope=excluded.scope, status=excluded.status,
            updated_at=excluded.updated_at, stats_json=excluded.stats_json,
-           ignored_edges_json=excluded.ignored_edges_json, error=excluded.error`
+           ignored_edges_json=excluded.ignored_edges_json, error=excluded.error, ${StoreService.GEN_CONFIG_COLUMN}=excluded.${StoreService.GEN_CONFIG_COLUMN}`
       ).run(
         graph.id, graph.docId, graph.docHash, graph.title,
         graph.generation.agentId, graph.generation.agentName, graph.generation.modelId,
         graph.generation.thinkingEffort, graph.generation.promptVersion, graph.generation.precision, graph.generation.scope,
         graph.status, graph.createdAt || now, graph.updatedAt || now,
-        JSON.stringify(graph.stats ?? emptyStats()), JSON.stringify(graph.ignoredEdges ?? []), graph.error ?? null
+        JSON.stringify(graph.stats ?? emptyStats()), JSON.stringify(graph.ignoredEdges ?? []), graph.error ?? null,
+        genConfigJson
       )
       db.prepare('DELETE FROM graph_nodes WHERE graph_id = ?').run(graph.id)
       db.prepare('DELETE FROM graph_edges WHERE graph_id = ?').run(graph.id)
@@ -543,6 +571,7 @@ export class StoreService {
       } satisfies GraphEdge
     })
     this.attachAnchors(nodes, edges)
+    const genConfig = parseJson<Partial<LogicGraph['generation']>>(g[StoreService.GEN_CONFIG_COLUMN as keyof typeof g] as string, {})
     return {
       id: str(g.id),
       docId: str(g.doc_id),
@@ -559,7 +588,15 @@ export class StoreService {
         thinkingEffort: g.thinking_effort == null ? null : str(g.thinking_effort),
         precision: str(g.precision ?? 'structure'),
         promptVersion: str(g.prompt_version),
-        scope: str(g.scope ?? 'full')
+        scope: str(g.scope ?? 'full'),
+        // 生成配置扩展字段（增量重试按它复现同一套分块；旧图没有就是 undefined）
+        chunkTokens: genConfig.chunkTokens ?? null,
+        edgeKinds: genConfig.edgeKinds ?? null,
+        concurrency: genConfig.concurrency ?? null,
+        entityThreshold: genConfig.entityThreshold ?? null,
+        nodeLimit: genConfig.nodeLimit ?? null,
+        sectionIds: genConfig.sectionIds ?? null,
+        fromPage: genConfig.fromPage ?? null
       },
       nodes,
       edges,
@@ -574,19 +611,39 @@ export class StoreService {
     for (const n of nodes) n.anchorIds.forEach((a) => ids.add(a))
     for (const e of edges) e.anchorIds.forEach((a) => ids.add(a))
     if (ids.size === 0) return
+    /**
+     * **批量**取锚点：一张 200 节点 / 400 边的图带一千多个锚点引用，
+     * 逐条 `getAnchor(id)` 就是上千次单行 SQL —— 生成完成后 reload 会实打实卡一下。
+     * SQLite 的变量上限（老版 999）内分批 `IN` 查询，一两趟拿完；JSON 后端一次内存筛选。
+     */
     const map = new Map<string, unknown>()
-    for (const id of ids) {
-      const a = this.getAnchor(id)
-      if (a) {
-        map.set(id, {
-          docId: a.docId,
-          docHash: a.docHash,
-          charStart: a.charStart,
-          charEnd: a.charEnd,
-          quote: a.quote,
-          primary: parseJson(a.primaryJson, null),
-          extras: parseJson(a.extrasJson, [])
-        })
+    const toView = (a: AnchorRecord): unknown => ({
+      docId: a.docId,
+      docHash: a.docHash,
+      charStart: a.charStart,
+      charEnd: a.charEnd,
+      quote: a.quote,
+      primary: parseJson(a.primaryJson, null),
+      extras: parseJson(a.extrasJson, [])
+    })
+    if (!this.db) {
+      const pool = new Map(this.fallbackRead().anchors.map((a) => [a.id, toView(a)]))
+      for (const id of ids) {
+        const view = pool.get(id)
+        if (view) map.set(id, view)
+      }
+    } else {
+      const all = [...ids]
+      const batchSize = 500
+      for (let offset = 0; offset < all.length; offset += batchSize) {
+        const batch = all.slice(offset, offset + batchSize)
+        const rows = this.requireDb()
+          .prepare('SELECT * FROM anchors WHERE id IN (' + batch.map(() => '?').join(',') + ')')
+          .all(...batch)
+        for (const row of rows) {
+          const a = rowToAnchor(row)
+          map.set(a.id, toView(a))
+        }
       }
     }
     for (const n of nodes) n.anchors = n.anchorIds.map((id) => map.get(id)).filter(Boolean) as GraphNode['anchors']
@@ -604,6 +661,34 @@ export class StoreService {
     db.prepare('DELETE FROM graph_nodes WHERE graph_id = ?').run(graphId)
     db.prepare('DELETE FROM graph_edges WHERE graph_id = ?').run(graphId)
     db.prepare('DELETE FROM graphs WHERE id = ?').run(graphId)
+  }
+
+  /**
+   * 某文档最近 N 次**成功**生成的耗时样本（旧的 JSON 后端返回空数组 —— 降级场景没有耗时预估也无妨）。
+   * 供生成前的耗时预估做历史校准：elapsedMs / 波数 ≈ 单波真实耗时。
+   */
+  graphHistoryElapsed(docId: string, limit: number): { elapsedMs: number; chunkCount: number; concurrency: number }[] {
+    if (!this.db) return []
+    const rows = this.requireDb()
+      .prepare(
+        `SELECT stats_json FROM graphs
+         WHERE doc_id = ? AND status IN ('done','partial') AND stats_json IS NOT NULL
+         ORDER BY updated_at DESC LIMIT ?`
+      )
+      .all(docId, limit * 2) as Record<string, unknown>[]
+    const out: { elapsedMs: number; chunkCount: number; concurrency: number }[] = []
+    for (const row of rows) {
+      const stats = parseJson<{ elapsedMs?: number; chunkCount?: number; waveCount?: number; concurrency?: number }>(row.stats_json, {})
+      const elapsedMs = num(stats.elapsedMs, 0)
+      const chunkCount = num(stats.chunkCount, 0)
+      if (elapsedMs <= 0 || chunkCount <= 0) continue
+      const waves = stats.waveCount != null && num(stats.waveCount, 0) > 0
+        ? num(stats.waveCount, 0)
+        : Math.ceil(chunkCount / Math.max(1, num(stats.concurrency, 3)))
+      out.push({ elapsedMs, chunkCount, concurrency: Math.max(1, Math.round(chunkCount / Math.max(1, waves))) })
+      if (out.length >= limit) break
+    }
+    return out
   }
 
   // --------------------------------------------------- conversations/messages
@@ -643,6 +728,7 @@ export class StoreService {
   }
 
   messageAppend(payload: Record<string, unknown>): void {
+    const summary = payload.summary == null ? null : str(payload.summary)
     const row = {
       id: str(payload.id),
       conversation_id: str(payload.conversationId),
@@ -651,17 +737,18 @@ export class StoreService {
       anchor_ids: JSON.stringify(payload.anchorIds ?? []),
       tool_calls_json: payload.toolCalls ? JSON.stringify(payload.toolCalls) : null,
       usage_json: payload.usage ? JSON.stringify(payload.usage) : null,
-      created_at: num(payload.createdAt, Date.now())
+      created_at: num(payload.createdAt, Date.now()),
+      summary
     }
     if (!this.db) {
       this.fallbackMutate((s) => upsertBy(s.messages, 'id', row))
       return
     }
     this.requireDb().prepare(
-      `INSERT INTO messages (id, conversation_id, role, content, anchor_ids, tool_calls_json, usage_json, created_at)
-       VALUES (?,?,?,?,?,?,?,?)
-       ON CONFLICT(id) DO UPDATE SET content=excluded.content, tool_calls_json=excluded.tool_calls_json, usage_json=excluded.usage_json`
-    ).run(row.id, row.conversation_id, row.role, row.content, row.anchor_ids, row.tool_calls_json, row.usage_json, row.created_at)
+      `INSERT INTO messages (id, conversation_id, role, content, anchor_ids, tool_calls_json, usage_json, created_at, summary)
+       VALUES (?,?,?,?,?,?,?,?,?)
+       ON CONFLICT(id) DO UPDATE SET content=excluded.content, tool_calls_json=excluded.tool_calls_json, usage_json=excluded.usage_json, summary=excluded.summary`
+    ).run(row.id, row.conversation_id, row.role, row.content, row.anchor_ids, row.tool_calls_json, row.usage_json, row.created_at, row.summary)
   }
 
   messageList(conversationId: string): unknown[] {

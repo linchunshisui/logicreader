@@ -196,6 +196,83 @@ export async function listSessionsFor(dir: string, limit = 30): Promise<SdkSessi
   }
 }
 
+/** 读回放用的消息视图（与渲染端 ChatMessage 的最小公共形状）。 */
+export interface SessionTranscriptEntry {
+  role: 'user' | 'assistant'
+  text: string
+  thinking: string
+  at: number
+}
+
+interface SdkSessionMessageLike {
+  type?: unknown
+  uuid?: unknown
+  session_id?: unknown
+  message?: { role?: unknown; content?: unknown } | null
+}
+
+/**
+ * 读一个历史会话的**全部对话**（官方 `getSessionMessages`，与本机 JSONL 同源）。
+ * 只保留 user / assistant 的文本与思考块（工具调用块不进回放视图 —— 回看对话要的是内容，不是过程行）。
+ * 会话不存在 / 字段缺失时返回空数组，调用方给"看不到回放"的提示而不是报错。
+ */
+export async function readSessionTranscript(sessionId: string, dir?: string | null, limit = 200): Promise<SessionTranscriptEntry[]> {
+  const loaded = await loadSdk()
+  const reader = (loaded.module as { getSessionMessages?: (id: string, options?: Record<string, unknown>) => Promise<unknown[]> } | null)
+    ?.getSessionMessages
+  if (!reader) return []
+  try {
+    const messages = await reader(sessionId, { dir: dir ?? undefined, limit, includeSystemMessages: false })
+    if (!Array.isArray(messages)) return []
+    const entries: SessionTranscriptEntry[] = []
+    for (const raw of messages as SdkSessionMessageLike[]) {
+      const type = String(raw.type ?? '')
+      if (type !== 'user' && type !== 'assistant') continue
+      const message = raw.message ?? {}
+      const content = message.content
+      let text = ''
+      let thinking = ''
+      if (typeof content === 'string') {
+        text = content.trim()
+      } else if (Array.isArray(content)) {
+        const parts = content as { type?: unknown; text?: unknown; thinking?: unknown }[]
+        text = parts
+          .filter((part) => part?.type === 'text' && typeof part.text === 'string')
+          .map((part) => String(part.text))
+          .join('\n')
+          .trim()
+        thinking = parts
+          .filter((part) => part?.type === 'thinking' && typeof part.thinking === 'string')
+          .map((part) => String(part.thinking))
+          .join('\n')
+          .trim()
+      }
+      if (text.length === 0 && thinking.length === 0) continue
+      entries.push({ role: type === 'user' ? 'user' : 'assistant', text, thinking, at: 0 })
+    }
+    return entries
+  } catch (error) {
+    logMain('debug', 'agent', '读会话回放失败：' + String(error))
+    return []
+  }
+}
+
+/** 删除一个历史会话（官方 `deleteSession`：删本机 JSONL 与子代理记录目录）。 */
+export async function deleteSdkSession(sessionId: string, dir?: string | null): Promise<boolean> {
+  const loaded = await loadSdk()
+  const deleter = (loaded.module as { deleteSession?: (id: string, options?: Record<string, unknown>) => Promise<void> } | null)
+    ?.deleteSession
+  if (!deleter) return false
+  try {
+    await deleter(sessionId, { dir: dir ?? undefined })
+    logMain('info', 'agent', '已删除历史会话：' + sessionId)
+    return true
+  } catch (error) {
+    logMain('warn', 'agent', '删除历史会话失败：' + String(error))
+    return false
+  }
+}
+
 /**
  * SDK 自带的原生 CLI（平台可选依赖）。
  * 布局：`node_modules/@anthropic-ai/claude-agent-sdk-win32-x64/claude.exe`

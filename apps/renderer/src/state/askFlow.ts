@@ -55,6 +55,13 @@ export async function ask(options: AskOptions): Promise<void> {
     notify(i18n.t('agent.unavailableHint'), 'warning', { timeoutMs: 8000 })
     return
   }
+  // 绑定文档（恢复这篇文档的默认会话）：从选区提问时面板可能还没打开过——
+  // 不绑的话 send 会另起一条新会话，而不是落在文档默认会话里
+  if (useAgent.getState().docId !== (options.selection?.docId ?? null)) {
+    await useAgent.getState().bindDocument(options.selection?.docId ?? null)
+  }
+  // 确保默认会话已在（首轮通读若还没跑，先跑它——用户的提问会紧跟着落在同一会话里）
+  await useAgent.getState().ensureDocumentSession()
   const tabs = useTabs.getState()
   const activeTab = tabs.activeTab()
   const docId = activeTab && activeTab.kind !== 'welcome' && activeTab.kind !== 'settings' ? activeTab.docId : null
@@ -120,18 +127,26 @@ export async function ask(options: AskOptions): Promise<void> {
     includeLocationHeader: settings.reader.includeLocationHeader
   })
 
+  /**
+   * 核心诉求 = 用户真正想问的那句话（"解释选中的内容：Maximum Compound Divergence (MCD)"），
+   * 历史回放与关系图节点显示它；实际发给 Agent 的仍是完整提问（含引用材料与位置头，不精简）。
+   * 纯文本提问（没有材料前缀）的摘要就是原文本身。
+   */
+  const summary = coreIntentOf(options.question)
+
   await agent.send(options.question, {
     systemContext: payload.systemContext,
     locationLabel: payload.locationLabel,
-    anchorIds: payload.anchorIds
+    anchorIds: payload.anchorIds,
+    summary
   })
 
-  // 提问入图（FR-8.2）：回答完成后新增 inquiry 节点并与来源节点连边
+  // 提问入图（FR-8.2）：回答完成后新增 inquiry 节点（标题=核心诉求，摘要=回答开头）并与来源节点连边
   const messages = useAgent.getState().messages
   const answer = [...messages].reverse().find((message) => message.role === 'assistant')
   if (graph.graph && docId === graph.graph.docId) {
     const nodeId = await graph.addInquiryNode({
-      title: options.question.slice(0, 28),
+      title: summary.slice(0, 28),
       summary: (answer?.content ?? '').slice(0, 120),
       anchorIds: anchorId ? [anchorId] : [],
       fromNodeId: options.nodeId ?? null
@@ -150,6 +165,27 @@ const PRESET_LABEL_KEYS: Record<'explain' | 'ask' | 'translate' | 'graph', strin
   ask: 'agent.presetAsk',
   translate: 'agent.presetTranslate',
   graph: 'agent.presetToGraph'
+}
+
+/**
+ * 从一条提问里提取**核心诉求**（纯函数，可单测）。
+ *
+ * 带引用材料的提问长这样（§5.6.3 的预设构造）：
+ *   "解释选中的内容：\n<选区原文可能很长>"
+ * 核心诉求 = 动作标签 + 选区**开头一小段**（让"选的哪段"可辨认，但不把整段材料摆进历史）。
+ * 没有材料前缀的普通提问，核心诉求就是原文（截到 80 字）。
+ */
+export function coreIntentOf(question: string, maxChars = 80): string {
+  const text = question ?? ''
+  const labelEnd = text.indexOf('：')
+  if (labelEnd <= 0 || labelEnd > 30) return text.slice(0, maxChars)
+  const label = text.slice(0, labelEnd).trim()
+  if (label.length === 0) return text.slice(0, maxChars)
+  const body = text.slice(labelEnd + 1).replace(/\s+/g, ' ').trim()
+  if (body.length === 0) return label
+  const keep = Math.max(20, maxChars - label.length - 1)
+  const bodyPart = body.length > keep ? body.slice(0, keep) + '…' : body
+  return label + '：' + bodyPart
 }
 
 /**

@@ -15,6 +15,7 @@ import { useDocuments } from '../../state/documents.store'
 import { useUiStore } from '../../state/ui.store'
 import { executeCommand } from '../../state/commands.store'
 import { notify } from '../../state/notifications.store'
+import { api } from '../../lib/api'
 import { IconAgent, IconChevronDown, IconChevronRight, IconPlus } from '../../workbench/icons'
 import { AgentMarkdown } from './AgentMarkdown'
 
@@ -45,6 +46,7 @@ export function AgentSidebarView(): JSX.Element {
   const tabs = useTabs()
   const documents = useDocuments()
   const scrollRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
   const [popover, setPopover] = useState<Popover>('none')
   /** 斜杠面板里当前选中的下标（键盘导航用） */
   const [slashIndex, setSlashIndex] = useState(0)
@@ -52,6 +54,19 @@ export function AgentSidebarView(): JSX.Element {
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameDraft, setRenameDraft] = useState('')
   const [namingId, setNamingId] = useState<string | null>(null)
+
+  /**
+   * 「聚焦 Agent 输入框」的请求位（Ctrl+Shift+A / 菜单 / 面板的 ＋ 都会发）。
+   * 面板可能**刚被命令打开**——挂载需要一拍，所以消费要在挂载后做；
+   * 挂载动画/布局未稳定时直接 focus 也可能被弹层抢走，稍微让一帧。
+   */
+  const agentFocusRequest = useUiStore((state) => state.agentFocusRequest)
+  useEffect(() => {
+    if (!agentFocusRequest) return
+    useUiStore.getState().consumeAgentFocus()
+    const timer = setTimeout(() => inputRef.current?.focus(), 60)
+    return () => clearTimeout(timer)
+  }, [agentFocusRequest])
 
   const commitRename = async (sessionId: string): Promise<void> => {
     const text = renameDraft.trim()
@@ -68,6 +83,16 @@ export function AgentSidebarView(): JSX.Element {
     void useAgent.getState().init()
     void useAgent.getState().bindDocument(docId)
   }, [docId])
+
+  /**
+   * 文档默认会话的**就绪重试**：面板挂载时文档模型可能还没解析完（恢复会话的标签是异步打开的），
+   * 第一轮 ensureDocumentSession 会因"拿不到模型"静默退出 —— 文档就绪后再补一次。
+   * ensureDocumentSession 自己有幂等守卫（已有会话/已在流式就不再发），重复调用无副作用。
+   */
+  useEffect(() => {
+    if (!docId || !model) return
+    void useAgent.getState().ensureDocumentSession()
+  }, [docId, model, agent.hydratedFromSnapshot])
 
   /**
    * 启动即把真实模型清单拉回来（起临时进程探测）。
@@ -134,7 +159,17 @@ export function AgentSidebarView(): JSX.Element {
   const thoughtLevels = currentModel?.thoughtLevels ?? []
   const currentEffort = thoughtLevels.find((level) => level.id === agent.thinkingEffort) ?? null
   const extraHigh = thoughtLevels.find((level) => /xhigh|extra|max|ultra/i.test(level.id + level.name)) ?? null
-  const contextTokens = model ? estimateTokens(model.text) : 0
+  /**
+   * 上下文占用：**Agent 报的真实值优先**（事件/拉取共同刷新，跟着对话走）；
+   * 没有真实值时才退到"文档体量的静态估算"——并明说它是估算，别让用户把文档大小当成对话占用。
+   */
+  const realContext = agent.contextUsage
+  const estimatedContext = model ? estimateTokens(model.text) : 0
+  const contextLabel = realContext
+    ? t('agent.contextTokens', { tokens: realContext.used.toLocaleString() }) + (realContext.size ? ' / ' + realContext.size.toLocaleString() : '')
+    : estimatedContext > 0
+      ? t('agent.contextTokensEstimate', { tokens: estimatedContext.toLocaleString() })
+      : null
   const ready = Boolean(agent.selectedAgentId && capability?.available)
   /**
    * 模型芯片的悬停说明：把"选的角色 -> 实际解析到的模型"讲清楚。
@@ -303,11 +338,7 @@ export function AgentSidebarView(): JSX.Element {
           <span className="lr-agent__status-text">
             {agent.streaming ? t('agent.statusWorking') : capability?.displayName}
           </span>
-          {contextTokens > 0 ? (
-            <span className="lr-agent__status-meta">
-              {t('agent.contextTokens', { tokens: contextTokens.toLocaleString() })}
-            </span>
-          ) : null}
+          {contextLabel ? <span className="lr-agent__status-meta">{contextLabel}</span> : null}
         </div>
       ) : null}
 
@@ -612,6 +643,29 @@ export function AgentSidebarView(): JSX.Element {
                       >
                         {t('agent.fork')}
                       </button>
+                      {/* 删除：删掉这条会话的本机记录（目前仅 Claude Code 通道支持；先确认再动手） */}
+                      <button
+                        className="lr-agent__picker-action lr-agent__picker-action--danger"
+                        title={t('agent.historyDeleteHint')}
+                        onMouseDown={(event) => event.stopPropagation()}
+                        onClick={() => {
+                          void (async () => {
+                            const answer = await api.dialog.message({
+                              type: 'question',
+                              message: t('agent.historyDeleteConfirm', {
+                                name: item.title ?? t('agent.historyUntitled', { id: item.shortId ?? item.sessionId.slice(0, 8) })
+                              }),
+                              detail: t('agent.historyDeleteDetail'),
+                              buttons: [t('common.delete'), t('common.cancel')],
+                              cancelId: 1
+                            })
+                            if (answer !== 0) return
+                            await agent.deleteHistorySession(item.sessionId)
+                          })()
+                        }}
+                      >
+                        {t('common.delete')}
+                      </button>
                     </div>
                   ))
                 )}
@@ -622,6 +676,7 @@ export function AgentSidebarView(): JSX.Element {
 
         <div className="lr-agent__input" data-disabled={!ready}>
           <textarea
+            ref={inputRef}
             value={agent.draft}
             placeholder={ready ? t('agent.inputPlaceholder') : t('agent.notFound') + ' · ' + t('agent.unavailableHint')}
             rows={1}
@@ -677,7 +732,11 @@ export function AgentSidebarView(): JSX.Element {
             <button
               className="lr-icon-button"
               title={t('agent.newSession')}
-              onClick={() => void agent.newSession()}
+              onClick={() => {
+                void agent.newSession()
+                // 新会话清掉消息流后输入框保持焦点，用户能直接开始打字
+                setTimeout(() => inputRef.current?.focus(), 30)
+              }}
             >
               <IconPlus size={15} />
             </button>
@@ -879,13 +938,77 @@ function MessageEntry({
   notes: { id: string; text: string }[]
 }): JSX.Element {
   const { t } = useTranslation()
+  const agent = useAgent()
   const isUser = message.role === 'user'
+  /**
+   * "重试"只挂在**最后一条**失败的助手消息上（历史里的旧失败用发新消息覆盖即可，
+   * 每条错误都摆按钮会把消息流变成按钮墙）。
+   */
+  const isLastFailed =
+    message.role === 'assistant' &&
+    (message.status === 'error' || message.status === 'interrupted') &&
+    [...agent.messages].reverse().find((item) => item.role === 'assistant' && (item.status === 'error' || item.status === 'interrupted'))?.id ===
+      message.id
+  /** 有核心诉求摘要的提问：完整原文默认收起（材料在，点开才看） */
+  const [showFull, setShowFull] = useState(false)
+  /**
+   * 用户提问的锚点（选区提问时带上）：有锚点才能"点位置跳回原文"。
+   * 跳转走 `revealInReader` 唯一入口 —— 与关系图跳转同一套行为（打开/激活阅读器标签 + 常驻高亮）。
+   */
+  const [anchorView, setAnchorView] = useState<{ docId: string; charStart: number; charEnd: number; quote: string } | null>(null)
+  useEffect(() => {
+    if (!isUser || (message.anchorIds?.length ?? 0) === 0) return
+    let cancelled = false
+    void (async () => {
+      const anchor = await api.store.getAnchor(message.anchorIds![0]).catch(() => null)
+      if (cancelled || !anchor) return
+      // 锚点自带 docId：就算用户已经切换了文档/会话，跳的还是"提问当时"的那份原文
+      setAnchorView({ docId: anchor.docId, charStart: anchor.charStart, charEnd: anchor.charEnd, quote: anchor.quote })
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [isUser, message.anchorIds])
+  const jumpToSource = async (): Promise<void> => {
+    if (!anchorView) return
+    const { revealInReader } = await import('../../lib/graphJump')
+    const opened = await revealInReader(anchorView.docId, anchorView.charStart, anchorView.charEnd, { hold: true })
+    if (!opened) notify(t('graph.jumpFailed'), 'warning')
+  }
   return (
     <div className="lr-entry" data-role={message.role} data-status={message.status}>
       {isUser ? (
         <>
-          {message.locationLabel ? <div className="lr-entry__meta">↳ {message.locationLabel}</div> : null}
-          <div className="lr-entry__text lr-selectable">{message.content}</div>
+          {/* 位置来源可点击（带锚点的选区提问）：跳回原文并常驻高亮，与关系图跳转同一套行为 */}
+          {message.locationLabel ? (
+            anchorView ? (
+              <button
+                className="lr-entry__meta lr-entry__meta--link"
+                title={t('agent.jumpToSource')}
+                onClick={() => void jumpToSource()}
+              >
+                ↳ {message.locationLabel}
+              </button>
+            ) : (
+              <div className="lr-entry__meta">↳ {message.locationLabel}</div>
+            )
+          ) : null}
+          {/* 气泡里显示**核心诉求**（有摘要时）；完整原文（引用材料/位置头）按需展开看 ——
+              历史回放读的是问题，不是材料，但材料一个字也不少（点开可见）。 */}
+          {message.summary ? (
+            <>
+              <div className="lr-entry__question lr-selectable">{message.summary}</div>
+              <button
+                className="lr-entry__meta lr-entry__meta--link"
+                onClick={() => setShowFull((value) => !value)}
+              >
+                {showFull ? '▾ ' + t('agent.hideOriginal') : '▸ ' + t('agent.showOriginal')}
+              </button>
+              {showFull ? <div className="lr-entry__text lr-entry__original lr-selectable">{message.content}</div> : null}
+            </>
+          ) : (
+            <div className="lr-entry__question lr-selectable">{message.content}</div>
+          )}
         </>
       ) : (
         <>
@@ -926,6 +1049,18 @@ function MessageEntry({
           {message.status === 'error' ? <div className="lr-entry__error">{message.error}</div> : null}
           {message.status === 'interrupted' ? (
             <div className="lr-entry__error">{t('agent.interrupted')}</div>
+          ) : null}
+          {isLastFailed ? (
+            <div className="lr-entry__retry">
+              <button
+                className="lr-button lr-button--secondary"
+                disabled={agent.streaming}
+                title={t('agent.retryHint')}
+                onClick={() => void agent.retryLast()}
+              >
+                ⟳ {t('agent.retry')}
+              </button>
+            </div>
           ) : null}
           {message.usage ? (
             <div className="lr-entry__meta">
@@ -1120,13 +1255,21 @@ function documentDirectory(): string | null {
  *   → 在助手正文里给出方案 → 调 ExitPlanMode（**入参为空**）请求批准。
  * 所以"方案文字"只能从它前面的助手正文里取（主进程已把它挂在 plan-review 事件上）。
  *
- * 批准 = 放行 ExitPlanMode（CLI 会把权限模式切回 default，之后才允许改文件）；
- * 拒绝 = 拦下这次调用，模型留在计划模式继续改方案。
+ * 四个动作（用户要求"计划可由用户手动修改和手动取消"）：
+ *   批准 = 放行 ExitPlanMode（CLI 会把权限模式切回 default，之后才允许改文件）；
+ *   修改后批准 = 方案正文就地可编辑，改完按"编辑后的方案"发起新一轮（档位先切编辑自动）；
+ *   让它继续完善 = 拦下这次调用，模型留在计划模式继续改方案；
+ *   取消 = 关掉卡片，不批准不拒绝（挂起的权限请求照样收尾），留在计划模式继续对话。
  */
 function PlanReviewCard({ plan }: { plan: { messageId: string; plan: string; filePath: string | null } }): JSX.Element {
   const { t } = useTranslation()
   const agent = useAgent()
   const [busy, setBusy] = useState(false)
+  /**
+   * 编辑态：null = 只读展示（初始），非 null = 用户点过"修改"、textarea 里是草稿。
+   * 初值取模型给的原文 —— 用户想改的往往是"某几行"，从原文起步比空白框友好。
+   */
+  const [editing, setEditing] = useState<string | null>(null)
   const request = agent.permissions.find((item) => item.kind === 'plan')
   /**
    * 按钮文案里的 Agent 名字：以前写死成 "让 Claude 继续完善" ——
@@ -1154,6 +1297,24 @@ function PlanReviewCard({ plan }: { plan: { messageId: string; plan: string; fil
       setBusy(false)
     }
   }
+  const approveEdited = async (): Promise<void> => {
+    const edited = (editing ?? '').trim()
+    if (edited.length === 0) return
+    setBusy(true)
+    try {
+      await agent.approvePlanWithEdits(edited)
+    } finally {
+      setBusy(false)
+    }
+  }
+  const dismiss = async (): Promise<void> => {
+    setBusy(true)
+    try {
+      await agent.dismissPlan()
+    } finally {
+      setBusy(false)
+    }
+  }
   return (
     <div className="lr-plancard">
       <div className="lr-plancard__head">
@@ -1164,17 +1325,58 @@ function PlanReviewCard({ plan }: { plan: { messageId: string; plan: string; fil
           </span>
         ) : null}
       </div>
-      {/* 方案正文按 markdown 渲染：模型给的就是 `###` / 表格 / 列表，源码直出等于没排版 */}
-      <div className="lr-plancard__body lr-scroll lr-selectable">
-        {plan.plan ? <AgentMarkdown text={plan.plan} /> : t('agent.planEmpty')}
-      </div>
+      {/* 方案正文按 markdown 渲染：模型给的就是 `###` / 表格 / 列表，源码直出等于没排版。
+          编辑态切换成 textarea（等宽、随内容长高），"改几行"不需要进别的界面。 */}
+      {editing === null ? (
+        <div className="lr-plancard__body lr-scroll lr-selectable">
+          {plan.plan ? <AgentMarkdown text={plan.plan} /> : t('agent.planEmpty')}
+        </div>
+      ) : (
+        <textarea
+          className="lr-plancard__edit lr-scroll"
+          value={editing}
+          rows={Math.min(20, Math.max(6, editing.split('\n').length + 2))}
+          onChange={(event) => setEditing(event.target.value)}
+          onKeyDown={(event) => {
+            // Ctrl+Enter 直接按改后的方案执行；Esc 退出编辑（回到只读预览，改动丢弃前先回到预览再确认）
+            if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+              event.preventDefault()
+              void approveEdited()
+            }
+            if (event.key === 'Escape') {
+              event.preventDefault()
+              setEditing(null)
+            }
+          }}
+          spellCheck={false}
+        />
+      )}
       <div className="lr-plancard__actions">
-        <button className="lr-button" disabled={busy} onClick={() => void decide(true)}>
-          {t('agent.planApprove')}
-        </button>
-        <button className="lr-button lr-button--secondary" disabled={busy} onClick={() => void decide(false)}>
-          {t('agent.planReject', { name: agentName })}
-        </button>
+        {editing === null ? (
+          <>
+            <button className="lr-button" disabled={busy} onClick={() => void decide(true)}>
+              {t('agent.planApprove')}
+            </button>
+            <button className="lr-button lr-button--secondary" disabled={busy} onClick={() => setEditing(plan.plan)}>
+              {t('agent.planEdit')}
+            </button>
+            <button className="lr-button lr-button--secondary" disabled={busy} onClick={() => void decide(false)}>
+              {t('agent.planReject', { name: agentName })}
+            </button>
+            <button className="lr-button lr-button--secondary" disabled={busy} onClick={() => void dismiss()}>
+              {t('agent.planCancel')}
+            </button>
+          </>
+        ) : (
+          <>
+            <button className="lr-button" disabled={busy || editing.trim().length === 0} onClick={() => void approveEdited()}>
+              {t('agent.planApproveEdited')}
+            </button>
+            <button className="lr-button lr-button--secondary" disabled={busy} onClick={() => setEditing(null)}>
+              {t('agent.planEditDiscard')}
+            </button>
+          </>
+        )}
       </div>
     </div>
   )

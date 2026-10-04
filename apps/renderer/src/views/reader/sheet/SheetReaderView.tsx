@@ -163,7 +163,9 @@ export function SheetReaderView({ tab, model }: Props): JSX.Element {
           charStart: block.charStart + Math.min(column, block.text.length),
           charEnd: block.charStart + Math.min(column + (value.length || 1), block.text.length),
           anchorId: null,
-          locationLabel: sheet.name + '!' + address
+          locationLabel: sheet.name + '!' + address,
+          // 单元格选区不经 DOM Range：工具条退回底部定位（表格视图下遮挡风险本来就小）
+          rect: null
         })
       }
     },

@@ -381,6 +381,7 @@ export function registerIpc(ctx: IpcContext): void {
   )
   handle(CH.agent.sessionDispose, (_e, sessionId) => agentRuntime.dispose(assertString(sessionId, 'sessionId')))
   handle(CH.agent.models, (_e, sessionId) => agentRuntime.models(assertString(sessionId, 'sessionId')))
+  handle(CH.agent.contextUsage, (_e, sessionId) => agentRuntime.contextUsage(assertString(sessionId, 'sessionId')))
   handle(CH.agent.probeModels, (_e, agentId) => agentRuntime.probeModels(assertString(agentId, 'agentId')))
   handle(CH.agent.commands, (_e, sessionId) => agentRuntime.commands(assertString(sessionId, 'sessionId')))
   handle(CH.agent.history, (_e, dir, limit, agentId) =>
@@ -406,6 +407,20 @@ export function registerIpc(ctx: IpcContext): void {
       sessionId: assertString(sessionId, 'sessionId'),
       firstPrompt: firstPrompt == null ? null : String(firstPrompt)
     })
+  )
+  handle(CH.agent.historyTranscript, (_e, agentId, sessionId, cwd) =>
+    agentRuntime.sessionTranscript(
+      agentId == null || String(agentId).length === 0 ? null : String(agentId),
+      assertString(sessionId, 'sessionId'),
+      cwd == null || String(cwd).length === 0 ? null : String(cwd)
+    )
+  )
+  handle(CH.agent.historyDelete, (_e, agentId, sessionId, cwd) =>
+    agentRuntime.deleteHistorySession(
+      agentId == null || String(agentId).length === 0 ? null : String(agentId),
+      assertString(sessionId, 'sessionId'),
+      cwd == null || String(cwd).length === 0 ? null : String(cwd)
+    )
   )
   handle(CH.agent.files, async (_e, dir, query, limit) => {
     const target = dir == null || String(dir).length === 0 ? null : String(dir)
@@ -471,6 +486,9 @@ export function registerIpc(ctx: IpcContext): void {
       chunkTokens: typeof obj.chunkTokens === 'number' ? obj.chunkTokens : undefined,
       concurrency: typeof obj.concurrency === 'number' ? obj.concurrency : undefined,
       entityThreshold: typeof obj.entityThreshold === 'number' ? obj.entityThreshold : undefined,
+      retryChunkIndexes: Array.isArray(obj.retryChunkIndexes)
+        ? (obj.retryChunkIndexes as unknown[]).map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 0)
+        : undefined,
       edgeKinds: Array.isArray(obj.edgeKinds) ? (obj.edgeKinds as string[]) : undefined,
       locale: typeof obj.locale === 'string' ? obj.locale : undefined
     }
@@ -489,7 +507,7 @@ export function registerIpc(ctx: IpcContext): void {
   handle(CH.graph.refine, async (_e, request) => {
     const obj = assertObject(request, 'request')
     const registration = agentRegistry.get(String(obj.agentId ?? ''))
-    return graphService.refine(
+    return graphService.generate(
       {
         docId: assertString(obj.docId, 'docId'),
         graphId: obj.graphId == null ? null : String(obj.graphId),
@@ -514,10 +532,15 @@ export function registerIpc(ctx: IpcContext): void {
         docId: assertString(obj.docId, 'docId'),
         graphId: assertString(obj.graphId, 'graphId'),
         agentId: assertString(obj.agentId, 'agentId'),
+        agentName: agentRegistry.get(String(obj.agentId ?? ''))?.displayName,
         modelId: obj.modelId == null ? null : String(obj.modelId),
         thinkingEffort: obj.thinkingEffort == null ? null : String(obj.thinkingEffort),
         precision: (obj.precision as 'structure') ?? 'structure',
-        scope: 'full'
+        scope: 'full',
+        // 增量重试：只重跑失败的分块，其余抽取结果从旧图继承（规划书 §5.5.3.5）
+        retryChunkIndexes: Array.isArray(obj.failedChunkIndexes)
+          ? (obj.failedChunkIndexes as unknown[]).map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 0)
+          : undefined
       },
       (progress) => broadcast(CH.graph.progress, progress)
     )

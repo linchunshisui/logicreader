@@ -163,6 +163,13 @@ export type AgentEvent =
   | { type: 'tool-result'; id: string; name: string; output: unknown; isError: boolean }
   | { type: 'permission-request'; requestId: string; detail: PermissionDetail }
   | { type: 'usage'; inputTokens: number; outputTokens: number }
+  | {
+      /** 会话的**上下文窗口占用**（与单条消息的 usage 不同：这是当前对话总共占了多少窗口） */
+      type: 'context-usage'
+      used: number
+      /** 窗口总量；通道报不上来时为 null（界面只显示 used） */
+      size: number | null
+    }
   | { type: 'plan'; entries: { content: string; status: string }[] }
   | { type: 'plan-review'; plan: PlanView }
   | { type: 'tool-diff'; diff: ToolDiffView }
@@ -288,6 +295,12 @@ export interface AgentSessionHandle {
   prompt(input: PromptInput, onEvent: (event: AgentEvent) => void): Promise<void>
   cancel(): Promise<void>
   dispose(): Promise<void>
+  /**
+   * 会话是否已不可用（连接被杀 / 已 dispose）。
+   * 取消路径用它判断"强杀后这个句柄还能不能复用"—— 不能的话运行时把它从会话表里摘掉，
+   * 否则下一句提问还打在死句柄上（表现成"停止之后 Agent 就坏了"）。
+   */
+  isUsable?(): boolean
   setConfigOption?(optionId: string, value: string | boolean): Promise<void>
   /** 运行时切换授权模式（只有 SDK 通道支持） */
   setPermissionMode?(mode: 'manual' | 'plan' | 'edit' | 'auto'): Promise<void>

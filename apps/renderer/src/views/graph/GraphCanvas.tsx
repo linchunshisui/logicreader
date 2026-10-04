@@ -336,6 +336,9 @@ function GraphCanvasInner({ docId }: { docId: string }): JSX.Element {
                 : graph.progress.phase === 'anchors' || graph.progress.phase === 'persist'
                   ? t('graph.progressLayout')
                   : graph.progress.detail}
+            {graph.progress.phase === 'map' && typeof graph.progress.etaMs === 'number' && graph.progress.etaMs > 0
+              ? ' · ' + t('graph.progressEta', { minutes: Math.max(1, Math.round(graph.progress.etaMs / 60000)) })
+              : ''}
           </span>
           <button className="lr-button lr-button--secondary" onClick={() => void graph.cancel()}>
             {t('graph.cancel')}

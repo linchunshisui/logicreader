@@ -68,7 +68,10 @@ export function TitleBar(): JSX.Element {
   ]
 
   const agentItems: MenuItem[] = [
-    { id: 'newSession', label: t('menu.agentNewSession'), shortcut: 'Ctrl+Shift+A', run: run(CMD.agentNewSession) },
+    // Ctrl+Shift+A 实际绑定的是「聚焦 Agent 输入框」（见 keybindings.ts）——
+    // 之前把快捷键标在"新建会话"上，按下去却只是聚焦输入框，用户以为按键坏了
+    { id: 'newSession', label: t('menu.agentNewSession'), run: run(CMD.agentNewSession) },
+    { id: 'focus', label: t('cmd.agent.focusInput'), shortcut: 'Ctrl+Shift+A', run: run(CMD.agentFocusInput) },
     { id: 'ask', label: t('menu.agentAskSelection'), shortcut: 'Ctrl+Shift+Q', run: run(CMD.agentAskSelection) },
     { id: 'sep1', label: '', separator: true },
     { id: 'graph', label: t('graph.generate'), shortcut: 'Ctrl+Shift+G', run: run(CMD.graphGenerate) },

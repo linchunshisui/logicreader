@@ -116,6 +116,8 @@ export interface ExtractionResult {
 export interface ExtractionContext {
   charStart: number
   charEnd: number
+  /** 分块原文：供"模型给了 evidence 但锚点坏了"时按引文重新定位（可选，越准的兜底越要用它） */
+  chunkText?: string
   nodeKindWhitelist?: NodeKind[] | null
   edgeKindWhitelist?: EdgeKind[] | null
 }
@@ -141,15 +143,74 @@ export function parseExtraction(rawText: string, ctx: ExtractionContext): Valida
    * 弱模型常把 spans 输出成「块内相对偏移」而非要求的全局偏移，直接丢弃会让整个分块零产出。
    * 兜底：绝对解释一个都不合法、而相对解释有合法值时，换算回全局坐标（并在 issues 里留痕）。
    */
-  const resolveSpans = (spans: ExtractedSpan[], path: string): ExtractedSpan[] => {
+  const resolveSpans = (spans: ExtractedSpan[], path: string, evidence: string): ExtractedSpan[] => {
     const absolute = spans.filter(inRange)
     if (absolute.length > 0) return absolute
     const relative = spans.filter(
       (s) => isInt(s.charStart) && isInt(s.charEnd) && s.charStart >= 0 && s.charEnd <= chunkLength && s.charEnd > s.charStart
     )
-    if (relative.length === 0) return []
+    if (relative.length === 0) {
+      // 第三层兜底：锚点彻底坏了但 evidence 是真原文 —— 在分块里找到它，按命中位置重新锚定。
+      // 实测弱模型（GLM/DeepSeek 经代理）最常见的就是"引用对了、坐标全错"，这一层能把这类条目救回来。
+      const reanchored = reanchorFromEvidence(evidence)
+      if (reanchored) {
+        issues.push({ path, message: '锚点按 evidence 引文在本块内重新定位（模型坐标无效）' })
+        return [reanchored]
+      }
+      return []
+    }
     issues.push({ path, message: '锚点按块内相对偏移换算（模型未按全局坐标输出）' })
     return relative.map((s) => ({ charStart: s.charStart + ctx.charStart, charEnd: s.charEnd + ctx.charStart }))
+  }
+
+  /**
+   * evidence 重锚定的工作集（懒初始化，本块共用一份）：
+   * 归一化文本 + "归一化下标 → 原始下标"映射表。大分块 × 几十条坏锚点条目时
+   * 不能每条都重新扫一遍原文。
+   */
+  let reanchorIndex: { haystack: string; map: number[] } | null = null
+  const getReanchorIndex = (): { haystack: string; map: number[] } | null => {
+    const text = ctx.chunkText
+    if (!text) return null
+    if (reanchorIndex) return reanchorIndex
+    const haystackChars: string[] = []
+    const map: number[] = []
+    for (let i = 0; i < text.length; i += 1) {
+      if (/\s/.test(text[i])) continue
+      haystackChars.push(text[i])
+      map.push(i)
+    }
+    reanchorIndex = { haystack: haystackChars.join(''), map }
+    return reanchorIndex
+  }
+
+  /**
+   * 按 evidence 引文在分块原文里重新定位（归一化空白后精确匹配，找不到再试前 40 字前缀）。
+   * 返回全局坐标；定位不到返回 null。
+   */
+  const reanchorFromEvidence = (evidence: string): ExtractedSpan | null => {
+    if (!isString(evidence) || evidence.trim().length < 6) return null
+    const index = getReanchorIndex()
+    if (!index) return null
+    const needle = evidence.replace(/\s+/g, '')
+    if (needle.length < 6) return null
+    const { haystack, map } = index
+    const mapBack = (normStart: number, normEnd: number): ExtractedSpan | null => {
+      if (map.length === 0) return null
+      const start = Math.min(Math.max(0, normStart), map.length - 1)
+      const end = Math.min(Math.max(0, normEnd - 1), map.length - 1)
+      const rawStart = map[start]
+      const rawEnd = map[end] + 1
+      if (rawEnd <= rawStart) return null
+      return { charStart: ctx.charStart + rawStart, charEnd: ctx.charStart + rawEnd }
+    }
+    const direct = haystack.indexOf(needle)
+    if (direct >= 0) return mapBack(direct, direct + needle.length)
+    // 引文常被模型改写头尾：取前 40 字做前缀匹配
+    const prefix = needle.slice(0, 40)
+    const byPrefix = haystack.indexOf(prefix)
+    if (byPrefix >= 0) return mapBack(byPrefix, byPrefix + Math.min(needle.length, prefix.length + 60))
+    return null
   }
 
   let dropped = 0
@@ -169,7 +230,7 @@ export function parseExtraction(rawText: string, ctx: ExtractionContext): Valida
       return
     }
     const spans = Array.isArray(e.spans) ? e.spans.filter(isObject).map((s) => ({ charStart: s.charStart as number, charEnd: s.charEnd as number })) : []
-    const valid = resolveSpans(spans, p + '.spans')
+    const valid = resolveSpans(spans, p + '.spans', isString(e.evidence) ? e.evidence : '')
     if (valid.length === 0) {
       issues.push({ path: p + '.spans', message: '锚点越界或缺失' })
       dropped += 1
@@ -218,7 +279,7 @@ export function parseExtraction(rawText: string, ctx: ExtractionContext): Valida
       return
     }
     const spans = Array.isArray(r.spans) ? r.spans.filter(isObject).map((s) => ({ charStart: s.charStart as number, charEnd: s.charEnd as number })) : []
-    const valid = resolveSpans(spans, p + '.spans')
+    const valid = resolveSpans(spans, p + '.spans', isString(r.evidence) ? r.evidence : '')
     if (valid.length === 0) {
       issues.push({ path: p + '.spans', message: '锚点越界或缺失' })
       dropped += 1

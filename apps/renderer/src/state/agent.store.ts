@@ -21,6 +21,7 @@ import {
 } from '@logicreader/shared'
 import i18n from '../i18n'
 import { api } from '../lib/api'
+import { buildContext } from '../lib/contextBuilder'
 import { notify } from './notifications.store'
 import { useTabs } from './tabs.store'
 import { useDocuments } from './documents.store'
@@ -51,6 +52,8 @@ export interface ChatMessage {
   createdAt: number
   status: 'streaming' | 'done' | 'error' | 'interrupted'
   error?: string
+  /** 用户提问的**核心诉求**（有值时历史回放/关系图节点显示它；实际发给 Agent 的仍是完整 content） */
+  summary?: string
   /** 本条消息引用的锚点（用于定位角标） */
   anchorIds?: string[]
   locationLabel?: string
@@ -77,8 +80,7 @@ interface AgentState {
   /** 扩展档：Agent 声明了更高思考强度档位时才可用 */
   ultracode: boolean
   sessionId: string | null
-  conversationId: string | null
-  /**
+  conversationId: string | null  /**
    * 当前绑定的文档；`null` = 全局会话（没有打开任何文档）。
    * 初值故意用 `undefined`：`bindDocument(null)` 的守卫是"值没变就跳过"，
    * 若初值也是 `null`，首次绑定全局会话会被直接跳过 —— 快照里的授权模式/模型/草稿就永远恢复不了
@@ -116,6 +118,12 @@ interface AgentState {
    * 换 API 之后别名与真实模型不是一回事：用户选 sonnet、跑的是 GLM-5.3-Flash —— 这里存后者。
    */
   activeModel: string | null
+  /**
+   * 会话的**上下文窗口占用**（真实值：由 Agent 事件（dsh 的 usage_update / Codex 的 tokenUsage）
+   * 与每轮结束后的拉取（SDK 的 getContextUsage）共同刷新；null = 还没有可靠数据）。
+   * 状态栏的"上下文 N token"显示它，而不是只会算一次的文档体量。
+   */
+  contextUsage: { used: number; size: number | null } | null
   /** 会话可用的斜杠命令（CLI 下发，含用户技能） */
   commands: SlashCommandView[]
   /** 历史会话（CLI 持久化记录，与 VS Code 扩展共用） */
@@ -130,6 +138,8 @@ interface AgentState {
   hydratedFromSnapshot: boolean
   initialized: boolean
   lastError: string | null
+  /** 最近一次提问的完整载荷（重试时原样重发；只存内存，会话重启后为 null） */
+  lastPrompt: { text: string; systemContext?: string; locationLabel?: string; anchorIds?: string[] } | null
 
   init: () => Promise<void>
   refreshAgents: (force?: boolean) => Promise<void>
@@ -150,6 +160,13 @@ interface AgentState {
   queryFiles: (dir: string | null, query: string) => Promise<WorkspaceFileView[]>
   /** 选一个历史会话续聊：关掉当前会话，下一次提问带上 resume */
   resumeSession: (remoteSessionId: string) => Promise<void>
+  /** 删除一条历史会话（界面先确认；不支持删除的通道提示后返回） */
+  deleteHistorySession: (remoteSessionId: string) => Promise<void>
+  /**
+   * 文档默认会话：没有会话时自动发起首轮"通读"（论文全文为上下文 → 总结理解 + 阅读参考）。
+   * 条件不满足（未装 Agent / 文档太短 / 已有会话）时静默退出，用户发第一条消息时自然建会话。
+   */
+  ensureDocumentSession: () => Promise<void>
   /** 从某个历史会话分叉：复制它的历史开新会话，原会话不动 */
   forkSession: (remoteSessionId: string) => Promise<void>
   setModel: (modelId: string | null) => void
@@ -166,6 +183,12 @@ interface AgentState {
       systemContext?: string
       locationLabel?: string
       anchorIds?: string[]
+      /**
+       * 提问的**核心诉求**（历史回放显示用）：发给 Agent 的原文常带着引用材料与位置头，
+       * 历史里要显示的是"用户真正想问的那句"——比如"解释选中的内容：Maximum Compound
+       * Divergence (MCD)"，而不是整段引用。不传时回放退回显示完整原文（互不影响）。
+       */
+      summary?: string
       /** 分叉这次提问要接上的历史会话 */
       forkFrom?: string
     }
@@ -174,12 +197,25 @@ interface AgentState {
   respondPermission: (requestId: string, optionId: string | null) => Promise<void>
   /** 批准当前计划：放行 ExitPlanMode，并把档位切到"编辑自动"（与 VS Code 的批准语义一致） */
   approvePlan: () => Promise<void>
+  /** 按用户改过的方案执行：切"编辑自动"档后把改后的方案作为新一轮提问发出 */
+  approvePlanWithEdits: (editedPlan: string) => Promise<void>
   /** 拒绝计划：拦下 ExitPlanMode，留在计划模式继续改方案 */
   rejectPlan: () => Promise<void>
+  /**
+   * 手动取消计划卡片：既不批准也不拒绝 —— 挂起的 ExitPlanMode 权限请求一并撤下
+   * （否则它还在等回执，模型那轮就永远停在那里），用户回到普通对话，想继续就再说一句。
+   */
+  dismissPlan: () => Promise<void>
   /** 回退文件到某个检查点之前（dryRun=true 只预演） */
   rewindFiles: (userMessageId: string, dryRun?: boolean) => Promise<unknown>
   /** 逐块回退某次改动（VS Code 的"逐 hunk 接受/拒绝"等价物） */
   revertHunks: (toolUseId: string, indices: number[]) => Promise<{ ok: boolean; conflict?: string }>
+  /**
+   * 重试最后一次失败的回合（Agent 进程退出 / 请求超时 / 网络断）：
+   * 丢弃死掉的会话句柄（进程已退出的连接续不上，新建才能跑），把**当时的原文与上下文**原样再发一次。
+   * lastPrompt 没有记录（会话重启后）时退化为"重发最后一条用户消息的纯文本"。
+   */
+  retryLast: () => Promise<void>
   clear: () => void
 }
 
@@ -218,9 +254,12 @@ export const useAgent = create<AgentState>((set, get) => ({
   resolvedModels: [],
   modelsRevision: 0,
   activeModel: null,
+  contextUsage: null,
   hydratedFromSnapshot: false,
   initialized: false,
   lastError: null,
+  /** 最近一次提问的完整载荷（重试用；会话内记忆，重启后为 null 走退化路径） */
+  lastPrompt: null,
 
   init: async () => {
     if (get().initialized) return
@@ -336,6 +375,7 @@ export const useAgent = create<AgentState>((set, get) => ({
             checkpoints: [],
             pendingPlan: null,
             activeModel: null,
+            contextUsage: null,
             // 模型清单与命令清单都是**按通道**来的：不清掉会把上一条通道的模型显示在新通道上
             resolvedModels: [],
             commands: [],
@@ -491,10 +531,58 @@ export const useAgent = create<AgentState>((set, get) => ({
   },
 
   resumeSession: async (remoteSessionId) => {
-    const sessionId = get().sessionId
-    set({ sessionId: null, resumeSessionId: remoteSessionId, permissions: [], streaming: false })
+    const state = get()
+    const sessionId = state.sessionId
+    /**
+     * 续聊会话：把远端会话 id 挂到"下一轮带上历史"；
+     * **同时把这条会话的历史对话回放进消息流**（用户反馈：点开历史会话看不到全部对话）。
+     * 回放读不到（Codex 等通道暂不支持）时保持现状 + 提示"续聊可用但看不到旧对话"。
+     */
+    const messages = state.messages
+    set({ sessionId: null, resumeSessionId: remoteSessionId, permissions: [], streaming: false, pendingPlan: null })
     if (sessionId) await api.agent.sessionDispose(sessionId).catch(() => undefined)
     logDebug('已选择续聊会话：' + remoteSessionId)
+    const transcript = await api.agent
+      .historyTranscript(state.selectedAgentId, remoteSessionId, workspaceDirFor(state))
+      .catch(() => [])
+    if (transcript.length === 0) {
+      if (state.selectedAgentId) {
+        notify(i18n.t('agent.historyNoTranscript'), 'info', { timeoutMs: 6000 })
+      }
+      return
+    }
+    // 回放消息是**只读历史**：不计入本轮流式状态，id 加前缀避免与真实消息撞 id。
+    // 用户消息显示**核心诉求**（历史回放读的是问题，不是材料）——通道回放给的是
+    // 完整原文（含引用材料），这里用 coreIntentOf 提炼；完整原文仍挂在 content 上（可展开）。
+    const { coreIntentOf } = await import('../state/askFlow')
+    const historyMessages: ChatMessage[] = transcript.map((entry, index) => ({
+      id: 'hist-' + remoteSessionId.slice(0, 8) + '-' + index,
+      role: entry.role,
+      content: entry.text,
+      summary: entry.role === 'user' ? coreIntentOf(entry.text) : undefined,
+      thinking: entry.thinking,
+      tools: [],
+      createdAt: entry.at || Date.now() - (transcript.length - index) * 1000,
+      status: 'done' as const
+    }))
+    set({ messages: historyMessages })
+    void persistAgentState(get)
+  },
+
+  /** 删除一条历史会话（删除前由界面确认；不支持删除的通道返回 false 并提示）。 */
+  deleteHistorySession: async (remoteSessionId) => {
+    const state = get()
+    const ok = await api.agent
+      .historyDelete(state.selectedAgentId, remoteSessionId, workspaceDirFor(state))
+      .catch(() => false)
+    if (!ok) {
+      notify(i18n.t('agent.historyDeleteUnsupported'), 'warning', { timeoutMs: 6000 })
+      return
+    }
+    // 删掉的正是当前续聊目标时，撤掉"下一轮接上它"的挂起状态
+    if (state.resumeSessionId === remoteSessionId) set({ resumeSessionId: null })
+    await get().refreshHistory(workspaceDirFor(state))
+    notify(i18n.t('agent.historyDeleted'), 'success')
   },
 
   forkSession: async (remoteSessionId) => {
@@ -565,6 +653,7 @@ export const useAgent = create<AgentState>((set, get) => ({
       checkpoints: [],
       pendingPlan: null,
       activeModel: null,
+      contextUsage: null,
       resolvedModels: []
     })
     // 从会话快照恢复 Agent 状态（会话、模式、模型、草稿）
@@ -592,6 +681,49 @@ export const useAgent = create<AgentState>((set, get) => ({
     } catch {
       /* 快照不可用时忽略 */
     }
+    /**
+     * 文档默认会话（用户要求）：打开文档就有一个"通读会话"——首轮把论文作为上下文发给 Agent，
+     * 要一份**总结理解 + 阅读参考**；之后这篇文档的所有提问（解释选中内容等）都默认在这条会话里进行，
+     * Agent 手里始终带着论文上下文。同一篇文档共用一个历史对话；用户手动「新建会话」才另起一条。
+     */
+    void get().ensureDocumentSession()
+  },
+
+  /**
+   * 确保文档有默认会话：没有 conversationId 时自动发起首轮"通读"。
+   * 条件全部满足才发（避免误触发）：绑定了文档、文档已解析、有可用 Agent、不在流式中、
+   * 没有待发/挂起的会话、面板已水合过快照（否则恢复逻辑还没跑完）。
+   * 失败（未装 Agent 等）静默退出 —— 面板仍是可用的空会话，用户发第一条消息时自然建会话。
+   */
+  ensureDocumentSession: async () => {
+    const state = get()
+    if (!state.docId || state.conversationId || state.sessionId || state.streaming || state.resumeSessionId) return
+    if (!state.hydratedFromSnapshot) return
+    const { useDocuments } = await import('./documents.store')
+    const model = useDocuments.getState().models[state.docId] ?? null
+    if (!model || model.text.trim().length < 200) return
+    const capability = currentCapability(state.agents, state.selectedAgentId)
+    if (!capability?.available) return
+    const locale = currentLocale()
+    const zh = locale === 'zh-CN'
+    const question = zh
+      ? '请通读这份文档，给我一份总结理解：它在讲什么、核心论点与结构是什么；再给一份阅读参考：哪些章节是重点、按什么顺序读、有哪些概念需要先弄清楚。'
+      : 'Read this document and give me a summary of understanding (what it is about, core claims, structure) and a reading guide (which sections matter, in what order, which concepts to learn first).'
+    await get().send(question, {
+      systemContext: buildContext({
+        mode: 'fulltext',
+        document: model,
+        graph: null,
+        anchor: null,
+        nodeId: null,
+        history: [],
+        question,
+        contextParagraphsBefore: 1,
+        contextParagraphsAfter: 1,
+        includeLocationHeader: false
+      }).systemContext,
+      summary: zh ? '总结理解与阅读参考（通读全文）' : 'Summary & reading guide (full read)'
+    })
   },
 
   setDraft: (value) => {
@@ -609,7 +741,8 @@ export const useAgent = create<AgentState>((set, get) => ({
       permissions: [],
       permissionNotes: [],
       checkpoints: [],
-      streaming: false
+      streaming: false,
+      contextUsage: null
     })
     await persistAgentState(get)
   },
@@ -635,7 +768,9 @@ export const useAgent = create<AgentState>((set, get) => ({
     const userMessage: ChatMessage = {
       id: createId('msg'),
       role: 'user',
+      // content 永远是发给 Agent 的完整原文；summary 是"核心诉求"（历史回放显示用）——两者分开存、互不精简
       content: trimmed,
+      summary: options?.summary?.trim() ? options.summary.trim() : undefined,
       thinking: '',
       tools: [],
       createdAt: Date.now(),
@@ -653,6 +788,15 @@ export const useAgent = create<AgentState>((set, get) => ({
       status: 'streaming'
     }
     set({ messages: [...state.messages, userMessage, assistantMessage], streaming: true, draft: '' })
+    // 记下这次提问的完整载荷：失败后"重试"要原样重发（含选区上下文与位置头），而不是只重发干巴巴的问题文本
+    set({
+      lastPrompt: {
+        text: trimmed,
+        systemContext: systemContext ?? undefined,
+        locationLabel: options?.locationLabel,
+        anchorIds: options?.anchorIds
+      }
+    })
 
     let sessionId = state.sessionId
     try {
@@ -698,6 +842,8 @@ export const useAgent = create<AgentState>((set, get) => ({
         role: 'user',
         content: trimmed,
         anchorIds: options?.anchorIds ?? [],
+        // 核心诉求随消息落库：历史回放显示它，实际提问（content）保持完整
+        summary: userMessage.summary ?? null,
         createdAt: userMessage.createdAt
       })
       await persistAgentState(get)
@@ -723,6 +869,50 @@ export const useAgent = create<AgentState>((set, get) => ({
     set({ streaming: false })
   },
 
+  retryLast: async () => {
+    const state = get()
+    if (state.streaming) return
+    /**
+     * 找"最后一次失败的回合"对应的用户消息：从后往前找第一条 error/interrupted 的助手消息，
+     * 再取它前面最近的用户消息 —— 那就是用户想重发的东西。
+     */
+    const messages = state.messages
+    let failedIndex = -1
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (messages[i].role === 'assistant' && (messages[i].status === 'error' || messages[i].status === 'interrupted')) {
+        failedIndex = i
+        break
+      }
+    }
+    if (failedIndex < 0) return
+    let userText = ''
+    for (let i = failedIndex - 1; i >= 0; i -= 1) {
+      if (messages[i].role === 'user') {
+        userText = messages[i].content
+        break
+      }
+    }
+    if (userText.trim().length === 0) return
+    /**
+     * "Agent 进程已退出"这类失败里会话句柄已经死了（连接续不上）：
+     * 显式丢掉它，让 send 走新建会话路径 —— 否则重试打在死句柄上，重试一次失败一次。
+     */
+    const sessionId = state.sessionId
+    if (sessionId) await api.agent.sessionDispose(sessionId).catch(() => undefined)
+    set({ sessionId: null, permissions: [], permissionNotes: [] })
+    const prompt = state.lastPrompt
+    if (prompt && prompt.text === userText) {
+      await get().send(prompt.text, {
+        systemContext: prompt.systemContext,
+        locationLabel: prompt.locationLabel,
+        anchorIds: prompt.anchorIds
+      })
+      return
+    }
+    // lastPrompt 没有记录（会话重启后）：退化为重发纯文本（选区上下文无法复原，但问题本身还在）
+    await get().send(userText)
+  },
+
   rewindFiles: async (userMessageId, dryRun = false) => {
     const sessionId = get().sessionId
     if (!sessionId) throw new Error('还没有活动会话')
@@ -740,9 +930,30 @@ export const useAgent = create<AgentState>((set, get) => ({
     await get().setPermissionMode('edit')
   },
 
+  /**
+   * 按用户**改过的方案**执行：先切"编辑自动"档（用户已经把方案定稿 = 授权动手），
+   * 再把改后的方案作为一条普通用户消息发出去 —— 模型不需要重新走一遍 ExitPlanMode 批准流
+   * （那要求它先在计划档重答一轮，多烧一次完整往返）。
+   * 挂起的 ExitPlanMode 权限请求要回"拒绝"收掉，否则没人理它那轮就一直挂着。
+   */
+  approvePlanWithEdits: async (editedPlan: string) => {
+    const request = get().permissions.find((item) => item.kind === 'plan')
+    if (request) await get().respondPermission(request.requestId, 'reject_once').catch(() => undefined)
+    set({ pendingPlan: null })
+    await get().setPermissionMode('edit')
+    await get().send(editedPlan)
+  },
+
   rejectPlan: async () => {
     const request = get().permissions.find((item) => item.kind === 'plan')
     if (request) await get().respondPermission(request.requestId, 'reject_once')
+    set({ pendingPlan: null })
+  },
+
+  dismissPlan: async () => {
+    // 挂起的 ExitPlanMode 权限请求要回一个"拒绝"：不回执的话模型那轮会一直等（与 stop 不同，会话不动）
+    const request = get().permissions.find((item) => item.kind === 'plan')
+    if (request) await get().respondPermission(request.requestId, 'reject_once').catch(() => undefined)
     set({ pendingPlan: null })
   },
 
@@ -805,6 +1016,10 @@ function handleEvent(
         usage: { inputTokens: payload.inputTokens, outputTokens: payload.outputTokens }
       }))
       break
+    case 'context-usage':
+      // Agent 亲口报的上下文占用（dsh 的 usage_update / Codex 的 tokenUsage）—— 状态栏跟它走
+      set({ contextUsage: { used: payload.used, size: payload.size } })
+      break
     case 'tool-diff':
       updateAssistant(set, get, (current) => ({
         ...current,
@@ -839,6 +1054,8 @@ function handleEvent(
         set({ activeModel: payload.activeModel })
         logDebug('实际运行模型：' + payload.activeModel)
       }
+      // 新会话从零开始：旧会话的上下文占用不再有意义（事件会很快带来新值）
+      if (!payload.resumed) set({ contextUsage: null })
       void persistAgentState(get)
       /**
        * 会话已经初始化完成 —— 这时再拉一次模型清单，
@@ -896,6 +1113,8 @@ function handleEvent(
           set({ pendingPlan: { messageId: last.id, plan: text, filePath: null } })
         }
       }
+      // SDK 通道不推上下文用量（只有"随时问一次"的方法）：每轮结束拉一次，状态栏才跟得上对话
+      if (state.sessionId) void refreshContextUsage(state.sessionId, set).catch(() => undefined)
       void persistAssistantMessage(get, messages)
       break
     }
@@ -925,6 +1144,19 @@ function updateAssistant(
   set({ messages })
 }
 
+/**
+ * 拉一次上下文用量（SDK 通道有"随时问"的方法；事件路径覆盖不了它）。
+ * 拉不到就保持现状 —— 事件值优先于拉取值？不：拉取值更新（刚结束的这一轮一定反映进去了），
+ * 只有"拉不到"（null）时才保留事件带来的旧值。
+ */
+async function refreshContextUsage(
+  sessionId: string,
+  set: (partial: Partial<AgentState>) => void
+): Promise<void> {
+  const usage = await api.agent.contextUsage(sessionId).catch(() => null)
+  if (usage) set({ contextUsage: usage })
+}
+
 async function persistAssistantMessage(get: () => AgentState, messages: ChatMessage[]): Promise<void> {
   const conversationId = get().conversationId
   if (!conversationId) return
@@ -951,6 +1183,7 @@ async function loadMessages(conversationId: string, set: (partial: Partial<Agent
       id: String(row.id ?? createId('msg')),
       role: (String(row.role ?? 'assistant') as ChatMessage['role']) ?? 'assistant',
       content: String(row.content ?? ''),
+      summary: row.summary == null || String(row.summary).length === 0 ? undefined : String(row.summary),
       thinking: '',
       tools: parseJson<ToolCallView[]>(row.tool_calls_json, []),
       usage: parseJson<{ inputTokens: number; outputTokens: number } | undefined>(row.usage_json, undefined),

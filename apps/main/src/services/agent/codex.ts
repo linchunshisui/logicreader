@@ -472,6 +472,13 @@ export function translateCodexNotification(
       const input = Number(last.inputTokens ?? 0) + Number(last.cachedInputTokens ?? 0)
       const output = Number(last.outputTokens ?? 0)
       if (input > 0 || output > 0) emit({ type: 'usage', inputTokens: input, outputTokens: output })
+      /**
+       * 上下文占用：`total` 视角（本轮为止对话累计的输入+输出）最接近"窗口里有多少东西"。
+       * app-server 不报窗口总量 —— size 置 null，界面只显示 used。
+       */
+      const totalUsage = (usage.total ?? usage.last ?? {}) as Record<string, unknown>
+      const contextUsed = Number(totalUsage.inputTokens ?? 0) + Number(totalUsage.cachedInputTokens ?? 0) + Number(totalUsage.outputTokens ?? 0)
+      if (contextUsed > 0) emit({ type: 'context-usage', used: Math.round(contextUsed), size: null })
       return
     }
     case 'turn/completed': {

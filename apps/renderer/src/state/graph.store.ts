@@ -19,6 +19,8 @@ export interface GraphProgressView {
   done: number
   total: number
   detail: string
+  /** 预计剩余毫秒（Map 阶段按实测速率滚动估计） */
+  etaMs?: number | null
   error?: string
 }
 
@@ -117,6 +119,8 @@ export interface GenerateRequest {
   chunkTokens?: number
   concurrency?: number
   entityThreshold?: number
+  /** 增量重试：只重跑这些下标的分块（其余从 graphId 对应的旧图继承） */
+  retryChunkIndexes?: number[]
 }
 
 const NODE_W = 220
@@ -229,13 +233,25 @@ export const useGraph = create<GraphState>((set, get) => ({
     const { graph, docId } = get()
     if (!graph || !docId) return
     const generation = graph.generation
+    /**
+     * 增量重试：**只重跑失败的分块**，成功的抽取结果从这张图继承（不再全量重烧一遍 token）。
+     * 分块配置（chunkTokens / 边白名单 / 抽取范围 / 并发）不从这里传 —— 主进程会按旧图
+     * generation 里记录的值复现同一套分块（failedChunkIndexes 是相对那一次分块的下标，
+     * 换了配置下标就指错块）。
+     */
+    const failedChunkIndexes = graph.stats.failedChunkIndexes ?? []
+    if (failedChunkIndexes.length === 0) {
+      notify('没有失败的分块，无需重试', 'info')
+      return
+    }
     await get().generate({
       docId,
       graphId: graph.id,
       agentId: generation.agentId,
       modelId: generation.modelId,
       thinkingEffort: generation.thinkingEffort,
-      precision: generation.precision as GraphPrecision
+      precision: generation.precision as GraphPrecision,
+      retryChunkIndexes: failedChunkIndexes
     })
   },
 

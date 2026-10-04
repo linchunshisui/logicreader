@@ -368,6 +368,15 @@ export class AgentRuntime {
     const session = this.sessions.get(sessionId)
     if (!session) return
     await session.handle.cancel()
+    /**
+     * 取消把连接杀掉的情况（ACP 强杀兜底）：把死句柄从会话表摘掉，
+     * 否则下一句提问还打在它上面 —— 用户看到的就是"停止之后 Agent 就坏了"。
+     * 渲染端的会话 id 会自然失效，下一次 send 走"新建会话"路径。
+     */
+    if (session.handle.isUsable?.() === false) {
+      this.sessions.delete(sessionId)
+      logMain('info', 'agent', '会话在取消中被终止，已从会话表摘除：' + sessionId)
+    }
   }
 
   async dispose(sessionId: string): Promise<void> {
@@ -482,6 +491,26 @@ export class AgentRuntime {
   }
 
   /**
+   * 会话的**上下文窗口占用**（拉取式；事件路径见 ACP 的 usage_update → context-usage）。
+   * 只有 SDK 通道有"随时问一次"的方法（`getContextUsage`，与 /context 命令同源）；
+   * 其它通道返回 null，界面沿用事件带来的最后已知值。
+   */
+  async contextUsage(sessionId: string): Promise<{ used: number; size: number | null } | null> {
+    const session = this.sessions.get(sessionId)
+    if (!session?.sdk?.contextUsage) return null
+    try {
+      const raw = (await session.sdk.contextUsage()) as { totalTokens?: number; maxTokens?: number } | undefined
+      const used = Number(raw?.totalTokens)
+      if (!Number.isFinite(used) || used <= 0) return null
+      const size = Number(raw?.maxTokens)
+      return { used: Math.round(used), size: Number.isFinite(size) && size > 0 ? Math.round(size) : null }
+    } catch (error) {
+      logMain('debug', 'agent', '取上下文用量失败：' + String(error))
+      return null
+    }
+  }
+
+  /**
    * 把文件回退到某个检查点（用户消息）之前的状态。
    * 只有 SDK 通道支持（`enableFileCheckpointing` + `rewindFiles`）。
    * `dryRun` 用来先让用户看到"会改哪些文件、增删多少行"，再决定是否真的回退。
@@ -522,8 +551,7 @@ export class AgentRuntime {
   /**
    * 列某个工作目录下的历史会话（最近优先）。
    * 数据源是 CLI 自己持久化的会话记录，与 VS Code 扩展共用 —— 用户在哪边聊过都能续。
-   */
-  async listSessions(dir: string | null, limit = 30, agentId: string | null = null): Promise<unknown[]> {
+   */  async listSessions(dir: string | null, limit = 30, agentId: string | null = null): Promise<unknown[]> {
     const target = dir ?? process.cwd()
     /**
      * 历史会话按**当前选中 Agent 的通道**取：
@@ -587,6 +615,46 @@ export class AgentRuntime {
     const { listSessionsFor } = await import('./sdk')
     const rows = await listSessionsFor(target, limit)
     return this.withSessionTitles(agentId, rows)
+  }
+
+  /**
+   * 读一个历史会话的**全部对话**（历史会话列表点开时的回放数据源）。
+   * 各通道的能力差异很大：
+   *  - SDK（Claude Code）：官方 `getSessionMessages()`（与本机 JSONL 同源）；
+   *  - ACP（dsh）：ACP 协议没有"读回放"，但 dsh 自己的**会话日志**在磁盘上（多帧 zstd JSONL），
+   *    直接解它 —— 与"总结命名读标题"是同一套数据，只是这次读整份；
+   *  - Codex（app-server）：rollout 记录无公开读取 API —— 返回空，界面显示"该通道暂不支持回放"，
+   *    续聊本身仍然可用（下一轮会带上历史）。
+   */
+  async sessionTranscript(agentId: string | null, sessionId: string, cwd: string | null): Promise<{ role: 'user' | 'assistant'; text: string; thinking: string; at: number }[]> {
+    const registration = agentId ? agentRegistry.get(agentId) : null
+    const capability = agentId ? agentRegistry.capability(agentId) : null
+    if (registration?.kind === 'dsh' || capability?.protocol === 'acp') {
+      // dsh 的会话 id 在列表里可能带 session- 前缀，日志目录两种形态都有 —— readDshSessionTranscript 自己兜
+      const { readDshSessionTranscript } = await import('./dsh-session-log')
+      return readDshSessionTranscript(sessionId)
+    }
+    if (capability?.protocol === 'sdk') {
+      const { readSessionTranscript } = await import('./sdk')
+      return readSessionTranscript(sessionId, cwd)
+    }
+    return []
+  }
+
+  /**
+   * 删除一个历史会话。
+   * 只有 SDK 通道有官方删除 API（`deleteSession`：删本机 JSONL 与子代理记录目录）；
+   * dsh 的会话文件是它自己的运行时资产（ACP 没有删除方法，擅自删它的磁盘文件风险大于收益），
+   * Codex 没有删除 API —— 这两个通道返回 false，界面给"该通道暂不支持删除"。
+   */
+  async deleteHistorySession(agentId: string | null, sessionId: string, cwd: string | null): Promise<boolean> {
+    const capability = agentId ? agentRegistry.capability(agentId) : null
+    if (capability?.protocol === 'sdk') {
+      const { deleteSdkSession } = await import('./sdk')
+      return deleteSdkSession(sessionId, cwd)
+    }
+    logMain('info', 'agent', '该通道不支持删除历史会话（' + (capability?.protocol ?? 'unknown') + '）：' + sessionId)
+    return false
   }
 
   /**

@@ -8,6 +8,13 @@ export interface SelectionInfo {
   charEnd: number
   anchorId: string | null
   locationLabel: string
+  /**
+   * 选区在**视口**里的位置（选中范围的联合矩形）。
+   * 浮动工具条用它把按钮组摆在**选区旁边**，而不是永远趴在视口底部
+   * —— 底部固定在"选中的文字就在底部"时正好挡住选区（用户实测）。
+   * 早期写入方（或恢复路径）没带这个字段时为 null，工具条退回底部定位。
+   */
+  rect: { x: number; y: number; width: number; height: number } | null
 }
 
 /** 跳转的来源：关系图里的哪个节点（阅读器据此在文段旁显示相关逻辑链） */
@@ -62,6 +69,10 @@ interface UiState {
   requestReveal: (request: Omit<RevealRequest, 'nonce'>) => void
   /** 结束这次跳转上下文（清掉常驻高亮与旁边的逻辑链面板） */
   clearReveal: () => void
+  /** 聚焦 Agent 输入框的请求位（命令/快捷键发起；面板挂载后消费，非 0 即待处理） */
+  agentFocusRequest: number
+  requestAgentFocus: () => void
+  consumeAgentFocus: () => void
   openCommandPalette: () => void
   closeCommandPalette: () => void
   toggleCommandPalette: () => void
@@ -89,6 +100,9 @@ export const useUiStore = create<UiState>((set) => ({
   setSettingsCategory: (category) => set({ settingsCategory: category }),
   requestReveal: (request) => set({ revealRequest: { ...request, nonce: Date.now() } }),
   clearReveal: () => set({ revealRequest: null }),
+  agentFocusRequest: 0,
+  requestAgentFocus: () => set({ agentFocusRequest: Date.now() }),
+  consumeAgentFocus: () => set({ agentFocusRequest: 0 }),
   openQuickOpen: () => set({ quickOpenOpen: true, commandPaletteOpen: false }),
   closeQuickOpen: () => set({ quickOpenOpen: false }),
   setStatusMessage: (message) => set({ statusMessage: message, statusMessageAt: Date.now() }),

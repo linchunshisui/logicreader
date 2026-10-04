@@ -533,13 +533,24 @@ export function registerGlobalCommands(): void {
       keybinding: 'Ctrl+Shift+A',
       run: () => {
         useLayout.getState().toggleAuxBar(true)
+        // 面板可能刚被打开（挂载需要一拍）：请求位由 AgentSidebarView 在挂载后消费
+        useUiStore.getState().requestAgentFocus()
       }
     },
     {
       id: CMD.agentNewSession,
       titleKey: 'cmd.agent.newSession',
       categoryKey: 'command.category.agent',
-      run: () => useLayout.getState().toggleAuxBar(true)
+      run: () => {
+        /**
+         * "新建会话"要**真的新建**：只把面板打开的话，用户点完菜单什么都没发生
+         * （面板本来开着时尤其如此）—— 会话还是原来那条，输入框里还有原来的草稿。
+         * 这里先开面板、再清会话（newSession 顺带清消息流），并请输入框聚焦。
+         */
+        useLayout.getState().toggleAuxBar(true)
+        void useAgentStore.getState().newSession()
+        useUiStore.getState().requestAgentFocus()
+      }
     },
     {
       id: CMD.agentManager,

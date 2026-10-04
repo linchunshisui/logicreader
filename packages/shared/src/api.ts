@@ -121,6 +121,14 @@ export type AgentEventPayload =
   | { sessionId: string; type: 'tool-result'; id: string; name: string; output: unknown; isError: boolean }
   | { sessionId: string; type: 'permission-request'; requestId: string; detail: { title: string; kind: string; rawInput: unknown; options: { optionId: string; name: string; kind: string }[] } }
   | { sessionId: string; type: 'usage'; inputTokens: number; outputTokens: number }
+  | {
+      /** 会话的上下文窗口占用（对话当前占了多少窗口；与单条消息 usage 不同） */
+      sessionId: string
+      type: 'context-usage'
+      used: number
+      /** 窗口总量；通道报不上来时为 null */
+      size: number | null
+    }
   | { sessionId: string; type: 'plan'; entries: { content: string; status: string }[] }
   | { sessionId: string; type: 'tool-diff'; diff: ToolDiffView }
   | { sessionId: string; type: 'plan-review'; plan: { plan: string; filePath?: string | null } }
@@ -303,6 +311,11 @@ export interface LogicReaderApi {
   models(sessionId: string): Promise<AgentModelView[]>
   /** 不建常驻会话地探测一次模型清单（界面在"还没发过消息"时也能显示真实模型名） */
   probeModels(agentId: string): Promise<AgentModelView[]>
+  /**
+   * 会话的上下文窗口占用（拉取式，与 `context-usage` 事件同一数据）。
+   * 只有 SDK 通道有"随时问一次"的方法；null = 该通道拉不到，沿用事件带来的最后已知值。
+   */
+  contextUsage(sessionId: string): Promise<{ used: number; size: number | null } | null>
   /** 会话可用的斜杠命令（由 CLI 下发，含用户技能；非 SDK 通道返回空数组） */
   commands(sessionId: string): Promise<SlashCommandView[]>
   /**
@@ -315,6 +328,16 @@ export interface LogicReaderApi {
   historyRename(agentId: string, sessionId: string, title: string): Promise<void>
   /** 让 Agent 用一句话给某个历史会话"总结命名"（续聊那条会话再问，一次很小的调用） */
   historyName(agentId: string, sessionId: string, firstPrompt?: string | null): Promise<string | null>
+  /**
+   * 读一个历史会话的**全部对话**（点开历史会话时的回放数据源）。
+   * SDK（Claude Code）与 dsh（读它自己的会话日志）支持；其它通道返回空数组（界面给"暂不支持回放"）。
+   */
+  historyTranscript(agentId: string | null, sessionId: string, cwd: string | null): Promise<{ role: 'user' | 'assistant'; text: string; thinking: string; at: number }[]>
+  /**
+   * 删除一个历史会话（目前只有 Claude Code 通道支持，删它本机的会话记录）。
+   * 返回 false = 该通道不支持删除（界面要说明，而不是静默无操作）。
+   */
+  historyDelete(agentId: string | null, sessionId: string, cwd: string | null): Promise<boolean>
   /** 工作区文件索引（"@ 文件引用"用；主进程缓存，遵守 respectGitIgnore） */
   files(dir: string | null, query?: string, limit?: number): Promise<WorkspaceFileView[]>
   /** 把文件回退到某个检查点（用户消息）之前；dryRun 只预演不改盘 */

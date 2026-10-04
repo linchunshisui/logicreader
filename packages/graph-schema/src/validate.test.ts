@@ -138,3 +138,60 @@ describe('弱模型的块内相对锚点兜底', () => {
     expect(result.value?.dropped).toBe(1)
   })
 })
+
+describe('按 evidence 引文重新锚定（弱模型坐标全错但引文是对的）', () => {
+  const chunkText = '注意力机制本质上是对序列依赖建模的结构性简化。此前的模型普遍依赖循环结构。'
+  const ctx = { charStart: 500, charEnd: 500 + chunkText.length, chunkText }
+
+  it('evidence 在块内唯一命中 → 按命中位置重新锚定', () => {
+    const raw = JSON.stringify({
+      entities: [
+        {
+          name: '注意力机制',
+          type: 'claim',
+          summary: 's',
+          evidence: '本质上是对序列依赖建模的结构性简化',
+          spans: [{ charStart: 99999, charEnd: 100500 }]
+        }
+      ],
+      relations: []
+    })
+    const result = parseExtraction(raw, ctx)
+    expect(result.value?.entities).toHaveLength(1)
+    const span = result.value?.entities[0]?.spans[0]
+    expect(span).not.toBeUndefined()
+    // 引文从第 6 个字符开始（"注意力机制"之后），锚点应落在 500+6 附近
+    expect(span!.charStart).toBeGreaterThanOrEqual(505)
+    expect(span!.charEnd).toBeLessThanOrEqual(500 + chunkText.length)
+    expect(result.issues.some((issue) => issue.message.includes('重新定位'))).toBe(true)
+  })
+
+  it('evidence 带空白差异也能命中（归一化后匹配）', () => {
+    const raw = JSON.stringify({
+      entities: [
+        {
+          name: '循环结构',
+          type: 'claim',
+          summary: 's',
+          evidence: '此前的模型 普遍依赖\n循环结构。',
+          spans: [{ charStart: 7000, charEnd: 7200 }]
+        }
+      ],
+      relations: []
+    })
+    const result = parseExtraction(raw, ctx)
+    expect(result.value?.entities).toHaveLength(1)
+  })
+
+  it('evidence 在块内找不到 → 照旧丢弃（不瞎锚）', () => {
+    const raw = JSON.stringify({
+      entities: [
+        { name: '幻觉', type: 'claim', summary: 's', evidence: '这段话根本不在这块文本里', spans: [{ charStart: 7000, charEnd: 7200 }] }
+      ],
+      relations: []
+    })
+    const result = parseExtraction(raw, ctx)
+    expect(result.value?.entities).toHaveLength(0)
+    expect(result.value?.dropped).toBe(1)
+  })
+})

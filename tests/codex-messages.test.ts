@@ -146,7 +146,7 @@ describe('Codex 通知翻译', () => {
     ])
   })
 
-  it('用量取 last 分解（含缓存命中）', () => {
+  it('用量取 last 分解（含缓存命中）；同一条通知带上下文占用（total 视角，窗口总量不报 → null）', () => {
     const { events, emit } = collect()
     translateCodexNotification(
       'thread/tokenUsage/updated',
@@ -154,7 +154,10 @@ describe('Codex 通知翻译', () => {
       emit,
       newCodexTurn('t1')
     )
-    expect(events).toEqual([{ type: 'usage', inputTokens: 120, outputTokens: 7 }])
+    expect(events).toEqual([
+      { type: 'usage', inputTokens: 120, outputTokens: 7 },
+      { type: 'context-usage', used: 127, size: null }
+    ])
   })
 
   it('回合结束给 done；失败回合先给 error', () => {

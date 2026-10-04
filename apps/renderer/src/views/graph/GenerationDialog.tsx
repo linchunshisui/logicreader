@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { AgentModelView, GraphPrecision } from '@logicreader/shared'
 import { EDGE_KINDS, PRECISION_PROFILES, edgeLabel, type EdgeKind } from '@logicreader/graph-schema'
@@ -15,6 +15,9 @@ interface Estimate {
   minutes: [number, number]
   nodes: [number, number]
   edges: [number, number]
+  chunkChars: number
+  basis: 'history' | 'heuristic'
+  historySamples: number
 }
 
 interface Props {
@@ -136,14 +139,17 @@ export function GenerationDialog({ open, docId, docTitle, onClose, onStart }: Pr
   /**
    * 打开对话框即探测真实模型清单（与 Agent 面板同一来源）：
    * 当前选中的 Agent 走 store 的 ensureModels；对话框里换成别的 Agent 时单独起探测进程。
+   * inFlightRef 防抖：探测要起一个 CLI 子进程（2~4 秒），连续换 Agent 不该叠出多个进程。
    */
+  const probingRef = useRef<string | null>(null)
   useEffect(() => {
     if (!open || !agentId) return
     if (agentId === agent.selectedAgentId) {
       void useAgent.getState().ensureModels()
       return
     }
-    if (probedModels[agentId]) return
+    if (probedModels[agentId] || probingRef.current === agentId) return
+    probingRef.current = agentId
     let cancelled = false
     void api.agent
       .probeModels(agentId)
@@ -151,6 +157,9 @@ export function GenerationDialog({ open, docId, docTitle, onClose, onStart }: Pr
         if (!cancelled && list.length > 0) setProbedModels((prev) => ({ ...prev, [agentId]: list }))
       })
       .catch(() => undefined)
+      .finally(() => {
+        if (probingRef.current === agentId) probingRef.current = null
+      })
     return () => {
       cancelled = true
     }
@@ -278,6 +287,14 @@ export function GenerationDialog({ open, docId, docTitle, onClose, onStart }: Pr
                   tokens: estimate.totalTokens.toLocaleString(),
                   minutes: estimate.minutes[0] + '–' + estimate.minutes[1]
                 })}
+              </strong>
+            </div>
+            <div>
+              <span className="lr-setting__hint">{t('graph.estimateBasis')}</span>
+              <strong>
+                {estimate.basis === 'history'
+                  ? t('graph.estimateBasisHistory', { samples: estimate.historySamples })
+                  : t('graph.estimateBasisHeuristic', { chunks: estimate.chunkCount })}
               </strong>
             </div>
           </div>

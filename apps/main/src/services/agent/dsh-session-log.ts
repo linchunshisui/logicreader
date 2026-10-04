@@ -54,8 +54,32 @@ export function indexDshSessionLogs(root = dshSessionsRoot()): Map<string, strin
     }
     for (const entry of entries) {
       const sessionId = entry.startsWith('session-') ? entry.slice('session-'.length) : entry
-      const file = join(dir, entry, 'session.v4.jsonl.zstd')
-      if (!existsSync(file)) continue
+      const sessionDir = join(dir, entry)
+      /**
+       * 文件名**至少三种**：`session.jsonl.zstd`（早期）/ `session.v3…` / `session.v4…`（当前）。
+       * 只认 v4 时老会话全部"没有日志"，标题永远空 —— 列目录取匹配里最大的那份。
+       */
+      let candidates: string[] = []
+      try {
+        candidates = readdirSync(sessionDir).filter((name) => /^session(\.v\d+)?\.jsonl\.zstd$/.test(name))
+      } catch {
+        continue
+      }
+      let file: string | null = null
+      let bestSize = -1
+      for (const name of candidates) {
+        const candidate = join(sessionDir, name)
+        try {
+          const size = statSync(candidate).size
+          if (size > bestSize) {
+            bestSize = size
+            file = candidate
+          }
+        } catch {
+          /* 忽略 */
+        }
+      }
+      if (!file) continue
       /**
        * **两种 id 形态都要能查到**：ACP 的 `session/list` 对桌面端建的会话回的是
        * `session-<uuid>`（带前缀），而目录名与 ACP 自己建的会话是裸 `<uuid>`。
@@ -165,4 +189,148 @@ export function readDshSessionHint(file: string, maxBytes = 512 * 1024): DshSess
       }
     }
   }
+}
+
+// ------------------------------------------------------------------ 完整回放（历史会话"点开看全部对话"）
+
+export interface DshTranscriptEntry {
+  role: 'user' | 'assistant'
+  text: string
+  /** 思考正文（assistant 的 reasoning 块；没有为空串） */
+  thinking: string
+  /** 记录时间（毫秒）；日志里是 epoch ms */
+  at: number
+}
+
+/**
+ * 按会话 id 找它的日志文件。
+ * 实测文件名**至少有三种**：`session.jsonl.zstd`（早期）、`session.v3.jsonl.zstd`、
+ * `session.v4.jsonl.zstd`（当前）——只认 v4 的话，老会话就"没有日志"。
+ * 这里列目录取**名字匹配且最大**的那份（同名多份时内容更全的那个赢）。
+ */
+export function findDshSessionFile(sessionId: string, root = dshSessionsRoot()): string | null {
+  let groups: string[] = []
+  try {
+    groups = readdirSync(root)
+  } catch {
+    return null
+  }
+  for (const group of groups) {
+    const dir = join(root, group)
+    let entries: string[] = []
+    try {
+      entries = readdirSync(dir)
+    } catch {
+      continue
+    }
+    // 会话目录名有两种形态：裸 <uuid> 与 session-<uuid>（桌面端）
+    if (!entries.includes(sessionId) && !entries.includes('session-' + sessionId)) continue
+    const sessionDir = join(dir, entries.includes(sessionId) ? sessionId : 'session-' + sessionId)
+    let files: string[] = []
+    try {
+      files = readdirSync(sessionDir).filter((name) => /^session(\.v\d+)?\.jsonl\.zstd$/.test(name))
+    } catch {
+      continue
+    }
+    let best: string | null = null
+    let bestSize = -1
+    for (const name of files) {
+      const file = join(sessionDir, name)
+      try {
+        const size = statSync(file).size
+        if (size > bestSize) {
+          bestSize = size
+          best = file
+        }
+      } catch {
+        /* 忽略 */
+      }
+    }
+    if (best) return best
+  }
+  return null
+}
+
+/**
+ * 读一整个会话日志，还原**全部对话**（历史会话点开时的回放数据源）。
+ * 记录按 seq 排序（日志顺序即对话顺序）；只取真正由人发出的 `user/message`
+ * （`source.kind === 'user'`，"审批策略变更"这类系统注入不要）与 `assistant/message`。
+ * 上限 `maxBytes`（默认 4MB）防超大日志把主进程内存吃爆 —— 截断处之后的轮次就看不见了，
+ * 但对"回看对话"这个用途，丢最尾巴的几轮远好于进程崩掉。
+ */
+export function readDshSessionTranscript(sessionId: string, maxBytes = 4 * 1024 * 1024): DshTranscriptEntry[] {
+  const file = findDshSessionFile(sessionId)
+  if (!file) return []
+  let fd: number | null = null
+  try {
+    const size = statSync(file).size
+    const length = Math.min(size, maxBytes)
+    if (length <= 0) return []
+    const buffer = Buffer.allocUnsafe(length)
+    fd = openSync(file, 'r')
+    const read = readSync(fd, buffer, 0, length, 0)
+    return pickDshTranscript(decodeZstdFrames(buffer.subarray(0, read)))
+  } catch {
+    return []
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd)
+      } catch {
+        /* 忽略 */
+      }
+    }
+  }
+}
+
+/** 文本块 → 纯文本（content 数组里挑 text，其余类型丢弃）。 */
+function textOf(parts: unknown): string {
+  const list = Array.isArray(parts) ? (parts as { type?: string; text?: string }[]) : []
+  return list
+    .filter((part) => part?.type === 'text' && typeof part.text === 'string')
+    .map((part) => String(part.text))
+    .join('\n')
+    .trim()
+}
+
+/** 从 JSONL 文本里还原对话（纯函数，可单测）。 */
+export function pickDshTranscript(jsonl: string): DshTranscriptEntry[] {
+  const records: { seq: number; at: number; entry: DshTranscriptEntry }[] = []
+  for (const line of jsonl.split('\n')) {
+    const trimmed = line.trim()
+    if (trimmed.length === 0 || trimmed.charCodeAt(0) !== 123 /* '{' */) continue
+    let record: Record<string, unknown>
+    try {
+      record = JSON.parse(trimmed) as Record<string, unknown>
+    } catch {
+      continue
+    }
+    const type = String(record.type ?? '')
+    const at = Number(record.time ?? 0)
+    if (type === 'user/message') {
+      const data = (record.data ?? {}) as Record<string, unknown>
+      const source = (data.source ?? {}) as { kind?: unknown }
+      if (String(source.kind ?? '') !== 'user') continue
+      const text = textOf(data.content)
+      if (text.length === 0) continue
+      records.push({ seq: Number(record.seq ?? 0), at, entry: { role: 'user', text, thinking: '', at } })
+      continue
+    }
+    if (type === 'assistant/message') {
+      const data = (record.data ?? {}) as Record<string, unknown>
+      const message = (data.message ?? {}) as Record<string, unknown>
+      const parts = Array.isArray(message.content) ? (message.content as { type?: string; text?: string }[]) : []
+      const text = textOf(parts)
+      const thinking = parts
+        .filter((part) => part?.type === 'reasoning' && typeof part.text === 'string')
+        .map((part) => String(part.text))
+        .join('\n')
+        .trim()
+      if (text.length === 0 && thinking.length === 0) continue
+      records.push({ seq: Number(record.seq ?? 0), at, entry: { role: 'assistant', text, thinking, at } })
+    }
+  }
+  // seq 可能重复（多帧拼接），退回"数组顺序"作为次序；只在不破坏时间序的前提下排
+  records.sort((a, b) => (a.at !== b.at ? a.at - b.at : a.seq - b.seq))
+  return records.map((record) => record.entry)
 }

@@ -215,11 +215,23 @@ export class AcpClient {
       }
       default:
         /**
-         * 没消费的更新留一条 debug 痕迹。
-         * 实测 dsh 0.2 每轮会发 `usage_update`（上下文用量 `used` / `size`）——
-         * 它跟本程序"每条消息的输入/输出 token"不是一回事，硬映射会把"上下文占用"说成"这轮输入"，
-         * 所以宁可先不显示，但要能在日志里看见它来过（排查"为什么不显示用量"时有用）。
+         * dsh 0.2 每轮会发 `usage_update`（上下文用量）：`update.used` = 当前对话占用的 token、
+         * `update.size` = 窗口总量（拿不到时是 -1 / 缺省）。这跟"单条消息的输入/输出 token"不是一回事，
+         * 之前直接丢掉 —— 状态栏于是只能显示文档体量的静态估算、永远不更新。
+         * 现在翻成 `context-usage` 事件（字段做防御性解析：数字才认，负数/缺省按 null 处理）。
          */
+        if (kind === 'usage_update' || kind === 'usage') {
+          const used = Number((update as { used?: unknown }).used)
+          const sizeRaw = Number((update as { size?: unknown }).size)
+          if (Number.isFinite(used) && used > 0) {
+            this.options.onEvent({
+              type: 'context-usage',
+              used: Math.round(used),
+              size: Number.isFinite(sizeRaw) && sizeRaw > 0 ? Math.round(sizeRaw) : null
+            })
+          }
+          break
+        }
         if (kind.length > 0) logMain('debug', 'acp', '未消费的会话更新：' + kind)
         break
     }
@@ -287,6 +299,19 @@ export class AcpClient {
 
   cancel(sessionId: string): void {
     this.notify('session/cancel', { sessionId })
+  }
+
+  /**
+   * 强制收尾：Agent 对 `session/cancel` 不响应时（实测思考型模型空转时 dsh 会拖着不回
+   * `session/prompt` 的结果），取消不能只靠 Agent 自觉 —— 这里把**所有挂起请求**按超时错误拒绝。
+   * `session/prompt` 的调用方（AcpSession.prompt）会把它翻成 error 事件，UI 的流式状态才能落地。
+   */
+  forceFailPending(reason: string): void {
+    for (const [, pending] of this.pending) {
+      clearTimeout(pending.timer)
+      pending.reject(new Error(reason))
+    }
+    this.pending.clear()
   }
 
   async setConfigOption(sessionId: string, configId: string, value: string | boolean): Promise<ConfigOption[] | null> {

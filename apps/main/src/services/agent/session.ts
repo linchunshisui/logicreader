@@ -23,6 +23,13 @@ export class AcpSession implements AgentSessionHandle {
   private remoteId: string | null = null
   private configOptions: ConfigOption[] = []
   private disposed = false
+  /**
+   * 本轮 `session/prompt` 的收尾信号：done / error 事件发出的同一时刻 resolve（resolve 值不重要，
+   * 只表示"这一轮不再跑了"—— 成功与失败都算收尾）。取消路径用它判断"Agent 是否已经停了"，
+   * 避免瞎等或瞎杀。
+   */
+  private promptSettled: Promise<boolean>
+  private settlePrompt: ((value: boolean) => void) | null = null
 
   private constructor(
     id: string,
@@ -31,6 +38,9 @@ export class AcpSession implements AgentSessionHandle {
     private readonly onEvent: (event: AgentEvent) => void
   ) {
     this.id = id
+    this.promptSettled = new Promise<boolean>((resolve) => {
+      this.settlePrompt = resolve
+    })
   }
 
   static async create(create: AcpSessionCreateOptions): Promise<AcpSession> {
@@ -105,6 +115,11 @@ export class AcpSession implements AgentSessionHandle {
     return this.remoteId
   }
 
+  /** 取消强杀 / dispose 之后句柄不可复用（运行时会把它从会话表摘掉）。 */
+  isUsable(): boolean {
+    return !this.disposed
+  }
+
   get options(): ConfigOption[] {
     return this.configOptions
   }
@@ -136,22 +151,57 @@ export class AcpSession implements AgentSessionHandle {
   async prompt(input: PromptInput): Promise<void> {
     if (this.disposed) throw new Error('会话已关闭')
     if (!this.remoteId) throw new Error('会话尚未建立')
+    // 新一轮：重置收尾信号（上一轮的 settle 已消费）
+    this.promptSettled = new Promise<boolean>((resolve) => {
+      this.settlePrompt = resolve
+    })
     if (input.modelId) await this.applyConfig('model', input.modelId)
     if (input.thinkingEffort) await this.applyConfig('thought_level', input.thinkingEffort)
     const text = input.systemContext ? input.systemContext + '\n\n' + input.text : input.text
     try {
       const result = await this.client.prompt(this.remoteId, text)
+      this.settlePrompt?.(true)
       this.onEvent({ type: 'done', stopReason: (result as { stopReason?: string })?.stopReason ?? 'end_turn' })
     } catch (error) {
+      this.settlePrompt?.(false)
       if (this.disposed) return
       this.onEvent({ type: 'error', message: error instanceof Error ? error.message : String(error), retryable: true })
     }
   }
 
+  /**
+   * 停止当前回合（用户点「停止」）。
+   *
+   * 三步降级，**不再无条件杀进程**（旧实现 `setTimeout(killTree, 2500)`）：
+   * 子进程承载着**全部会话与整条 ACP 连接** —— 无条件杀掉等于把"停止这一轮"升级成"会话报废"，
+   * 而且就算 Agent 已经优雅停了，2.5 秒后照样被杀；下一句提问打在死句柄上，
+   * 看起来就是"停止之后 Agent 就坏了"。
+   *
+   * 1. 发 `session/cancel` 通知（规范的取消路径）；
+   * 2. 等 3 秒：Agent 配合就会回 `session/prompt` 的结果（stopReason=cancelled），自然收尾；
+   * 3. 还没停 → 把本连接**挂起的请求**按取消错误拒绝（UI 的流式状态立刻落地），再等 2 秒
+   *    仍不收敛才杀进程树 —— 杀掉的是"拖着不停的连接"，不是"正在好好干活的会话"。
+   */
   async cancel(): Promise<void> {
     if (this.remoteId) this.client.cancel(this.remoteId)
-    // 给 Agent 一点时间优雅收尾，超时后强杀
-    setTimeout(() => killTree(this.child), 2500)
+    const settledInGrace = await Promise.race([
+      // prompt 收尾（done/error 事件已由 prompt() 发出；resolve 值不重要，收尾就是收尾）
+      this.promptSettled.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 3000))
+    ])
+    if (settledInGrace) return
+    logMain('warn', 'acp', 'Agent 未在 3 秒内响应取消，强制收尾挂起请求')
+    this.client.forceFailPending('会话取消：Agent 未响应 session/cancel，已强制中断等待')
+    // 最后的兜底：再给 2 秒让回合真正终止（forceFail 已把等待方放行），仍没收尾才杀进程树
+    const settledAfterForce = await Promise.race([
+      this.promptSettled.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 2000))
+    ])
+    if (!settledAfterForce) {
+      logMain('warn', 'acp', 'Agent 仍未收敛，杀掉子进程树（连接不可恢复）')
+      killTree(this.child)
+      this.disposed = true
+    }
   }
 
   async dispose(): Promise<void> {

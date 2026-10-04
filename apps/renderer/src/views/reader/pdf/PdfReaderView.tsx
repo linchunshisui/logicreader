@@ -7,6 +7,7 @@ import { api } from '../../../lib/api'
 import { loadPdfDocument, releasePdfDocument, getPdfLayout, pdfjsLib } from '../../../lib/pdfjs'
 import { expandRevealRange } from '@logicreader/document-model'
 import { confirmFragments, rangeForChars, resolveDomSelection } from '../../../lib/selection'
+import { selectionRectOf } from '../../../lib/readerSelection'
 import { useRevealRequest } from '../../../lib/revealRequest'
 import { useZoomAnchor } from '../../../lib/zoomAnchor'
 import { TEXT_LAYER_MAPPING_VERSION } from '../../../lib/textLayerMapping'
@@ -459,7 +460,9 @@ export function PdfReaderView({ tab, model }: Props): JSX.Element {
         charStart,
         charEnd,
         anchorId: null,
-        locationLabel: describeLocator({ kind: 'pdf', page, rects }, { locale: i18n.language })
+        locationLabel: describeLocator({ kind: 'pdf', page, rects }, { locale: i18n.language }),
+        // 视口联合矩形：浮动工具条据此摆在选区旁边（而不是趴在视口底部挡住选区）
+        rect: selectionRectOf(range)
       })
       return true
     },

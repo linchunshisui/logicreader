@@ -16,6 +16,7 @@ import {
 } from '@logicreader/document-model'
 import {
   EDGE_KINDS,
+  NODE_KIND_COLOR,
   PRECISION_PROFILES,
   PROMPT_VERSION,
   emptyStats,
@@ -51,6 +52,8 @@ export interface GraphGenerateRequest {
   chunkTokens?: number
   concurrency?: number
   entityThreshold?: number
+  /** 增量重试：只重跑这些下标的分块（其余实体/连线从 graphId 对应的旧图继承） */
+  retryChunkIndexes?: number[]
   locale?: string
 }
 
@@ -60,6 +63,8 @@ export interface GraphProgress {
   done: number
   total: number
   detail: string
+  /** 预计剩余毫秒（运行中按已完成分块的实测速率滚动估计；null = 还没有可靠样本） */
+  etaMs?: number | null
   error?: string
 }
 
@@ -74,6 +79,12 @@ export interface GraphEstimate {
   nodes: [number, number]
   edges: [number, number]
   costLevel: number
+  /** 单块目标体量（字符），供界面展示"每块约多久" */
+  chunkChars: number
+  /** 依据历史统计的校准说明（首次使用为 null） */
+  basis: 'history' | 'heuristic'
+  /** 历史校准样本数（同文档 / 同模型的过去几轮） */
+  historySamples: number
 }
 
 /** 取文档所在目录（Agent 工作目录 / --add-dir 用）。 */
@@ -83,9 +94,12 @@ function documentDirOf(filePath: string): string | null {
   return index > 0 ? normalized.slice(0, index) : null
 }
 
-function loadModel(docId: string): DocumentModel {
+function loadModel(docId: string, options: { fresh?: boolean } = {}): DocumentModel {
   const record = storeService.getDocument(docId)
   if (!record) throw new Error('文档未入库：' + docId)
+  const cached = modelCache.get(docId)
+  // fresh（generate 路径）不走缓存：文档可能被重新解析而 docHash 未变（块切分策略升级等），必须以库里最新块为准
+  if (!options.fresh && cached && cached.hash === record.docHash) return cached.model
   const blocks: Block[] = storeService.getBlocks(docId).map((row) => ({
     id: row.id,
     docId: row.docId,
@@ -99,7 +113,7 @@ function loadModel(docId: string): DocumentModel {
     parentId: row.parentId ?? undefined
   }))
   const outline = record.outlineJson ? JSON.parse(record.outlineJson) : []
-  return finalizeDocumentModel({
+  const model = finalizeDocumentModel({
     docId,
     docHash: record.docHash,
     format: record.format as DocumentModel['format'],
@@ -111,7 +125,17 @@ function loadModel(docId: string): DocumentModel {
     pageCount: record.pageCount,
     meta: record.metaJson ? JSON.parse(record.metaJson) : {}
   })
+  /**
+   * 按文档缓存（docHash 失效即弃）：生成对话框里**每一次**下拉变化都会发一次 estimate IPC，
+   * 每次都全量读块 + JSON.parse + 重拼全文是纯重复劳动；同文档反复预估是常态路径。
+   * 只缓存最近 4 篇 —— 阅读器场景足够，内存不会滚大。
+   */
+  modelCache.delete(docId)
+  modelCache.set(docId, { hash: record.docHash, model })
+  if (modelCache.size > 4) modelCache.delete(modelCache.keys().next().value as string)
+  return model
 }
+const modelCache = new Map<string, { hash: string; model: DocumentModel }>()
 
 /** 代理套餐对「档位别名 / 思考强度」组合的拒付特征（403 / does not support / Token Plan 等）。 */
 function isPlanRejection(message: string): boolean {
@@ -142,9 +166,85 @@ export function chunkTimeoutFor(chars: number): number {
   return Math.round(Math.min(CHUNK_TIMEOUT_MAX_MS, Math.max(CHUNK_TIMEOUT_MIN_MS, budget)))
 }
 
+/**
+ * 思考强度对**耗时**的放大系数（对 token 同样适用——思考 token 也计费）。
+ * 依据 §53/§54 实测：同机同模型 xhigh 单块 88~300 秒，low 一次 21.7 秒，medium 介于其间。
+ * 未指定档位时按 medium 系数（用户全局 effortLevel 生效的现实，取偏保守值）。
+ */
+export function effortTimeFactor(effort: string | null | undefined): number {
+  switch (effort) {
+    case 'off':
+    case 'none':
+      return 0.7
+    case 'low':
+    case 'minimal':
+      return 0.9
+    case 'medium':
+    case null:
+    case undefined:
+      return 1
+    case 'high':
+      return 1.6
+    case 'xhigh':
+    case 'max':
+      return 2.6
+    default:
+      return 1
+  }
+}
+
+/** 档位抽取密度（实体数 / 千字符），决定输出 token 量与提示词里的数量指导。 */
+export function profileDensityPerKiloChars(profile: { id: GraphPrecision }): number {
+  switch (profile.id) {
+    case 'skeleton':
+      return 1.5
+    case 'structure':
+      return 3.5
+    case 'panorama':
+      return 7
+    default:
+      return 4
+  }
+}
+
 /** runOnce 超时中断的错误标识（与 agent runtime 的超时文案对应）。 */
 function isChunkTimeout(message: string): boolean {
   return message.startsWith('分块请求超时')
+}
+
+/**
+ * 用历史耗时样本校准整篇预估：样本折成"单波耗时"，按本轮波数外推。
+ * 纯函数（样本由调用方从 graphs 表取），便于单测钉住行为。
+ */
+export function estimateMinutesFromHistory(
+  samples: { elapsedMs: number; chunkCount: number; concurrency: number }[],
+  chunkCount: number,
+  concurrency: number
+): { minutes: [number, number]; samples: number } | null {
+  if (samples.length === 0) return null
+  // 单波耗时 = 整篇耗时 / 波数；耗时随波数近似线性（并发恒定时单块耗时稳定）
+  const perWave = samples
+    .map((s) => s.elapsedMs / Math.max(1, Math.ceil(s.chunkCount / Math.max(1, s.concurrency))))
+    .filter((v) => Number.isFinite(v) && v > 0)
+  if (perWave.length === 0) return null
+  perWave.sort((a, b) => a - b)
+  const mid = perWave[Math.floor(perWave.length / 2)]
+  const waves = Math.ceil(chunkCount / concurrency)
+  const low = Math.max(1, Math.round((waves * mid * 0.7) / 60000))
+  const high = Math.max(low + 1, Math.round((waves * mid * 1.6) / 60000))
+  return { minutes: [low, high], samples: perWave.length }
+}
+
+/**
+ * 无历史时的启发式：一次性会话冷启动 ~12 秒 + 单块处理时间（随块体量与思考强度），乘波数。
+ * 速率依据 §54 实测（xhigh）：1k 字符 ≈ 88 秒、4.6k ≈ 131 秒 —— 折算约「60 秒基础 + 15 秒/千字符」，
+ * 思考强度系数作用在处理时间上（冷启动与思考强度无关），整篇再留 15% 波间抖动余量。
+ */
+export function heuristicMinutes(chunkCount: number, concurrency: number, chunkChars: number, effortFactor: number): [number, number] {
+  const perChunkMs = (60000 + chunkChars * 0.015) * effortFactor + 12000
+  const waves = Math.ceil(chunkCount / concurrency)
+  const totalMs = waves * perChunkMs * 1.15
+  return [Math.max(1, Math.round((totalMs / 60000) * 0.75)), Math.max(2, Math.round((totalMs / 60000) * 1.5))]
 }
 
 function mapPrompt(input: {
@@ -156,10 +256,13 @@ function mapPrompt(input: {
   nodeKinds: string[]
   edgeKinds: string[]
   locale: string
+  /** 档位抽取密度（实体数/千字符），给模型一个"抽多细"的数量指导 */
+  density: number
 }): string {
   const zh = input.locale.startsWith('zh')
   const kindList = input.nodeKinds.join(' | ')
   const edgeList = input.edgeKinds.join(' | ')
+  const expected = Math.max(3, Math.round((input.chunkText.length / 1000) * input.density))
   if (zh) {
     return [
       '你是严谨的文档逻辑结构抽取器。下面给出《' + input.title + '》的一个片段。',
@@ -172,8 +275,10 @@ function mapPrompt(input: {
       '3. 关系类型只能是：' + edgeList + '；',
       '4. 每个节点与每条关系都必须给出原文摘句 evidence，以及 spans（相对全文的字符范围，必须落在上面给出的区间内）；',
       '5. 无法给出原文依据的条目一律不要输出；',
-      '6. 只输出 JSON，不要输出任何解释文字或 Markdown 代码围栏。',
-      '7. 不要使用任何工具（不要读写文件、不要执行命令、不要联网检索），直接把 JSON 作为回答正文输出。',
+      '6. 本片段体量约 ' + Math.round(input.chunkText.length / 1000) + ' 千字符，期望抽取约 ' + expected + ' 个实体（允许 ±40% 浮动；内容确实不足时可以更少，但不要为凑数编造）；',
+      '7. 节点名称必须与片段中的原文用词一致，同一概念在片段内多次出现时只建一个节点；',
+      '8. 只输出 JSON，不要输出任何解释文字或 Markdown 代码围栏。',
+      '9. 不要使用任何工具（不要读写文件、不要执行命令、不要联网检索），直接把 JSON 作为回答正文输出。',
       '',
       '输出结构：',
       '{"entities":[{"name":"简短名称(不超过14字)","type":"claim","summary":"一句话摘要(不超过40字)","evidence":"原文摘句","spans":[{"charStart":0,"charEnd":0}]}],',
@@ -194,8 +299,10 @@ function mapPrompt(input: {
     '3. Edge kinds: ' + edgeList,
     '4. Every entity and relation must carry verbatim evidence and spans (global character offsets inside the range above).',
     '5. Drop anything without a source anchor.',
-    '6. Output JSON only, no prose, no code fences.',
-    '7. Do not use any tool (no file reads or writes, no shell commands, no web search); answer with the JSON body directly.',
+    '6. This fragment is about ' + Math.round(input.chunkText.length / 1000) + 'k characters; expect roughly ' + expected + ' entities (±40% is fine; fewer if the content truly warrants it, but never invent filler).',
+    '7. Node names must use the fragment\'s own wording; mention the same concept multiple times → one node only.',
+    '8. Output JSON only, no prose, no code fences.',
+    '9. Do not use any tool (no file reads or writes, no shell commands, no web search); answer with the JSON body directly.',
     '',
     '{"entities":[{"name":"...","type":"claim","summary":"...","evidence":"...","spans":[{"charStart":0,"charEnd":0}]}],"relations":[{"from":"...","to":"...","type":"supports","label":"...","evidence":"...","spans":[{"charStart":0,"charEnd":0}]}]}',
     '',
@@ -220,6 +327,17 @@ export class GraphService {
     this.cancelled.add(taskId)
   }
 
+  /**
+   * 生成前的成本与耗时预估（规划书 §5.5.3.3：预估值基于本机历史统计，首次使用给保守区间）。
+   *
+   * 两层模型：
+   *  - **token 预估**：Map 阶段把整篇文档送进模型（含每块的提示词框架与标题路径），
+   *    输出按抽取密度（实体数 / 每千字符，随档位与思考强度走）估计；
+   *  - **耗时预估**：优先用**同文档的历史生成记录**校准 —— 历史里存了
+   *    `chunkCount × waveCount` 波的总耗时，能折出"单块 × 并发"的真实速率；
+   *    没有历史时退到常数启发式（每波 = 会话冷启动 + 单块处理时间，随块体量增长）。
+   *    思考强度是耗时的大头（实测 xhigh 是 low 的 2~4 倍），两档都乘系数。
+   */
   estimate(request: GraphGenerateRequest): GraphEstimate {
     const model = loadModel(request.docId)
     const profile = PRECISION_PROFILES[request.precision] ?? PRECISION_PROFILES.structure
@@ -230,17 +348,28 @@ export class GraphService {
       headingLevel: profile.headingLevel
     })
     const documentTokens = estimateTokens(model.text)
-    const weight = request.thinkingEffort === 'max' || request.thinkingEffort === 'xhigh' ? 1.8 : request.thinkingEffort === 'high' ? 1.35 : 1
-    // Map 阶段把整篇文档送进模型；Reduce 阶段再消耗一部分
-    const inputTokens = Math.round((documentTokens * 1.05 + chunks.length * 420) * weight)
-    const outputTokens = Math.round((documentTokens * 0.28 + chunks.length * 260) * weight)
+    const concurrency = Math.max(1, Math.min(6, request.concurrency ?? settingsService.all().graph.concurrency))
+    const effortFactor = effortTimeFactor(request.thinkingEffort)
+
+    // ---- token 预估：输入 = 文档全文 + 每块的提示词框架；输出 = 抽取密度 × 体量
+    const chunkChars = chunks.length > 0 ? Math.round(chunks.reduce((sum, c) => sum + c.text.length, 0) / chunks.length) : 0
+    const entityDensity = profileDensityPerKiloChars(profile)
+    const nodeScale = Math.min(2.2, Math.max(0.5, documentTokens / 18000))
+    const estNodes: [number, number] = [Math.round(profile.targetNodes[0] * nodeScale), Math.round(profile.targetNodes[1] * nodeScale)]
+    const outputTokens = Math.round((documentTokens * 0.22 + (estNodes[0] + estNodes[1]) / 2 * (60 + entityDensity * 8)) * effortFactor)
+    const inputTokens = Math.round((documentTokens * 1.05 + chunks.length * 420) * effortFactor)
     const totalTokens = inputTokens + outputTokens
-    const minutes: [number, number] = [
-      Math.max(1, Math.round(totalTokens / 42000)),
-      Math.max(2, Math.round(totalTokens / 16000))
-    ]
-    const scale = Math.min(2.2, Math.max(0.5, documentTokens / 18000))
-    const nodeRange = profile.targetNodes
+
+    // ---- 耗时预估：历史优先，启发式兜底
+    const history = estimateMinutesFromHistory(
+      storeService.graphHistoryElapsed(request.docId, 3),
+      chunks.length,
+      concurrency
+    )
+    const minutes: [number, number] = history
+      ? history.minutes
+      : heuristicMinutes(chunks.length, concurrency, chunkChars, effortFactor)
+
     return {
       precision: request.precision,
       chunkCount: chunks.length,
@@ -249,9 +378,12 @@ export class GraphService {
       outputTokens,
       totalTokens,
       minutes,
-      nodes: [Math.round(nodeRange[0] * scale), Math.round(nodeRange[1] * scale)],
-      edges: [Math.round(nodeRange[0] * scale * 1.8), Math.round(nodeRange[1] * scale * 1.9)],
-      costLevel: profile.relativeCost
+      nodes: estNodes,
+      edges: [Math.round(estNodes[0] * 1.8), Math.round(estNodes[1] * 1.9)],
+      costLevel: profile.relativeCost,
+      chunkChars,
+      basis: history ? 'history' : 'heuristic',
+      historySamples: history ? history.samples : 0
     }
   }
 
@@ -264,28 +396,68 @@ export class GraphService {
     this.cancelled.delete(taskId)
     const locale = request.locale ?? resolveLocale()
     const settings = settingsService.all()
-    const profile = PRECISION_PROFILES[request.precision] ?? PRECISION_PROFILES.structure
-    const model = loadModel(request.docId)
+    // fresh：生成必须以库里最新块为准（文档可能被重新解析而 docHash 未变）；缓存只服务 estimate
+    const model = loadModel(request.docId, { fresh: true })
     if (model.text.trim().length === 0) throw new Error('文档没有可抽取的文本（扫描版 PDF 需要 OCR，属于二期能力）')
 
-    onProgress({ taskId, phase: 'prepare', done: 0, total: 1, detail: '分块中' })
-    let chunks = chunkDocument(model, {
-      targetTokens: request.chunkTokens ?? profile.targetTokens,
+    /**
+     * 增量重试（规划书 §5.5.3.5"重试失败块"）的**第一步是复现原图的生成配置**：
+     * failedChunkIndexes 是相对"那一次"分块边界的下标 —— 分块大小 / 关系白名单 / 抽取范围
+     * 只要有一项变了，下标就会指到别的分块上（轻则重跑错块，重则把失败块又漏掉）。
+     * 所以这里先读出旧图的 generation，用它覆盖本次请求里的对应字段；
+     * request 显式传了的字段仍以请求为准（用户在"相同配置"下微调是显式意图）。
+     */
+    const isRetry = Array.isArray(request.retryChunkIndexes) && request.retryChunkIndexes.length > 0
+    const previousGraph = request.graphId && isRetry ? storeService.graphGet(request.graphId) : null
+    const retryBasis = previousGraph?.generation ?? null
+    const effective: GraphGenerateRequest = retryBasis
+      ? {
+          ...request,
+          /**
+           * 重试 = **原配置复现**：分块坐标系相关的字段（精度 / 分块大小 / 关系白名单 / 抽取范围）
+           * 一律以旧图 generation 里记录的值为准 —— 无条件覆盖，请求里带了也不作数。
+           * 想换配置就走整篇重新生成（不带 retryChunkIndexes），两条路语义分明。
+           * 不影响分块坐标系的字段（并发 / 消解阈值 / 节点上限）允许请求微调。
+           */
+          precision: (retryBasis.precision as GraphGenerateRequest['precision']) || request.precision,
+          chunkTokens: retryBasis.chunkTokens ?? request.chunkTokens,
+          edgeKinds: retryBasis.edgeKinds ?? request.edgeKinds,
+          scope: (retryBasis.scope as GraphGenerateRequest['scope']) ?? request.scope,
+          sectionIds: retryBasis.sectionIds ?? request.sectionIds,
+          fromPage: retryBasis.fromPage ?? request.fromPage,
+          concurrency: request.concurrency ?? retryBasis.concurrency ?? undefined,
+          entityThreshold: request.entityThreshold ?? retryBasis.entityThreshold ?? undefined,
+          nodeLimit: request.nodeLimit ?? retryBasis.nodeLimit ?? undefined
+        }
+      : request
+
+    onProgress({ taskId, phase: 'prepare', done: 0, total: 1, detail: isRetry ? '按原图分块复现中' : '分块中' })
+    const profile = PRECISION_PROFILES[effective.precision] ?? PRECISION_PROFILES.structure
+    const allChunks = chunkDocument(model, {
+      targetTokens: effective.chunkTokens ?? profile.targetTokens,
       overlap: profile.overlap,
       headingLevel: profile.headingLevel
     })
-    if (request.scope === 'section' && request.sectionIds && request.sectionIds.length > 0) {
-      chunks = chunks.filter((chunk) => chunk.sectionId && request.sectionIds?.includes(chunk.sectionId))
+    let chunks = allChunks
+    if (effective.scope === 'section' && effective.sectionIds && effective.sectionIds.length > 0) {
+      chunks = chunks.filter((chunk) => chunk.sectionId && effective.sectionIds?.includes(chunk.sectionId))
     }
-    if (request.scope === 'from-page' && request.fromPage) {
+    if (effective.scope === 'from-page' && effective.fromPage) {
       const fromChar =
-        model.blocks.find((block) => block.locator.kind === 'pdf' && block.locator.page >= (request.fromPage ?? 1))?.charStart ?? 0
+        model.blocks.find((block) => block.locator.kind === 'pdf' && block.locator.page >= (effective.fromPage ?? 1))?.charStart ?? 0
       chunks = chunks.filter((chunk) => chunk.charEnd > fromChar)
     }
     if (chunks.length === 0) throw new Error('没有可抽取的分块')
-
-    const edgeWhitelist = (request.edgeKinds && request.edgeKinds.length > 0
-      ? request.edgeKinds
+    const retryIndexes = isRetry
+      ? new Set(request.retryChunkIndexes!.filter((i) => Number.isInteger(i) && i >= 0 && i < chunks.length))
+      : null
+    const pendingChunks = retryIndexes ? chunks.filter((_, index) => retryIndexes.has(index)) : chunks
+    if (retryIndexes && pendingChunks.length === 0) {
+      // 下标全部越界（文档重解析后分块边界变了）：明确报错，而不是静默跑一个空任务
+      throw new Error('重试失败块：分块边界已变化（文档被重新解析？），请改用整篇重新生成')
+    }
+    const edgeWhitelist = (effective.edgeKinds && effective.edgeKinds.length > 0
+      ? effective.edgeKinds
       : profile.edgeKindWhitelist ?? [...EDGE_KINDS]) as EdgeKind[]
     const nodeWhitelist = profile.nodeKindWhitelist
 
@@ -308,6 +480,10 @@ export class GraphService {
       evidence: string
       charStart: number
       charEnd: number
+      /** 增量重试从上一张图继承的连线（不参与"重跑分块才保留"的过滤） */
+      inherited?: boolean
+      /** 继承连线的原权重（重跑分块新抽出的连线没有这个字段，从 1 计） */
+      weight?: number
     }
 
     const entities: RawEntity[] = []
@@ -315,7 +491,44 @@ export class GraphService {
     let failedChunks = 0
     let emptyChunks = 0
     const warnings: string[] = []
-    const concurrency = Math.max(1, Math.min(6, request.concurrency ?? settings.graph.concurrency))
+    const concurrency = Math.max(1, Math.min(6, effective.concurrency ?? settings.graph.concurrency))
+    /**
+     * 进度与 ETA：按"块下标完成数"计（增量重试时也自然是正确分母），
+     * 用已完成分块的实测耗时滚动估计剩余时间 —— 一次性会话冷启动 3~12 秒、
+     * 思考型模型单块分钟级，进度条光有"第 N/M 块"完全不足以判断还要等多久。
+     */
+    const pendingTotal = pendingChunks.length
+    /** chunk → 全文分块下标（建一次映射；逐个 indexOf 是 O(待跑数 × 总块数)） */
+    const indexOfChunk = new Map(allChunks.map((chunk, index) => [chunk, index] as const))
+    const chunkIndexes = pendingChunks.map((chunk) => indexOfChunk.get(chunk) ?? -1)
+    /** 已跑完（无论成败）的分块下标 → 耗时；失败记 0，成功的记真实耗时（ETA 用它算中位速率） */
+    const chunkDuration = new Map<number, number>()
+    const computeEta = (completed: number): number | null => {
+      if (completed < 1 || completed >= pendingTotal) return completed >= pendingTotal ? 0 : null
+      const samples = [...chunkDuration.values()].filter((v) => v > 0)
+      if (samples.length === 0) return null
+      samples.sort((a, b) => a - b)
+      const median = samples[Math.floor(samples.length / 2)]
+      const remainingWaves = Math.ceil((pendingTotal - completed) / concurrency)
+      return Math.round(remainingWaves * median + 2000)
+    }
+    /**
+     * 每个分块收尾时统一报一次进度（成功 / 合法空 / 校验失败 / 异常四条路都走这里）。
+     * 成功记真实耗时，失败记 0 —— 下面 failedChunkIndexes 就靠"时长为 0"判失败，
+     * ETA 只统计 > 0 的样本。
+     */
+    const finishChunk = (index: number, elapsedMs: number, failure: string | null): void => {
+      chunkDuration.set(index, failure ? 0 : Math.max(1, elapsedMs))
+      const done = chunkDuration.size
+      onProgress({
+        taskId,
+        phase: 'map',
+        done: Math.min(done, pendingTotal),
+        total: pendingTotal,
+        etaMs: computeEta(done),
+        detail: failure ?? '已抽取 ' + entities.length + ' 个节点'
+      })
+    }
 
     const runChunk = async (index: number): Promise<void> => {
       const chunk = chunks[index]
@@ -328,12 +541,14 @@ export class GraphService {
         charEnd: chunk.charEnd,
         nodeKinds: nodeWhitelist ?? ['claim', 'conclusion', 'evidence', 'definition', 'data', 'method'],
         edgeKinds: edgeWhitelist,
-        locale
+        locale,
+        density: profileDensityPerKiloChars(profile)
       })
       let raw = ''
       let parsed: ReturnType<typeof parseExtraction> | null = null
       let lastTimedOut = false
       let lastChunkError: string | null = null
+      const chunkStarted = Date.now()
       for (let tryIndex = 0; tryIndex < 3; tryIndex += 1) {
         const suffix =
           tryIndex === 0
@@ -345,14 +560,23 @@ export class GraphService {
         // 自动降级重试 —— 先去掉思考强度、再落到默认模型；每步降级记入 warnings（图报告可见）
         const attempts: { modelId: string | null; effort: string | null; note: string | null }[] = []
         // 思考型代理模型在高强度下偶发长时间空转：上次超时后，先把思考强度压到 low 抢一次快答
-        if (lastTimedOut && (request.thinkingEffort ?? null) !== 'low') {
-          attempts.push({ modelId: request.modelId ?? null, effort: 'low', note: '上次请求超时，已降低思考强度重试' })
+        if (lastTimedOut && (effective.thinkingEffort ?? null) !== 'low') {
+          attempts.push({ modelId: effective.modelId ?? null, effort: 'low', note: '上次请求超时，已降低思考强度重试' })
         }
-        attempts.push({ modelId: request.modelId ?? null, effort: request.thinkingEffort ?? null, note: null })
-        if ((request.thinkingEffort ?? null) !== null) {
-          attempts.push({ modelId: request.modelId ?? null, effort: null, note: '思考强度不被支持，已自动降级' })
+        attempts.push({ modelId: effective.modelId ?? null, effort: effective.thinkingEffort ?? null, note: null })
+        /**
+         * 超时两连击后不再原样再试一轮：同样的输入、同样的配置，第三轮大概率还是空转
+         * （§53/§54 实测空转是代理端行为，与运气有关但概率稳定）。这里直接放弃该分块，
+         * 把 3×timeout 的最坏等待压到 2×timeout —— 与其空烧十分钟，不如把失败原因亮给用户。
+         */
+        if (lastTimedOut) {
+          lastChunkError = lastChunkError ?? '分块请求连续超时'
+          break
         }
-        if ((request.modelId ?? null) !== null) {
+        if ((effective.thinkingEffort ?? null) !== null) {
+          attempts.push({ modelId: effective.modelId ?? null, effort: null, note: '思考强度不被支持，已自动降级' })
+        }
+        if ((effective.modelId ?? null) !== null) {
           attempts.push({ modelId: null, effort: null, note: '指定模型档位不被支持，已改用默认模型' })
         }
         let result: { text: string; sessionId: string } | null = null
@@ -361,7 +585,7 @@ export class GraphService {
         for (const attempt of attempts) {
           try {
             result = await agentRuntime.runOnce({
-              agentId: request.agentId,
+              agentId: effective.agentId,
               prompt: prompt + suffix,
               modelId: attempt.modelId,
               thinkingEffort: attempt.effort,
@@ -397,6 +621,8 @@ export class GraphService {
         parsed = parseExtraction(raw, {
           charStart: chunk.charStart,
           charEnd: chunk.charEnd,
+          // 分块原文：锚点彻底坏了时按 evidence 引文在本块内重新定位（弱模型最常见失败模式的直接对策）
+          chunkText: chunk.text,
           nodeKindWhitelist: nodeWhitelist,
           edgeKindWhitelist: edgeWhitelist
         })
@@ -418,11 +644,13 @@ export class GraphService {
         const message = '分块 ' + index + ' 校验失败：' + detail + '｜原文开头：' + head
         warnings.push(message)
         logMain('warn', 'graph', message)
+        finishChunk(index, Date.now() - chunkStarted, message)
         return
       }
       if (parsed.value.entities.length === 0) {
         emptyChunks += 1
         logMain('debug', 'graph', '分块 ' + index + ' 返回合法空结果（该块没有可抽取的实体）')
+        finishChunk(index, Date.now() - chunkStarted, null)
         return
       }
       const extracted = parsed.value
@@ -452,37 +680,97 @@ export class GraphService {
           charEnd: span.charEnd
         })
       }
-      onProgress({
-        taskId,
-        phase: 'map',
-        done: index + 1,
-        total: chunks.length,
-        detail: '已抽取 ' + entities.length + ' 个节点'
-      })
+      finishChunk(index, Date.now() - chunkStarted, null)
     }
 
     let cursor = 0
     const workers = Array.from({ length: concurrency }, async () => {
-      while (cursor < chunks.length && !this.cancelled.has(taskId)) {
-        const index = cursor
+      while (cursor < chunkIndexes.length && !this.cancelled.has(taskId)) {
+        const slot = cursor
         cursor += 1
+        const index = chunkIndexes[slot]
         try {
           await runChunk(index)
         } catch (error) {
+          // 与校验失败同一条收尾路（finishChunk 统一计数 / ETA / failedChunkIndexes）
           failedChunks += 1
-          warnings.push('分块 ' + index + ' 失败：' + (error instanceof Error ? error.message : String(error)))
-          onProgress({ taskId, phase: 'map', done: index + 1, total: chunks.length, detail: '分块失败，继续' })
+          const message = '分块 ' + index + ' 失败：' + (error instanceof Error ? error.message : String(error))
+          warnings.push(message)
+          logMain('warn', 'graph', message)
+          finishChunk(index, 0, '分块失败，继续')
         }
       }
     })
     await Promise.all(workers)
 
     if (this.cancelled.has(taskId)) throw new Error('cancelled')
+    const failedChunkIndexes = chunkIndexes.filter((index) => {
+      // 失败 = 既没进 entities 也没记成功时长（成功/合法空都会写 chunkDuration）
+      return !chunkDuration.has(index) || chunkDuration.get(index) === 0
+    })
 
     onProgress({ taskId, phase: 'reduce', done: 0, total: 1, detail: '实体消解与合并' })
-    const threshold = request.entityThreshold ?? settings.graph.entityResolutionThreshold
+    const threshold = effective.entityThreshold ?? settings.graph.entityResolutionThreshold
     const canonical = new Map<string, RawEntity>()
     let mergedEntities = 0
+    /**
+     * 增量重试：继承节点的**全部出处**先收在这里（key → 位置列表），
+     * 等本轮分块的新抽取并进来后一起参与"节点多锚点"的合并。
+     */
+    const entityPositionsInherited = new Map<string, { charStart: number; charEnd: number }[]>()
+    /**
+     * 增量重试：上一张图的成功抽取先入列，再合并本轮重跑分块的新抽取。
+     * 旧实体标记 originChunk = -1（不属于本轮任何分块），合并/去重逻辑天然复用。
+     */
+    if (previousGraph) {
+      let inherited = 0
+      for (const oldNode of previousGraph.nodes) {
+        if (oldNode.meta?.isSection) continue
+        const firstAnchor = oldNode.anchors?.[0]
+        if (!firstAnchor) continue
+        const inheritedEntity: RawEntity = {
+          name: oldNode.title,
+          kind: oldNode.kind,
+          summary: oldNode.summary,
+          evidence: firstAnchor.quote,
+          charStart: firstAnchor.charStart,
+          charEnd: firstAnchor.charEnd,
+          chunkIndex: -1,
+          headingPath: (oldNode.meta?.headingPath as string[] | undefined) ?? [],
+          weight: Number(oldNode.meta?.weight ?? 1)
+        }
+        inherited += 1
+        const key = normalizeName(inheritedEntity.name)
+        if (key.length === 0) continue
+        if (!canonical.has(key)) canonical.set(key, inheritedEntity)
+        // 多位置节点：把旧图的其余锚点也带进"出处集合"（否则重试一轮就把多锚点打回单锚点）
+        const positions = entityPositionsInherited.get(key) ?? []
+        for (const anchor of oldNode.anchors ?? []) {
+          if (!positions.some((item) => Math.abs(item.charStart - anchor.charStart) < 8)) {
+            positions.push({ charStart: anchor.charStart, charEnd: anchor.charEnd })
+          }
+        }
+        entityPositionsInherited.set(key, positions)
+      }
+      for (const oldEdge of previousGraph.edges) {
+        const from = previousGraph.nodes.find((node) => node.id === oldEdge.from)
+        const to = previousGraph.nodes.find((node) => node.id === oldEdge.to)
+        if (!from || !to || from.meta?.isSection || to.meta?.isSection) continue
+        const firstAnchor = oldEdge.anchors?.[0]
+        relations.push({
+          from: from.title,
+          to: to.title,
+          kind: oldEdge.kind,
+          label: oldEdge.label,
+          evidence: firstAnchor ? firstAnchor.quote : '',
+          charStart: firstAnchor ? firstAnchor.charStart : 0,
+          charEnd: firstAnchor ? firstAnchor.charEnd : 1,
+          inherited: true,
+          weight: oldEdge.weight
+        })
+      }
+      if (inherited > 0) logMain('info', 'graph', '增量重试：从上一张图继承 ' + inherited + ' 个节点与 ' + previousGraph.edges.length + ' 条连线')
+    }
     for (const entity of entities) {
       const key = normalizeName(entity.name)
       if (key.length === 0) continue
@@ -528,6 +816,28 @@ export class GraphService {
       return null
     }
 
+    /**
+     * 节点多锚点（规划书 §5.5.7 / R-12 的"位置选择器"）：同名实体在多个分块出现时
+     * 保留**全部**出处（此前只留第一条，跨章节复现的关键概念只有一个锚点，位置选择器形同虚设）。
+     * 增量重试时继承出处（entityPositionsInherited）与新抽取的出处在这里汇合。
+     */
+    const entityPositions = new Map<string, { charStart: number; charEnd: number }[]>()
+    for (const entity of entities) {
+      const key = resolveKey(entity.name)
+      if (!key) continue
+      const list = entityPositions.get(key) ?? []
+      const span = { charStart: entity.charStart, charEnd: entity.charEnd }
+      if (!list.some((item) => Math.abs(item.charStart - span.charStart) < 8)) list.push(span)
+      entityPositions.set(key, list)
+    }
+    for (const [key, positions] of entityPositionsInherited) {
+      const list = entityPositions.get(key) ?? []
+      for (const span of positions) {
+        if (!list.some((item) => Math.abs(item.charStart - span.charStart) < 8)) list.push(span)
+      }
+      entityPositions.set(key, list)
+    }
+
     const nodeByKey = new Map<string, GraphNode>()
     for (const [key, entity] of canonical) {
       nodeByKey.set(key, {
@@ -549,6 +859,12 @@ export class GraphService {
           evidence: entity.evidence
         }
       })
+    }
+    /** 节点 id → 出处列表（建锚点阶段用；避免锚点循环里逐节点反查 key） */
+    const nodePositionsById = new Map<string, { charStart: number; charEnd: number }[]>()
+    for (const [key, node] of nodeByKey) {
+      const positions = entityPositions.get(key)
+      if (positions && positions.length > 0) nodePositionsById.set(node.id, positions)
     }
 
     const edgeMap = new Map<string, GraphEdge>()
@@ -576,7 +892,12 @@ export class GraphService {
         kind: relation.kind,
         label: relation.label,
         anchorIds: [],
-        weight: 1,
+        /**
+         * 增量重试：继承连线带**原权重**入场（而不是从 1 重新数起）——
+         * 否则 weight≥2 才能过的阈值过滤会把上一轮确认过多处的边误判成"只出现一次"而删掉，
+         * 重试一轮反而丢边。
+         */
+        weight: relation.inherited ? Math.max(1, Number(relation.weight ?? 1)) : 1,
         meta: {
           evidence: relation.evidence,
           charStart: relation.charStart,
@@ -600,7 +921,7 @@ export class GraphService {
       }
     }
 
-    const limit = request.nodeLimit ?? settings.graph.targetNodeLimit
+    const limit = effective.nodeLimit ?? settings.graph.targetNodeLimit
     if (nodeByKey.size > limit) {
       const sorted = [...nodeByKey.values()].sort((a, b) => (degree.get(b.id) ?? 0) - (degree.get(a.id) ?? 0))
       const keep = new Set(sorted.slice(0, limit).map((node) => node.id))
@@ -658,7 +979,20 @@ export class GraphService {
     for (const node of [...sectionNodes.values(), ...nodeByKey.values()]) {
       const charStart = Number(node.meta?.charStart ?? 0)
       const charEnd = Number(node.meta?.charEnd ?? charStart + 1)
-      node.anchorIds = [persistAnchor(charStart, charEnd)]
+      const primary = persistAnchor(charStart, charEnd)
+      const ids = [primary]
+      // 同名实体的其余出处（最多再补 5 处，超过的重复出处对位置选择器没有增量价值）
+      if (!node.meta?.isSection) {
+        const positions = nodePositionsById.get(node.id)
+        if (positions) {
+          for (const span of positions.slice(0, 6)) {
+            if (Math.abs(span.charStart - charStart) < 8 && Math.abs(span.charEnd - charEnd) < 8) continue
+            ids.push(persistAnchor(span.charStart, span.charEnd))
+            if (ids.length >= 6) break
+          }
+        }
+      }
+      node.anchorIds = ids
     }
     for (const edge of edgeMap.values()) {
       const meta = edge.meta ?? {}
@@ -710,6 +1044,10 @@ export class GraphService {
       // 全部分块都「解析成功但没实体」不是技术故障，得把话说清楚，别让用户以为工具坏了
       warnings.push('所有分块都返回了合法但空的抽取结果：模型没有抽到任何实体（可换更高精度档位或换模型）')
     }
+    /**
+     * failedChunks 与 failedChunkIndexes 分开记：前者是"本轮重跑的分块里失败的数量"（用户视角），
+     * 后者是"全文分块坐标系里失败的下标"（增量重试视角 —— 下一轮只重跑这些）。
+     */
     const stats: GraphStats = {
       ...emptyStats(),
       nodeCount: nodes.length,
@@ -722,7 +1060,11 @@ export class GraphService {
           ? Math.round(edges.reduce((sum, edge) => sum + String(edge.meta?.evidence ?? '').length, 0) / edges.length)
           : 0,
       mergedEntities,
-      elapsedMs: Date.now() - started
+      elapsedMs: Date.now() - started,
+      chunkCount: pendingChunks.length,
+      waveCount: Math.max(1, Math.ceil(pendingChunks.length / concurrency)),
+      chunkChars: pendingChunks.reduce((sum, chunk) => sum + chunk.text.length, 0),
+      failedChunkIndexes: [...new Set(failedChunkIndexes)].sort((a, b) => a - b)
     }
 
     const graph: LogicGraph = {
@@ -735,13 +1077,25 @@ export class GraphService {
       updatedAt: Date.now(),
       status: failedChunks > 0 ? 'partial' : 'done',
       generation: {
-        agentId: request.agentId,
-        agentName: request.agentName ?? request.agentId,
-        modelId: request.modelId ?? null,
-        thinkingEffort: request.thinkingEffort ?? null,
-        precision: request.precision,
+        agentId: effective.agentId,
+        agentName: request.agentName ?? effective.agentId,
+        modelId: effective.modelId ?? null,
+        thinkingEffort: effective.thinkingEffort ?? null,
+        precision: effective.precision,
         promptVersion: PROMPT_VERSION,
-        scope: request.scope ?? 'full'
+        scope: effective.scope ?? 'full',
+        /**
+         * 生成配置随图落库：增量重试要按**同一套分块**跑 —— failedChunkIndexes 是相对
+         * 那一次分块边界的下标，分块大小 / 白名单 / 范围一变，下标就会指错块。
+         * （重试入口缺省时优先用这里的值，而不是 UI 上的当前设置。）
+         */
+        chunkTokens: effective.chunkTokens ?? profile.targetTokens,
+        edgeKinds: edgeWhitelist,
+        concurrency,
+        entityThreshold: effective.entityThreshold ?? settings.graph.entityResolutionThreshold,
+        nodeLimit: effective.nodeLimit ?? settings.graph.targetNodeLimit,
+        sectionIds: effective.scope === 'section' ? effective.sectionIds ?? null : null,
+        fromPage: effective.scope === 'from-page' ? effective.fromPage ?? null : null
       },
       nodes,
       edges,
@@ -755,7 +1109,11 @@ export class GraphService {
       logMain('warn', 'graph', '生成结果为空（失败分块 ' + failedChunks + '），不入库：' + (graph.error ?? ''))
     } else {
       const previous = request.graphId ? storeService.graphGet(request.graphId) : null
-      if (previous) mergeHumanEdits(graph, previous)
+      if (previous) {
+        mergeHumanEdits(graph, previous)
+        // 同一张图（重试 / 增量补抽）保留原始创建时间，"updatedAt 才是本轮"的语义才成立
+        graph.createdAt = previous.createdAt
+      }
       storeService.graphSave(graph)
     }
     onProgress({ taskId, phase: 'done', done: 1, total: 1, detail: '关系图已生成' })
@@ -767,36 +1125,17 @@ export class GraphService {
     return graph
   }
 
-  async refine(
-    request: GraphGenerateRequest,
-    onProgress: (progress: GraphProgress) => void,
-    taskId = createId('task')
-  ): Promise<LogicGraph> {
-    return this.generate({ ...request, graphId: request.graphId ?? null }, onProgress, taskId)
-  }
-
   importFromJson(payload: unknown): LogicGraph {
     const result = validateGraphDocument(payload)
     if (!result.ok || !result.value) {
       throw new Error('导入失败：' + result.issues.slice(0, 5).map((issue) => issue.path + ' ' + issue.message).join('; '))
     }
     const graph = result.value
-    const anchors: {
-      id: string
-      docId: string
-      docHash: string
-      blockIds: string
-      charStart: number
-      charEnd: number
-      quote: string
-      quoteHash: string
-      primaryJson: string
-      extrasJson: string | null
-      status: 'ok' | 'stale'
-    }[] = []
-    for (const node of graph.nodes) {
+    /** 导入图的锚点先按导出格式原样入锚点表，再把 id 挂回节点 / 连线（节点与连线同一套转换）。 */
+    const anchors: Record<string, unknown>[] = []
+    const importAnchors = (refs: { docId: string; docHash: string; charStart: number; charEnd: number; quote: string; primary?: unknown; extras?: unknown[] }[] | undefined): string[] => {
       const ids: string[] = []
-      for (const anchor of node.anchors ?? []) {
+      for (const anchor of refs ?? []) {
         const id = createId('anc')
         ids.push(id)
         anchors.push({
@@ -813,30 +1152,17 @@ export class GraphService {
           status: 'ok'
         })
       }
-      node.anchorIds = ids.length > 0 ? ids : node.anchorIds
+      return ids
+    }
+    for (const node of graph.nodes) {
+      const ids = importAnchors(node.anchors)
+      if (ids.length > 0) node.anchorIds = ids
     }
     for (const edge of graph.edges) {
-      const ids: string[] = []
-      for (const anchor of edge.anchors ?? []) {
-        const id = createId('anc')
-        ids.push(id)
-        anchors.push({
-          id,
-          docId: anchor.docId,
-          docHash: anchor.docHash,
-          blockIds: '[]',
-          charStart: anchor.charStart,
-          charEnd: anchor.charEnd,
-          quote: anchor.quote,
-          quoteHash: '',
-          primaryJson: JSON.stringify(anchor.primary ?? { kind: 'text', line: 1, column: 0 }),
-          extrasJson: JSON.stringify(anchor.extras ?? []),
-          status: 'ok'
-        })
-      }
+      const ids = importAnchors(edge.anchors)
       if (ids.length > 0) edge.anchorIds = ids
     }
-    if (anchors.length > 0) storeService.saveAnchors(anchors)
+    if (anchors.length > 0) storeService.saveAnchors(anchors as never)
     storeService.graphSave(graph)
     return graph
   }
@@ -914,7 +1240,7 @@ export class GraphService {
       if (!point) continue
       parts.push(
         '<g><rect x="' + point.x + '" y="' + point.y + '" width="260" height="56" rx="8" fill="#ffffff" stroke="#d4d4d4"/>' +
-          '<rect x="' + point.x + '" y="' + point.y + '" width="3" height="56" fill="' + kindColor(node.kind) + '"/>' +
+          '<rect x="' + point.x + '" y="' + point.y + '" width="3" height="56" fill="' + (NODE_KIND_COLOR[node.kind as NodeKind] ?? '#8a8a8a') + '"/>' +
           '<text x="' + (point.x + 14) + '" y="' + (point.y + 24) + '" font-size="13" fill="#1f1f1f">' + escapeXml(node.title) + '</text>' +
           '<text x="' + (point.x + 14) + '" y="' + (point.y + 44) + '" font-size="11" fill="#777">' + escapeXml(node.summary.slice(0, 30)) + '</text></g>'
       )
@@ -964,25 +1290,17 @@ function graphDisplayTitle(docTitle: string, locale: string): string {
   return name ? name + ' · ' + suffix : suffix
 }
 
-function kindColor(kind: string): string {
-  const map: Record<string, string> = {
-    claim: '#3d7fd1',
-    conclusion: '#c98a2e',
-    evidence: '#3f9e46',
-    definition: '#2aa5a5',
-    data: '#8a5cd1',
-    method: '#5b7f95',
-    inquiry: '#e0713a',
-    selection: '#8a8a8a'
-  }
-  return map[kind] ?? '#8a8a8a'
-}
-
 function escapeXml(value: string): string {
   return value.replace(/[<>&"]/g, (char) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' })[char] ?? char)
 }
 
-/** 重生成时保留人工编辑（规划书 §5.5.3.6）。 */
+/**
+ * 重生成时保留人工编辑（规划书 §5.5.3.6）。
+ *
+ * 同时**继承上一张图的提问节点**（`inquiry`，来自文档默认会话的对话——用户要求：
+ * "每增加对话都需要在关系图中增加对话内容"，重生成不能把已有的对话内容冲掉）：
+ * 这些节点是"可读的对话记录"，没有人工 pinned 标记也照样带过来。
+ */
 function mergeHumanEdits(next: LogicGraph, previous: LogicGraph): void {
   const previousNodes = new Map(previous.nodes.map((node) => [node.id, node]))
   const byTitle = new Map(previous.nodes.map((node) => [normalizeName(node.title), node]))
@@ -1002,14 +1320,31 @@ function mergeHumanEdits(next: LogicGraph, previous: LogicGraph): void {
     (previous.ignoredEdges ?? []).map((edge) => (titleOf.get(edge.from) ?? edge.from) + '>' + (titleOf.get(edge.to) ?? edge.to) + '#' + edge.kind)
   )
   next.ignoredEdges = previous.ignoredEdges ?? []
+  // 边签名按"端点标题"比对：先建 next 的 id→标题表，避免 filter 里每条边两次 nodes.find（O(边×节点)）
+  const nextTitleOf = new Map(next.nodes.map((node) => [node.id, normalizeName(node.title)]))
   next.edges = next.edges.filter((edge) => {
-    const signature = normalizeName(byTitleId(next, edge.from)) + '>' + normalizeName(byTitleId(next, edge.to)) + '#' + edge.kind
+    const signature = (nextTitleOf.get(edge.from) ?? edge.from) + '>' + (nextTitleOf.get(edge.to) ?? edge.to) + '#' + edge.kind
     return !ignored.has(signature)
   })
-}
-
-function byTitleId(graph: LogicGraph, id: string): string {
-  return graph.nodes.find((node) => node.id === id)?.title ?? id
+  // 继承提问节点（对话内容）：next 里没有同标题节点时整条搬过来（节点 + 它的 inquiry 连边）
+  const nextTitles = new Set([...next.nodes].map((node) => normalizeName(node.title)))
+  for (const oldNode of previous.nodes) {
+    if (oldNode.kind !== 'inquiry') continue
+    if (nextTitles.has(normalizeName(oldNode.title))) continue
+    const carried: typeof oldNode = { ...oldNode, id: createId('n'), pinned: undefined }
+    next.nodes.push(carried)
+    const oldTitleById = new Map(previous.nodes.map((node) => [node.id, node.title]))
+    for (const oldEdge of previous.edges) {
+      if (oldEdge.from !== oldNode.id && oldEdge.to !== oldNode.id) continue
+      const otherId = oldEdge.from === oldNode.id ? oldEdge.to : oldEdge.from
+      const otherTitle = oldTitleById.get(otherId) ?? ''
+      const otherNext = next.nodes.find((node) => normalizeName(node.title) === normalizeName(otherTitle))
+      if (!otherNext) continue
+      const from = oldEdge.from === oldNode.id ? carried.id : otherNext.id
+      const to = oldEdge.from === oldNode.id ? otherNext.id : carried.id
+      next.edges.push({ ...oldEdge, id: createId('e'), from, to, anchors: undefined })
+    }
+  }
 }
 
 export const graphService = new GraphService()

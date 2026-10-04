@@ -1059,6 +1059,7 @@
 }
 
 /* -------------------------------------------------- 选区浮动工具条 */
+/* 默认（无选区位置信息）：视口底部居中 —— 表格单元格选区等路径的退回位置 */
 .lr-selection-toolbar {
   position: absolute;
   left: 50%;
@@ -1175,6 +1176,53 @@
   min-width: 0;
 }
 
+/**
+ * 用户提问是"从右侧发起的气泡"（用户要求）：整条消息右对齐，
+ * 正文装进**圆角矩形**里 —— 与左侧顶格的助手回复（思考/工具/正文）在方向上就分得开。
+ * .lr-entry[data-role="user"] 上的 align-items 让气泡按内容收缩、贴右；
+ * 气泡自身 max-width 85%，长问题不至于顶满整行。
+ */
+.lr-entry[data-role='user'] {
+  align-items: flex-end;
+}
+
+.lr-entry[data-role='user'] .lr-entry__meta,
+.lr-entry[data-role='user'] .lr-entry__meta--link {
+  text-align: right;
+}
+
+/**
+ * 用户提问要**醒目**（用户反馈）：浅底圆角矩形 + 蓝描边，
+ * 在一串"灰色的过程行"（思考/工具）里一眼找到"我问了什么"。
+ */
+.lr-entry__question {
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.66;
+  font-size: var(--lr-fs-md);
+  max-width: 85%;
+  padding: 8px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--vscode-focusBorder);
+  background: var(--vscode-input-background, rgba(127, 127, 127, 0.1));
+}
+
+/* 提问的位置来源：可点（带锚点时）就是一个链接按钮 */
+.lr-entry__meta--link {
+  text-align: left;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--vscode-textLink-foreground);
+  cursor: pointer;
+  font-size: var(--lr-fs-xs);
+}
+
+.lr-entry__meta--link:hover {
+  text-decoration: underline;
+  color: var(--vscode-textLink-activeForeground);
+}
+
 .lr-entry__text {
   white-space: pre-wrap;
   word-break: break-word;
@@ -1195,6 +1243,16 @@
   font-size: var(--lr-fs-sm);
   color: var(--vscode-errorForeground);
   white-space: pre-wrap;
+}
+
+/* 失败回合的重试按钮：紧跟错误行，紧凑不抢眼 */
+.lr-entry__retry {
+  margin-top: 2px;
+}
+
+.lr-entry__retry .lr-button {
+  font-size: var(--lr-fs-xs);
+  padding: 2px 10px;
 }
 
 .lr-entry__cursor {
@@ -1716,6 +1774,13 @@
   background: var(--vscode-list-hoverBackground);
 }
 
+/* 删除类动作：悬停时红字红框，与"总结命名/改名"这类无害操作区分开 */
+.lr-agent__picker-action--danger:hover {
+  border-color: var(--vscode-errorForeground);
+  color: var(--vscode-errorForeground);
+  background: var(--vscode-list-hoverBackground);
+}
+
 /* 键盘导航时的高亮（斜杠命令面板用） */
 .lr-agent__picker-item[data-active='true'] {
   background: var(--vscode-list-hoverBackground);
@@ -1950,6 +2015,26 @@
   padding: 8px 10px;
   border-radius: 6px;
   background: rgba(127, 127, 127, 0.08);
+}
+
+/* 计划编辑态：与预览同底色，等宽字体（方案是 markdown 源码），随 rows 撑高 */
+.lr-plancard__edit {
+  max-height: 340px;
+  overflow: auto;
+  resize: vertical;
+  font-family: var(--lr-font-mono);
+  font-size: var(--lr-fs-sm);
+  line-height: 1.6;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--vscode-focusBorder);
+  background: rgba(127, 127, 127, 0.08);
+  color: var(--vscode-editor-foreground);
+}
+
+.lr-plancard__edit:focus {
+  outline: none;
+  border-color: var(--vscode-focusBorder);
 }
 
 .lr-plancard__actions {

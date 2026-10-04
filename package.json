@@ -1,6 +1,6 @@
 {
   "name": "logicreader",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
   "description": "逻辑阅读器 / LogicReader —— 会画逻辑图的本地文档阅读器",
   "author": "LogicReader",

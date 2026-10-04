@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { zstdCompressSync } from 'node:zlib'
-import { decodeZstdFrames, pickDshSessionHint } from '../apps/main/src/services/agent/dsh-session-log'
+import { decodeZstdFrames, pickDshSessionHint, pickDshTranscript } from '../apps/main/src/services/agent/dsh-session-log'
 
 /**
  * dsh 的会话日志是**多帧拼接**的 zstd（Node 的 zstdDecompressSync 只解第一帧），
@@ -45,5 +45,67 @@ describe('dsh 会话日志：挑标题与第一句提问', () => {
   it('坏行不影响解析', () => {
     const messy = 'not json\n' + jsonl
     expect(pickDshSessionHint(messy).firstUserText).toBe('阅读 逻辑阅读器-任务规划书.md 文件，执行其中的内容')
+  })
+})
+
+describe('dsh 会话日志：还原全部对话（历史会话点开时的回放）', () => {
+  /** 与本机真实日志同构的记录（user/message 只认 source.kind=user；assistant/message 带 reasoning 块）。 */
+  const jsonl = [
+    JSON.stringify({ type: 'session', id: 'x', seq: 1, time: 1000 }),
+    // 系统注入（审批策略变更）不是用户说的话
+    JSON.stringify({
+      type: 'user/message', seq: 2, time: 1100,
+      data: { content: [{ type: 'text', text: 'The approval policy changed' }], source: { kind: 'user-approval' } }
+    }),
+    JSON.stringify({
+      type: 'user/message', seq: 3, time: 1200,
+      data: { content: [{ type: 'text', text: '解释 GRPO 的损失函数' }], source: { kind: 'user' } }
+    }),
+    JSON.stringify({
+      type: 'assistant/message', seq: 4, time: 1300,
+      data: {
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'reasoning', text: '用户在问强化学习…' },
+            { type: 'text', text: 'GRPO 的损失是带组内相对优势的策略梯度。' }
+          ]
+        }
+      }
+    }),
+    JSON.stringify({
+      type: 'user/message', seq: 5, time: 1400,
+      data: { content: [{ type: 'text', text: '那 SFT 呢？' }], source: { kind: 'user' } }
+    }),
+    JSON.stringify({
+      type: 'assistant/message', seq: 6, time: 1500,
+      data: { message: { role: 'assistant', content: [{ type: 'text', text: 'SFT 是监督微调…' }] } }
+    })
+  ].join('\n')
+
+  it('按时间序还原全部 user/assistant（系统注入跳过、reasoning 进 thinking）', () => {
+    const transcript = pickDshTranscript(jsonl)
+    expect(transcript).toEqual([
+      { role: 'user', text: '解释 GRPO 的损失函数', thinking: '', at: 1200 },
+      { role: 'assistant', text: 'GRPO 的损失是带组内相对优势的策略梯度。', thinking: '用户在问强化学习…', at: 1300 },
+      { role: 'user', text: '那 SFT 呢？', thinking: '', at: 1400 },
+      { role: 'assistant', text: 'SFT 是监督微调…', thinking: '', at: 1500 }
+    ])
+  })
+
+  it('空正文也没有思考的 assistant 记录被跳过', () => {
+    const withEmpty = jsonl + '\n' + JSON.stringify({ type: 'assistant/message', seq: 7, time: 1600, data: { message: { content: [] } } })
+    expect(pickDshTranscript(withEmpty)).toHaveLength(4)
+  })
+
+  it('坏行不影响解析；时间乱序时按 time 排回', () => {
+    const shuffled = [
+      jsonl.split('\n')[3], // assistant 先出现（乱序）
+      ...jsonl.split('\n').slice(0, 3),
+      ...jsonl.split('\n').slice(4)
+    ].join('\n')
+    const transcript = pickDshTranscript(shuffled)
+    expect(transcript[0]?.role).toBe('user')
+    expect(transcript[0]?.at).toBe(1200)
   })
 })

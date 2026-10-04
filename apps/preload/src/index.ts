@@ -131,11 +131,18 @@ const api: LogicReaderApi = {
     sessionDispose: (sessionId) => invoke<void>(CH.agent.sessionDispose, sessionId),
     models: (sessionId) => invoke<AgentModelView[]>(CH.agent.models, sessionId),
     probeModels: (agentId) => invoke<AgentModelView[]>(CH.agent.probeModels, agentId),
+    contextUsage: (sessionId) => invoke<{ used: number; size: number | null } | null>(CH.agent.contextUsage, sessionId),
     commands: (sessionId) => invoke<{ name: string; description?: string; argumentHint?: string }[]>(CH.agent.commands, sessionId),
     history: (dir, limit, agentId) => invoke<AgentSessionInfoView[]>(CH.agent.history, dir, limit ?? 30, agentId ?? null),
     historyRename: (agentId, sessionId, title) => invoke<void>(CH.agent.historyRename, agentId, sessionId, title),
     historyName: (agentId, sessionId, firstPrompt) =>
       invoke<string | null>(CH.agent.historyName, agentId, sessionId, firstPrompt ?? null),
+    historyTranscript: (agentId, sessionId, cwd) =>
+      invoke<
+        { role: 'user' | 'assistant'; text: string; thinking: string; at: number }[]
+      >(CH.agent.historyTranscript, agentId, sessionId, cwd),
+    historyDelete: (agentId, sessionId, cwd) =>
+      invoke<boolean>(CH.agent.historyDelete, agentId, sessionId, cwd),
     files: (dir, query, limit) => invoke<WorkspaceFileView[]>(CH.agent.files, dir, query ?? '', limit ?? 12),
     workdir: (documentDir) => invoke<string>(CH.agent.workdir, documentDir),
     revertHunks: (sessionId, toolUseId, indices) =>
@@ -174,10 +181,9 @@ const api: LogicReaderApi = {
     presets: () => invoke<unknown[]>(CH.graph.presets),
     savePreset: (preset) => invoke<unknown[]>(CH.graph.savePreset, preset),
     onProgress: (cb) =>
-      subscribe<[{ taskId: string; phase: string; done: number; total: number; detail: string; error?: string }]>(
-        CH.graph.progress,
-        cb
-      )
+      subscribe<
+        [{ taskId: string; phase: string; done: number; total: number; detail: string; etaMs?: number | null; error?: string }]
+      >(CH.graph.progress, cb)
   },
   log: {
     write: (level, scope, message, detail) => invoke<void>(CH.log.write, level, scope, message, detail),

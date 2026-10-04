@@ -815,7 +815,8 @@ export function App(): JSX.Element {
                 charStart,
                 charEnd,
                 anchorId: null,
-                locationLabel: ''
+                locationLabel: '',
+                rect: null
               })
               block.scrollIntoView({ block: 'center' })
               await sleep(900)

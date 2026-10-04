@@ -29,6 +29,27 @@ function squash(value: string): string {
 }
 
 /**
+ * 选区的视口联合矩形（跨行选区取"包住所有片段"的那一个）。
+ * 取不到（全部片段宽高为 0 之类）时返回 null，工具条退回底部定位。
+ */
+export function selectionRectOf(range: Range): { x: number; y: number; width: number; height: number } | null {
+  const rects = Array.from(range.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0)
+  if (rects.length === 0) return null
+  let left = Number.MAX_SAFE_INTEGER
+  let top = Number.MAX_SAFE_INTEGER
+  let right = 0
+  let bottom = 0
+  for (const rect of rects) {
+    left = Math.min(left, rect.left)
+    top = Math.min(top, rect.top)
+    right = Math.max(right, rect.right)
+    bottom = Math.max(bottom, rect.bottom)
+  }
+  if (right <= left || bottom <= top) return null
+  return { x: left, y: top, width: right - left, height: bottom - top }
+}
+
+/**
  * 把渲染出的元素对齐到文档模型的字符偏移，并写入 data-char-start / data-char-end。
  *
  * @param elements 必须是**文档顺序**的元素列表（通常是 querySelectorAll 的结果）
@@ -165,7 +186,9 @@ export function useReaderSelection(options: ReaderSelectionOptions): void {
         charStart: confirmed.charStart,
         charEnd: confirmed.charEnd,
         anchorId: null,
-        locationLabel: label(confirmed.charStart, confirmed.charEnd)
+        locationLabel: label(confirmed.charStart, confirmed.charEnd),
+        // 选区的视口位置（联合矩形）：浮动工具条据此把按钮摆在选区旁边，而不是趴在视口底部
+        rect: selectionRectOf(range)
       })
     }
 
