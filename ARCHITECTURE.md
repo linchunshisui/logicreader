@@ -382,6 +382,9 @@ DOM 选区
 | `lib/sheetWindow.ts` | 表格窗口渲染的**两套坐标换算**（容器坐标 ↔ 表格内部坐标）：`computeSheetWindow` / `rowScrollOffset` | 不要在这里碰 DOM；也不要把 `zoom` 的换算搬到视图里心算 —— 表格带 `zoom: scale`，混用坐标的症状是"滚到底行号对不上"且不报错 |
 | `services/store.service.ts:searchBlocks` | 跨文档全文检索（FTS5 trigram / LIKE 兜底 / JSON 内存扫描，**三条路径结果形状一致**） | 不要在视图里自己拼 SQL；也不要让短查询静默返回空（<3 字走 LIKE 兜底） |
 | `features/search/SearchView.tsx` | 两种范围：本文档（内存子串，即时）与全部文档（走库索引） | 库级命中要打开**没打开过**的文档时，必须复用 `openFileInWorkbench`（去重/建标签/记最近），不要自己拼标签 |
+| `lib/graphClusters.ts` | 社区检测（Louvain，**固定种子**）与"超级节点"折叠：`computeCommunities` / `buildAggregatedGraph` | 不要在这里碰 DOM，也不要写回 `cluster_id` 或原图数据 —— 聚合是**可选的一层表现**，关掉就完全回到旧行为 |
+| `state/graph.store.ts` 的 `expandedClusters` | 聚合视图下被展开的社区 | 不要和 `collapsedIds` 合并：前者按**社区**（Louvain），后者按**章节层级**（`parentId`），是两条不同的聚合路径 |
+| `GraphCanvas` 的聚合分支 | 开启聚合时画超级节点（位置 = 成员质心），双击下钻 | 折叠后的连线**必须仍有标注**（用"代表几条原关系"），不能因为折叠就让边变成无标注的线 |
 | `apps/main/src/index.ts` | 启动顺序、降级、日志 | 不要塞业务逻辑 |
 
 ---

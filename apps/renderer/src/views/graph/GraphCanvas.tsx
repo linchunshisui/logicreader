@@ -26,6 +26,7 @@ import { useDocuments } from '../../state/documents.store'
 import { useUiStore } from '../../state/ui.store'
 import { useSettings } from '../../state/settings.store'
 import { graphDisplayName } from '../../lib/graphName'
+import { buildAggregatedGraph } from '../../lib/graphClusters'
 import { locationLabel, revealInReader } from '../../lib/graphJump'
 import { canLinkNodes } from '../../state/graphEdits'
 import { notify } from '../../state/notifications.store'
@@ -125,6 +126,45 @@ function GraphCanvasInner({ docId }: { docId: string }): JSX.Element {
     )
   }, [graph.graph, graph.edgeKindFilter, visibleIds])
 
+  /** 图上全部节点（**不过滤**）：聚合视图展开社区时要按 id 取回真实节点。 */
+  const nodeById = useMemo(() => new Map((graph.graph?.nodes ?? []).map((node) => [node.id, node])), [graph.graph])
+
+  /**
+   * 聚合视图（按社区）。`null` = 按原路径渲染（开关关着 / 没有图）。
+   *
+   * 刻意做成"**可选的一层表现**"而不是替换：原来的渲染路径一字不改，
+   * 于是关掉开关就完全回到旧行为 —— 章节折叠、过滤、搜索、连线标注全都不受影响。
+   */
+  const aggregatedView = useMemo(() => {
+    if (!graph.aggregated || !graph.graph) return null
+    return buildAggregatedGraph(filteredNodes, filteredEdges, new Set(graph.expandedClusters))
+  }, [graph.aggregated, graph.graph, graph.expandedClusters, filteredNodes, filteredEdges])
+
+  /** 超级节点画在哪：成员位置的质心（它自己没有坐标）。 */
+  const clusterCentroid = useCallback(
+    (memberIds: readonly string[]): { x: number; y: number } => {
+      let x = 0
+      let y = 0
+      let count = 0
+      for (const id of memberIds) {
+        const node = nodeById.get(id)
+        const point = graph.positions[id] ?? (node && node.x !== null && node.y !== null ? { x: node.x, y: node.y } : null)
+        if (!point) continue
+        x += point.x
+        y += point.y
+        count += 1
+      }
+      return count > 0 ? { x: x / count, y: y / count } : { x: 0, y: 0 }
+    },
+    [graph.positions, nodeById]
+  )
+
+  /** 画布上的超级节点 id 集合：双击它们要下钻，而不是去查原文锚点。 */
+  const clusterDisplayIds = useMemo(
+    () => new Set(aggregatedView ? aggregatedView.nodes.filter((item) => item.isCluster).map((item) => item.id) : []),
+    [aggregatedView]
+  )
+
   // 邻居高亮：选中节点时其余降到 25%（规划书 §5.5.6）
   const neighbourIds = useMemo(() => {
     const set = new Set<string>(graph.selectedNodeIds)
@@ -159,6 +199,49 @@ function GraphCanvasInner({ docId }: { docId: string }): JSX.Element {
   const detail = zoom < 0.4 ? 'title' : zoom < 0.75 ? 'compact' : 'full'
 
   useEffect(() => {
+    /** 聚合视图：画超级节点 / 展开后的成员，位置取质心或原坐标 */
+    if (aggregatedView) {
+      setNodes(
+        aggregatedView.nodes.map((item) => {
+          const logical = item.isCluster ? null : nodeById.get(item.id) ?? null
+          const point = item.isCluster
+            ? clusterCentroid(item.memberIds)
+            : graph.positions[item.id] ?? { x: logical?.x ?? 0, y: logical?.y ?? 0 }
+          const graphNode: GraphNode = logical ?? {
+            id: item.id,
+            kind: item.kind as GraphNode['kind'],
+            title: item.title,
+            summary: '',
+            anchorIds: [],
+            parentId: null,
+            clusterId: null,
+            x: point.x,
+            y: point.y,
+            collapsed: false
+          }
+          return {
+            id: item.id,
+            type: 'logical',
+            position: point,
+            // 超级节点不给拖：它没有自己的坐标可存，拖完一重算就弹回质心
+            draggable: !item.isCluster,
+            selectable: true,
+            data: {
+              node: graphNode,
+              dimmed: false,
+              highlighted: graph.searchTerm.trim().length > 0,
+              detail,
+              sourceLabel: '',
+              childCount: 0,
+              collapsed: false,
+              cluster: item.isCluster ? { size: item.size, memberIds: item.memberIds } : undefined
+            }
+          } satisfies Node
+        })
+      )
+      return
+    }
+
     setNodes(
       filteredNodes.map((node) => {
         const point = graph.positions[node.id] ?? { x: node.x ?? 0, y: node.y ?? 0 }
@@ -180,9 +263,32 @@ function GraphCanvasInner({ docId }: { docId: string }): JSX.Element {
         } satisfies Node
       })
     )
-  }, [filteredNodes, graph.positions, graph.selectedNodeIds, neighbourIds, detail, anchorLabels, childCount, graph.collapsedIds, graph.searchTerm, setNodes])
+  }, [aggregatedView, clusterCentroid, nodeById, filteredNodes, graph.positions, graph.selectedNodeIds, neighbourIds, detail, anchorLabels, childCount, graph.collapsedIds, graph.searchTerm, setNodes])
 
   useEffect(() => {
+    if (aggregatedView) {
+      setEdges(
+        aggregatedView.edges.map((item) => ({
+          id: item.id,
+          source: item.from,
+          target: item.to,
+          type: 'logical',
+          markerEnd: { type: 'arrowclosed' as never, color: EDGE_STYLE[item.kinds[0]]?.color ?? '#9a9a9a' },
+          data: {
+            kind: item.kinds[0],
+            /**
+             * 折叠后的连线也**必须带标注**（产品要求"每条连线都有具体标注"）。
+             * 原标注在折叠后无法一一对应，所以用"这条线代表了几条原关系"来标注。
+             */
+            label: item.weight > 1 ? i18n.t('graph.clusterEdgeCount', { count: item.weight }) : '',
+            showLabel: detail !== 'title',
+            dimmed: false
+          }
+        }))
+      )
+      return
+    }
+
     setEdges(
       filteredEdges.map((edge) => ({
         id: edge.id,
@@ -199,7 +305,7 @@ function GraphCanvasInner({ docId }: { docId: string }): JSX.Element {
         }
       }))
     )
-  }, [filteredEdges, graph.selectedNodeIds, detail, setEdges])
+  }, [aggregatedView, filteredEdges, graph.selectedNodeIds, detail, setEdges])
 
   const onNodesChange = useCallback(
     (changes: NodeChange<Node>[]) => {
@@ -299,8 +405,6 @@ function GraphCanvasInner({ docId }: { docId: string }): JSX.Element {
     [graph, t]
   )
 
-  const nodeById = useMemo(() => new Map((graph.graph?.nodes ?? []).map((node) => [node.id, node])), [graph.graph])
-
   /**
    * "把某个节点摆到眼前"：逻辑链面板里的「在关系图中查看」发来请求，
    * 画布把它居中并选中 —— 否则切回图里可能什么都看不到（节点可能远在视野之外）。
@@ -398,14 +502,21 @@ function GraphCanvasInner({ docId }: { docId: string }): JSX.Element {
                * 双击与跳转不再冲突（双击只负责展开/折叠）。
                */
               onNodeClick={(event, node) => {
-                const logical = nodeById.get(node.id)
-                if (!logical) return
+                /*
+                 * 超级节点也要能选中：它不是从原文抽出来的、没有对应的逻辑节点，
+                 * 但"点了没有任何反馈"是明确的坏体验 —— 选中只依赖 id，不需要逻辑节点。
+                 */
                 const multi = event.ctrlKey || event.metaKey || event.shiftKey
                 const selected = multi ? [...graph.selectedNodeIds, node.id] : [node.id]
                 graph.select(selected, [])
                 if (activeTab) useTabs.getState().updateGraphView(activeTab.id, { selectedNodeIds: selected })
               }}
               onNodeDoubleClick={(_, node) => {
+                /* 聚合视图下双击超级节点 = 下钻 / 收起这一团（拉取原文锚点对它没有意义） */
+                if (clusterDisplayIds.has(node.id)) {
+                  graph.toggleCluster(node.id)
+                  return
+                }
                 const logical = nodeById.get(node.id)
                 if (!logical) return
                 /**
@@ -479,7 +590,12 @@ function GraphCanvasInner({ docId }: { docId: string }): JSX.Element {
           setTimeout(() => void fitView({ padding: 0.2, duration: 400 }), 260)
         }}
       />
-      {settings.graph.aggregate && graph.aggregated ? null : null}
+      {/* 聚合视图的说明条：让"现在画的是社区、双击可以下钻"这件事在界面上有据可依 */}
+      {aggregatedView ? (
+        <div className="lr-graph-aggregate-hint">
+          {i18n.t('graph.aggregateHint', { clusters: aggregatedView.clusters.length })}
+        </div>
+      ) : null}
     </div>
   )
 }

@@ -60,6 +60,13 @@ interface GraphState {
   layoutMode: 'layered' | 'force' | 'radial'
   aggregated: boolean
   collapsedIds: string[]
+  /**
+   * 聚合视图下**被展开**的社区（放的是社区 id）。
+   *
+   * 与 `collapsedIds` 并列但不同层：`collapsedIds` 管"章节层级折叠"（走 parentId），
+   * 这里管"按社区聚合"（走 Louvain 算出的社区）。两者互不干扰。
+   */
+  expandedClusters: string[]
   /** 由命令/快捷键发起的"打开生成配置面板"请求（非 0 即待处理） */
   generateRequest: number
   /** 由别处（逻辑链面板等）发起的"把某个节点居中并选中"请求 */
@@ -84,6 +91,8 @@ interface GraphState {
   setSearch: (value: string) => void
   toggleAggregate: () => void
   toggleCollapsed: (nodeId: string) => void
+  /** 展开/收起一个社区（聚合视图下双击超级节点触发） */
+  toggleCluster: (clusterId: string) => void
   renameNode: (nodeId: string, title: string) => Promise<void>
   changeNodeKind: (nodeId: string, kind: NodeKind) => Promise<void>
   deleteNode: (nodeId: string) => Promise<void>
@@ -146,6 +155,7 @@ export const useGraph = create<GraphState>((set, get) => ({
   layoutMode: 'layered',
   aggregated: false,
   collapsedIds: [],
+  expandedClusters: [],
   generateRequest: 0,
   focusRequest: null,
 
@@ -319,12 +329,19 @@ export const useGraph = create<GraphState>((set, get) => ({
   setEdgeKindFilter: (kinds) => set({ edgeKindFilter: kinds }),
   setNodeKindFilter: (kinds) => set({ nodeKindFilter: kinds }),
   setSearch: (value) => set({ searchTerm: value }),
-  toggleAggregate: () => set((state) => ({ aggregated: !state.aggregated })),
+  // 切聚合开关时清掉展开状态：否则关掉再开，会看到"上次展开的那个社区还是散着的"，与开关的语义不符
+  toggleAggregate: () => set((state) => ({ aggregated: !state.aggregated, expandedClusters: [] })),
   toggleCollapsed: (nodeId) =>
     set((state) => ({
       collapsedIds: state.collapsedIds.includes(nodeId)
         ? state.collapsedIds.filter((id) => id !== nodeId)
         : [...state.collapsedIds, nodeId]
+    })),
+  toggleCluster: (clusterId) =>
+    set((state) => ({
+      expandedClusters: state.expandedClusters.includes(clusterId)
+        ? state.expandedClusters.filter((id) => id !== clusterId)
+        : [...state.expandedClusters, clusterId]
     })),
 
   renameNode: async (nodeId, title) => {

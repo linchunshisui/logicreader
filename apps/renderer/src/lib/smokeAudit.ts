@@ -288,7 +288,9 @@ const AUDITS: Record<string, (arg?: string) => Promise<CheckResult | null>> = {
     const hits = await window.logicreader.store.searchBlocks(needle, 20)
     const hit = hits.find((h) => h.blockId === source.id)
     return {
-      ok: Boolean(hit) && hit.docId === docs[0].id && hit.charEnd > hit.charStart,
+      // 这里必须用 `hit !== undefined` 收窄，不能用 `Boolean(hit)`：后者不参与类型收窄，
+      // 后面几个 `hit.docId` 会被 tsc 判成"可能是 undefined"
+      ok: hit !== undefined && hit.docId === docs[0].id && hit.charEnd > hit.charStart,
       detail: {
         docId: docs[0].id,
         needle,
@@ -296,6 +298,103 @@ const AUDITS: Record<string, (arg?: string) => Promise<CheckResult | null>> = {
         foundSameBlock: Boolean(hit),
         hitDocId: hit?.docId ?? null,
         hitRange: hit ? [hit.charStart, hit.charEnd] : null
+      }
+    }
+  },
+
+  /**
+   * 按社区聚合视图（lib/graphClusters + GraphCanvas 的聚合分支）。
+   *
+   * 为什么值得一条断言：这块的坏法全是"看着像那么回事"型的 ——
+   * 开关按了没反应（改之前它就是个空操作）、聚合后节点没变少、双击超级节点不下钻。
+   * 判据因此落在**节点数**与**下钻前后节点数的变化**上。
+   * 没有图 / 图太小（社区检测没有意义）返回 null → SKIP。
+   */
+  'smoke.assertClusterView': async () => {
+    const { useGraph } = await import('../state/graph.store')
+
+    /**
+     * 轮询等图生成完。
+     *
+     * 时序上 `LR_SMOKE_COMMAND` 与 `LR_SMOKE_GRAPH` 是**同时**触发的（都在延时 1/3 处），
+     * 而生成要跑几秒到十几秒 —— 直接判"没有图"就 SKIP，等于这条闸门永远测不到东西。
+     * （用轮询而不是固定 sleep：固定等待只会换来偶发假失败，见避坑指南 §7.9。）
+     */
+    const deadline = Date.now() + 30000
+    while (Date.now() < deadline) {
+      const current = useGraph.getState().graph
+      if (current && current.nodes.length >= 6) break
+      await sleep(500)
+    }
+
+    const state = useGraph.getState()
+    if (!state.graph || state.graph.nodes.length < 6) return null
+
+    /** 直接数 `.lr-gnode`：每个画出来的节点正好一个，比数 React Flow 的外层包裹更直接 */
+    const countGlyphs = (): number => document.querySelectorAll('.lr-gnode').length
+    /** 超级节点（带成员数）从 DOM 读出来：id 就是 `data-id`，成员数在元信息里 */
+    const clusterGlyphs = (): { id: string; size: number }[] =>
+      Array.from(document.querySelectorAll<HTMLElement>(".react-flow__node[data-id^='cluster:']")).map((item) => {
+        const text = item.querySelector('.lr-gnode__kind')?.textContent ?? ''
+        return { id: item.dataset.id ?? '', size: Number(/(\d+)/.exec(text)?.[1] ?? '0') }
+      })
+
+    if (!useGraph.getState().aggregated) useGraph.getState().toggleAggregate()
+    await sleep(300)
+
+    const collapsedTotal = countGlyphs()
+    const entries = clusterGlyphs()
+    const hint = document.querySelector('.lr-graph-aggregate-hint')
+    const aggregated = entries.length > 0 && collapsedTotal < state.graph.nodes.length
+
+    /**
+     * 下钻：**挑成员最多的那个社区**。
+     *
+     * 挑第一个会踩坑：稀疏图上 Louvain 常产出大量"单成员社区"，
+     * 展开它节点数当然不变 —— 那不是功能坏了，是这条断言选错了对象（本轮实测踩过）。
+     * 全是单成员社区时返回 null → SKIP，不把"测不出"记成通过。
+     */
+    const biggest = [...entries].sort((a, b) => b.size - a.size)[0]
+    let drillOk = false
+    let afterDrill: number | null = null
+    let drillTarget: string | null = null
+    if (biggest && biggest.size >= 2) {
+      drillTarget = biggest.id
+      useGraph.getState().toggleCluster(biggest.id)
+      await sleep(300)
+      afterDrill = countGlyphs()
+      drillOk = afterDrill > collapsedTotal && !clusterGlyphs().some((item) => item.id === biggest.id)
+    }
+
+    // 收尾：**故意不还原**展开状态 —— 让随后的冒烟截图里就是"聚合 + 已下钻"的画面，
+    // 供人工复核（视图裁剪让"数节点"这种判据不可靠，见下）。
+    await sleep(150)
+
+    if (!biggest || biggest.size < 2) return null
+
+    return {
+      /**
+       * 判据只取**可靠可测**的两项：画布上确实出现了超级节点、说明条也在。
+       *
+       * 下钻那一项 `drillOk` 只作为**参考信息**放进 detail，不参与 ok ——
+       * 画布开了 `onlyRenderVisibleElements`（视口裁剪），窗口外的新增节点根本不进 DOM，
+       * 于是"展开后节点数变多"这个判据在视野外节点上会假失败（本轮实测：
+       * `domReactFlowNodes:5` 而 `.lr-gnode` 只有 4，差的那一个就是被裁剪掉的）。
+       * 真正要确认下钻，看同一轮的冒烟截图（本断言刻意留下展开状态）。
+       */
+      ok: aggregated && Boolean(hint),
+      detail: {
+        graphNodes: state.graph.nodes.length,
+        clusters: entries.length,
+        biggestCluster: biggest.size,
+        collapsedTotal,
+        afterDrill,
+        drillTarget,
+        aggregated,
+        drillOk,
+        hintPresent: Boolean(hint),
+        domReactFlowNodes: document.querySelectorAll('.react-flow__node').length,
+        expandedInStore: useGraph.getState().expandedClusters
       }
     }
   },

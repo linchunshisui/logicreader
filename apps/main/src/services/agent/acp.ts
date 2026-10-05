@@ -1,14 +1,55 @@
 /**
  * ACP 客户端：以 stdio + 换行分隔 JSON-RPC 与 Agent 通信（规划书 §5.4）。
- * 这里直接实现协议子集，不引入额外运行时依赖，便于打包与版本控制。
+ *
+ * 协议形状**不靠人记**：出站报文由下面几个纯函数拼，返回值直接声明成官方 SDK
+ * （`@agentclientprotocol/sdk` 的 `schema/types.gen`）的类型 —— 字段名或判别值一旦与协议不符，
+ * `pnpm typecheck` 就红。入站判别值同样由单测（`acp-protocol.test.ts`）对着官方 union 钉住。
+ *
+ * 为什么只用它的**类型**、不用它的运行时（`ClientSideConnection` 那套）：
+ * 那个 API 是 handler/context 式的，与本文件"事件流 + 请求-应答"的形状差别很大；
+ * 重写会把会话/权限/取消这些**只有接真 Agent 才能验**的语义全部重来一遍，收益远小于风险。
+ * 类型是零运行时成本的，且正好治"字段名悄悄对不上"这个最贵的毛病。
  */
 import type { ChildProcess } from 'node:child_process'
+import type {
+  NewSessionRequest,
+  PromptRequest,
+  SetSessionConfigOptionRequest
+} from '@agentclientprotocol/sdk'
 import { createId } from '@logicreader/shared'
 import { logMain } from '../../util/ipc'
 import { killTree, spawnAgent } from './exec'
 import type { AgentEvent, ConfigOption, PermissionDetail } from './types'
 
 export const ACP_PROTOCOL_VERSION = 1
+
+/**
+ * 出站报文拼装（纯函数，返回值类型来自官方 schema）。
+ *
+ * 抽出来的理由与仓库里"UI 与冒烟共用同一个拼装函数"是同一条：形状只能有一份来源，
+ * 测试断言的就是调用方真正发出去的那一份，而不是测试自己另写的一份。
+ */
+export function buildSetConfigOptionParams(
+  sessionId: string,
+  configId: string,
+  value: string | boolean
+): SetSessionConfigOptionRequest {
+  /**
+   * 布尔值必须带 `type: 'boolean'`：官方类型是**判别联合**
+   * `{ value: boolean, type: 'boolean' } | { value: string }`（再交上 sessionId/configId）。
+   * 少了 `type` 两个分支都不匹配 —— 严格的 Agent 直接拒，界面只表现为"改了但值没变"。
+   */
+  if (typeof value === 'boolean') return { sessionId, configId, value, type: 'boolean' }
+  return { sessionId, configId, value }
+}
+
+export function buildPromptParams(sessionId: string, text: string): PromptRequest {
+  return { sessionId, prompt: [{ type: 'text', text }] }
+}
+
+export function buildNewSessionParams(cwd: string, mcpServers: unknown[] = []): NewSessionRequest {
+  return { cwd, mcpServers: mcpServers as NewSessionRequest['mcpServers'] }
+}
 
 interface PendingRequest {
   resolve: (value: unknown) => void
@@ -247,7 +288,7 @@ export class AcpClient {
   }
 
   /** `timeoutMs` 只覆盖**这一次**请求（例如关闭会话时不该等满 10 分钟）。 */
-  request<T = unknown>(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<T> {
+  request<T = unknown>(method: string, params: object, timeoutMs?: number): Promise<T> {
     const id = this.nextId++
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -259,7 +300,7 @@ export class AcpClient {
     })
   }
 
-  notify(method: string, params: Record<string, unknown>): void {
+  notify(method: string, params: object): void {
     this.send({ jsonrpc: '2.0', method, params })
   }
 
@@ -271,7 +312,10 @@ export class AcpClient {
   }
 
   async newSession(cwd: string, mcpServers: unknown[] = []): Promise<{ sessionId: string; configOptions?: ConfigOption[] }> {
-    const result = await this.request<{ sessionId: string; configOptions?: ConfigOption[] }>('session/new', { cwd, mcpServers })
+    const result = await this.request<{ sessionId: string; configOptions?: ConfigOption[] }>(
+      'session/new',
+      buildNewSessionParams(cwd, mcpServers)
+    )
     return result
   }
 
@@ -291,10 +335,7 @@ export class AcpClient {
   }
 
   async prompt(sessionId: string, text: string): Promise<{ stopReason: string }> {
-    return this.request<{ stopReason: string }>('session/prompt', {
-      sessionId,
-      prompt: [{ type: 'text', text }]
-    })
+    return this.request<{ stopReason: string }>('session/prompt', buildPromptParams(sessionId, text))
   }
 
   cancel(sessionId: string): void {
@@ -316,11 +357,10 @@ export class AcpClient {
 
   async setConfigOption(sessionId: string, configId: string, value: string | boolean): Promise<ConfigOption[] | null> {
     try {
-      const result = await this.request<{ configOptions?: ConfigOption[] }>('session/set_config_option', {
-        sessionId,
-        configId,
-        value
-      })
+      const result = await this.request<{ configOptions?: ConfigOption[] }>(
+        'session/set_config_option',
+        buildSetConfigOptionParams(sessionId, configId, value)
+      )
       return result.configOptions ?? null
     } catch (error) {
       logMain('warn', 'acp', '设置会话配置项失败：' + configId, String(error))

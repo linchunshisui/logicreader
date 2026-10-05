@@ -135,6 +135,36 @@
   opacity: 0.95;
 }
 
+/*
+ * 超级节点（聚合视图）：它代表**一整团社区**，不是原文里抽出来的某个概念，
+ * 所以要比普通节点"重"一些 —— 更宽、描边更实，让人一眼看出这是聚合出来的东西。
+ */
+.lr-gnode[data-cluster='true'] {
+  width: 260px;
+  min-height: 72px;
+  border-width: 2px;
+  border-color: var(--vscode-focusBorder);
+}
+
+/*
+ * 聚合视图的说明条：让"现在画的是社区、双击可以下钻"在界面上有据可依。
+ * 锚在 `.lr-graph`（它有 position: relative）左下角；`pointer-events: none` 保证它不抢画布的拖拽。
+ */
+.lr-graph-aggregate-hint {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  z-index: 5;
+  max-width: 60%;
+  padding: 4px 10px;
+  border-radius: var(--lr-radius);
+  font-size: var(--lr-fs-xs);
+  color: var(--vscode-descriptionForeground);
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-editorGroup-border);
+  pointer-events: none;
+}
+
 .lr-gnode__bar {
   width: 3px;
   flex: 0 0 3px;
