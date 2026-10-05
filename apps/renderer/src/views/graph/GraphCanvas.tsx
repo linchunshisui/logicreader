@@ -26,7 +26,8 @@ import { useDocuments } from '../../state/documents.store'
 import { useUiStore } from '../../state/ui.store'
 import { useSettings } from '../../state/settings.store'
 import { graphDisplayName } from '../../lib/graphName'
-import { buildAggregatedGraph } from '../../lib/graphClusters'
+import { buildAggregatedGraph, communityColors } from '../../lib/graphClusters'
+import { degreesOf, nodeSizeOf } from '../../lib/graphNodeSize'
 import { locationLabel, revealInReader } from '../../lib/graphJump'
 import { canLinkNodes } from '../../state/graphEdits'
 import { notify } from '../../state/notifications.store'
@@ -140,6 +141,33 @@ function GraphCanvasInner({ docId }: { docId: string }): JSX.Element {
     return buildAggregatedGraph(filteredNodes, filteredEdges, new Set(graph.expandedClusters))
   }, [graph.aggregated, graph.graph, graph.expandedClusters, filteredNodes, filteredEdges])
 
+  /**
+   * 重要度分级 + 社区着色（两者都按**全图**算，不跟过滤走）。
+   *
+   * 用全图而不是过滤后的子集：布局是按全图算的，尺寸若跟过滤变，画布上就会出现
+   * "布局按小盒子留了间距、渲染却是大盒子"的互相压盖。
+   */
+  const degrees = useMemo(() => degreesOf(graph.graph?.edges ?? []), [graph.graph])
+  const maxDegree = useMemo(() => (degrees.size > 0 ? Math.max(...degrees.values()) : 0), [degrees])
+  const scaleById = useMemo(() => {
+    const map = new Map<string, number>()
+    for (const node of graph.graph?.nodes ?? []) {
+      map.set(node.id, nodeSizeOf(node, degrees.get(node.id) ?? 0, maxDegree).scale)
+    }
+    return map
+  }, [graph.graph, degrees, maxDegree])
+  /**
+   * 普通视图的社区着色。
+   *
+   * 用**过滤后**的节点/边算（与聚合视图、图例同源）：三者必须来自同一个集合，
+   * 否则图例上会列出画布上不存在的社区、或节点描边与图例对不上色。
+   * 种子固定，同一份输入每次算出的社区与配色都一样。
+   */
+  const community = useMemo(
+    () => communityColors(filteredNodes, filteredEdges),
+    [filteredNodes, filteredEdges]
+  )
+
   /** 超级节点画在哪：成员位置的质心（它自己没有坐标）。 */
   const clusterCentroid = useCallback(
     (memberIds: readonly string[]): { x: number; y: number } => {
@@ -234,6 +262,9 @@ function GraphCanvasInner({ docId }: { docId: string }): JSX.Element {
               sourceLabel: '',
               childCount: 0,
               collapsed: false,
+              // 超级节点固定基准尺寸（它是"一整团"的代表，再按度数放大就更挤了）
+              size: item.isCluster ? 1 : scaleById.get(item.id) ?? 1,
+              communityColor: community.colorOf.get(item.memberIds[0] ?? item.id),
               cluster: item.isCluster ? { size: item.size, memberIds: item.memberIds } : undefined
             }
           } satisfies Node
@@ -258,12 +289,14 @@ function GraphCanvasInner({ docId }: { docId: string }): JSX.Element {
             detail,
             sourceLabel: anchorLabels.get(node.id) ?? '',
             childCount: childCount.get(node.id) ?? 0,
-            collapsed: graph.collapsedIds.includes(node.id)
+            collapsed: graph.collapsedIds.includes(node.id),
+            size: scaleById.get(node.id) ?? 1,
+            communityColor: community.colorOf.get(node.id)
           }
         } satisfies Node
       })
     )
-  }, [aggregatedView, clusterCentroid, nodeById, filteredNodes, graph.positions, graph.selectedNodeIds, neighbourIds, detail, anchorLabels, childCount, graph.collapsedIds, graph.searchTerm, setNodes])
+  }, [aggregatedView, clusterCentroid, nodeById, filteredNodes, graph.positions, graph.selectedNodeIds, neighbourIds, detail, anchorLabels, childCount, graph.collapsedIds, graph.searchTerm, setNodes, scaleById, community])
 
   useEffect(() => {
     if (aggregatedView) {
@@ -300,6 +333,7 @@ function GraphCanvasInner({ docId }: { docId: string }): JSX.Element {
           kind: edge.kind,
           label: edge.label,
           showLabel: detail !== 'title',
+          strength: typeof edge.meta?.strength === 'number' ? edge.meta.strength : undefined,
           dimmed:
             graph.selectedNodeIds.length > 0 && !graph.selectedNodeIds.includes(edge.from) && !graph.selectedNodeIds.includes(edge.to)
         }
@@ -567,7 +601,16 @@ function GraphCanvasInner({ docId }: { docId: string }): JSX.Element {
               />
               <Controls showInteractive={false} />
             </ReactFlow>
-            <GraphLegend open={overlays.legend} onToggle={(value) => toggleOverlay('legend', value)} />
+            <GraphLegend
+              open={overlays.legend}
+              onToggle={(value) => toggleOverlay('legend', value)}
+              /**
+               * 图例的社区必须与画布上画的一致：聚合视图是按**过滤后**的节点算的社区，
+               * 这里若报全图社区，图例上会列出画布上根本不存在的分组。
+               */
+              clusters={aggregatedView ? aggregatedView.clusters : community.clusters}
+              clusterColorOf={community.clusterColorOf}
+            />
             <NodeInspector
               onJump={(anchorIds, kind, context) => void jumpToAnchor(anchorIds, kind, context)}
               onFocus={(node: GraphNode) => {

@@ -115,19 +115,27 @@ export function GraphToolbar({
 }
 
 /**
- * 边类型图例。
+ * 边类型图例 + 社区分组。
  *
  * 展开状态由调用方持有（存进关系图标签的 view，见 GraphViewState.overlays）：
  * 默认**收起** —— 展开后是一列九行，会占掉画布一角，和左下角的 React Flow 控件挤在一起。
  */
 export function GraphLegend({
   open,
-  onToggle
+  onToggle,
+  clusters = [],
+  clusterColorOf
 }: {
   open: boolean
   onToggle: (open: boolean) => void
+  /** 社区分组：节点描边的颜色就是从这套社区来的，图例得把它说清楚 */
+  clusters?: { id: string; title: string; size: number }[]
+  /** 社区 id → 颜色。由 `communityColors()` 一并算出，图例只查表，绝不自己再排一遍序 */
+  clusterColorOf?: Map<string, string>
 }): JSX.Element {
   const { t } = useTranslation()
+  /** 图例只列最靠前的几个社区：社区多起来（几十个）会把这角撑爆，全量信息在画布上 */
+  const topClusters = [...clusters].sort((a, b) => b.size - a.size).slice(0, 8)
   return (
     <div className="lr-graph__legend" data-open={open}>
       <button className="lr-graph__legend-toggle" onClick={() => onToggle(!open)}>
@@ -141,6 +149,23 @@ export function GraphLegend({
               {edgeLabel(kind, i18n.language)}
             </div>
           ))}
+          {topClusters.length > 0 ? (
+            <>
+              <div className="lr-graph__legend-title">{t('graph.legendCommunities')}</div>
+              {topClusters.map((cluster) => (
+                <div key={cluster.id} className="lr-graph__legend-row">
+                  <span
+                    className="lr-graph__legend-ring"
+                    style={{ borderColor: clusterColorOf?.get(cluster.id) ?? '#8a8a8a' }}
+                  />
+                  {cluster.title}
+                  <span className="lr-graph__legend-count">
+                    {t('graph.legendCommunitySize', { count: cluster.size })}
+                  </span>
+                </div>
+              ))}
+            </>
+          ) : null}
         </div>
       ) : null}
     </div>

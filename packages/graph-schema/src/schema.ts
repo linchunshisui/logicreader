@@ -108,6 +108,8 @@ export const EXTRACTION_JSON_SCHEMA = {
           to: { type: 'string' },
           type: { type: 'string' },
           label: { type: 'string' },
+          /** 原文对这一关系的断言强度 1..10；缺省时按"未给出"处理（不影响任何过滤，只影响渲染粗细） */
+          strength: { type: 'integer', minimum: 1, maximum: 10 },
           evidence: { type: 'string' },
           spans: {
             type: 'array',
@@ -124,4 +126,11 @@ export const EXTRACTION_JSON_SCHEMA = {
   }
 } as const
 
-export const PROMPT_VERSION = 'lr-graph-1.0.0'
+/**
+ * 抽取提示词的版本号，随图落库（`generation.promptVersion`），用于分辨"这张图是哪一版提示词抽的"。
+ *
+ * 1.1.0 相对 1.0.0 的两处契约变化：
+ *  - 提交给模型的片段文本可能是**源文件原文切片**，spans 改按**片段内相对偏移**解释；
+ *  - relations 增加 `strength`（1..10）。
+ */
+export const PROMPT_VERSION = 'lr-graph-1.1.0'

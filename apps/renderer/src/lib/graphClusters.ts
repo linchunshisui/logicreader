@@ -245,3 +245,46 @@ export function buildAggregatedGraph(
 
   return { clusters, nodes: display, edges: mergeEdges(edges, displayIdOf) }
 }
+
+/**
+ * 社区配色板：固定的一组、彼此区分度够高、在深浅两种主题下都能看清（用于节点描边）。
+ * 刻意不复用节点类型色 —— 左侧色条已经承担"这是什么类型"，颜色再撞上去两种语义就打架了。
+ */
+export const COMMUNITY_COLORS = [
+  '#6f8fbf',
+  '#c2866a',
+  '#7aa86f',
+  '#a789c4',
+  '#bfa463',
+  '#5fa8a4',
+  '#c07f95',
+  '#8d9ac6',
+  '#a88a66',
+  '#84a05f'
+]
+
+/**
+ * 普通（非聚合）视图的社区着色：社区 → 颜色，以及节点 → 颜色。
+ *
+ * 颜色按**社区 id 排序后**依次分配（而不是按社区大小）：这样"谁是什么颜色"在重算之间是稳定的，
+ * 且不会出现两个社区拿到同一个颜色（按 id 哈希就会撞色，撞色的社区在图上是分不出来的）。
+ *
+ * 复用 `groupByCommunity` —— 种子固定的 Louvain，同一张图每次算出来的社区是同一批。
+ */
+export function communityColors(
+  nodes: readonly GraphNode[],
+  edges: readonly GraphEdge[]
+): { clusters: GraphCluster[]; colorOf: Map<string, string>; clusterColorOf: Map<string, string> } {
+  const { clusters, clusterOf } = groupByCommunity(nodes, edges)
+  const ordered = [...clusters].sort((a, b) => a.id.localeCompare(b.id))
+  const clusterColorOf = new Map<string, string>()
+  ordered.forEach((cluster, index) => {
+    clusterColorOf.set(cluster.id, COMMUNITY_COLORS[index % COMMUNITY_COLORS.length])
+  })
+  const colorOf = new Map<string, string>()
+  for (const [nodeId, clusterId] of clusterOf) {
+    const color = clusterColorOf.get(clusterId)
+    if (color) colorOf.set(nodeId, color)
+  }
+  return { clusters, colorOf, clusterColorOf }
+}

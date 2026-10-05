@@ -103,6 +103,8 @@ export interface ExtractedRelation {
   label: string
   evidence: string
   spans: ExtractedSpan[]
+  /** 原文对这一关系的断言强度 1..10（缺省视为未给出）；只影响**渲染粗细**，不参与任何过滤 */
+  strength?: number
 }
 
 export interface ExtractionResult {
@@ -118,6 +120,19 @@ export interface ExtractionContext {
   charEnd: number
   /** 分块原文：供"模型给了 evidence 但锚点坏了"时按引文重新定位（可选，越准的兜底越要用它） */
   chunkText?: string
+  /**
+   * 片段内偏移 → 全文偏移。
+   *
+   * **给了它 = 提交给模型的是"片段文本"**（例如源文件的原文切片），模型返回的 spans 按
+   * **片段内相对偏移**解释；**不给 = 沿用旧契约**（spans 直接就是全局偏移）。
+   *
+   * 越界必须返回 null（不要夹取）：这样"模型其实给的是全局坐标"这种情况会原样落下，
+   * 由下面的全局分支接手，而不是被静默翻译到错误的锚点上。
+   *
+   * 刻意用回调而不是直接收一张偏移表：`graph-schema` 是被 `document-model` 之外的多方依赖的
+   * 底座包，不该反过来依赖文档模型。
+   */
+  translateFromChunk?: (localOffset: number) => number | null
   nodeKindWhitelist?: NodeKind[] | null
   edgeKindWhitelist?: EdgeKind[] | null
 }
@@ -144,6 +159,24 @@ export function parseExtraction(rawText: string, ctx: ExtractionContext): Valida
    * 兜底：绝对解释一个都不合法、而相对解释有合法值时，换算回全局坐标（并在 issues 里留痕）。
    */
   const resolveSpans = (spans: ExtractedSpan[], path: string, evidence: string): ExtractedSpan[] => {
+    /**
+     * 0) **片段内相对偏移**（新契约）：提交给模型的是源文件原文切片时走这条。
+     * 排在最前是因为新提示词就是这么要求的；翻译不出合法区间（说明模型给的其实是全局坐标）
+     * 就原样落下去，由下面的旧路径接手 —— 不能在这里静默指到别处。
+     */
+    if (ctx.translateFromChunk) {
+      const translate = ctx.translateFromChunk
+      const translated: ExtractedSpan[] = []
+      for (const span of spans) {
+        if (!isInt(span.charStart) || !isInt(span.charEnd) || span.charEnd <= span.charStart) continue
+        const from = translate(span.charStart)
+        const to = translate(span.charEnd - 1)
+        if (from == null || to == null) continue
+        const candidate = { charStart: Math.min(from, to), charEnd: Math.max(from, to) + 1 }
+        if (inRange(candidate)) translated.push(candidate)
+      }
+      if (translated.length > 0) return translated
+    }
     const absolute = spans.filter(inRange)
     if (absolute.length > 0) return absolute
     const relative = spans.filter(
@@ -199,10 +232,16 @@ export function parseExtraction(rawText: string, ctx: ExtractionContext): Valida
       if (map.length === 0) return null
       const start = Math.min(Math.max(0, normStart), map.length - 1)
       const end = Math.min(Math.max(0, normEnd - 1), map.length - 1)
-      const rawStart = map[start]
-      const rawEnd = map[end] + 1
-      if (rawEnd <= rawStart) return null
-      return { charStart: ctx.charStart + rawStart, charEnd: ctx.charStart + rawEnd }
+      // 工作集是"提交给模型的片段文本"，所以命中位置是**片段内**下标：
+      // 有翻译回调就必须过一遍（源文件切片下，片段下标 ≠ 全文偏移）。
+      const toGlobal = (index: number): number | null =>
+        ctx.translateFromChunk ? ctx.translateFromChunk(index) : ctx.charStart + index
+      const from = toGlobal(map[start])
+      const to = toGlobal(map[end])
+      if (from == null || to == null) return null
+      const charStart = Math.min(from, to)
+      const charEnd = Math.max(from, to) + 1
+      return charEnd > charStart ? { charStart, charEnd } : null
     }
     const direct = haystack.indexOf(needle)
     if (direct >= 0) return mapBack(direct, direct + needle.length)
@@ -285,13 +324,16 @@ export function parseExtraction(rawText: string, ctx: ExtractionContext): Valida
       dropped += 1
       return
     }
+    /** 断言强度：缺省不写（渲染层按"未给出"处理），越界一律夹回 1..10 */
+    const strength = isInt(r.strength) ? Math.min(10, Math.max(1, r.strength)) : undefined
     relations.push({
       from,
       to,
       kind,
       label: isString(r.label) ? r.label : '',
       evidence: isString(r.evidence) ? r.evidence : '',
-      spans: valid
+      spans: valid,
+      ...(strength === undefined ? {} : { strength })
     })
   })
 

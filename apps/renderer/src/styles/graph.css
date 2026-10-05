@@ -191,6 +191,11 @@
   -webkit-box-orient: vertical;
 }
 
+/* 枢纽节点（度数高）字号略微上调：盒子已经变大了，字还那么小会显得空 */
+.lr-gnode[data-hub='true'] .lr-gnode__title {
+  font-size: 14px;
+}
+
 .lr-gnode__summary {
   font-size: 11px;
   color: var(--graph-node-subtitle);
@@ -290,6 +295,29 @@
   width: 18px;
   height: 2px;
   border-radius: 1px;
+}
+
+/* 社区分组：色环与节点描边同色（节点的 border-color 就是社区色） */
+.lr-graph__legend-title {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--graph-node-border);
+  color: var(--graph-node-subtitle);
+  font-size: 11px;
+}
+
+.lr-graph__legend-ring {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border: 2px solid var(--graph-node-border);
+  flex: none;
+}
+
+.lr-graph__legend-count {
+  margin-left: auto;
+  color: var(--graph-node-subtitle);
+  font-size: 10px;
 }
 
 .lr-graph__inspector {

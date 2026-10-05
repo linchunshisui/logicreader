@@ -60,10 +60,46 @@ export const EDGE_STYLE: Record<EdgeKind, EdgeStyle> = {
   inquiry: { label: { zh: '提问', en: 'Inquiry' }, color: '#e5925f', dash: '8 4', bidirectional: false, width: 2 }
 }
 
+/**
+ * 关系类型的**语义与方向**（from → to）。
+ *
+ * 抽取提示词只说"关系类型只能是 causes | supports | ..."这九个词时，模型只能靠猜：
+ * `causes` 是"A 导致 B"还是反过来？`contrasts` 该挂在谁身上？猜错的直接后果就是**图的逻辑是错的**。
+ * 这里把每条边的方向语义写死，提示词按语言拼成一行注入（九行 × 两种语言会把提示词撑大）。
+ */
+export const EDGE_SEMANTIC: Record<EdgeKind, Bilingual> = {
+  causes: { zh: 'A 导致 B', en: 'A causes B' },
+  supports: { zh: 'A 为 B 提供论据支持', en: 'A supports B' },
+  refutes: { zh: 'A 反驳 / 否定 B', en: 'A refutes B' },
+  elaborates: { zh: 'A 展开说明 B', en: 'A elaborates on B' },
+  contrasts: { zh: 'A 与 B 构成对比（无向，两端等价）', en: 'A contrasts with B (undirected)' },
+  sequences: { zh: 'A 先于 / 递进到 B', en: 'A precedes B' },
+  defines: { zh: 'A 定义 / 界定 B', en: 'A defines B' },
+  references: { zh: 'A 引用 / 指向 B', en: 'A references B' },
+  inquiry: { zh: 'A 针对 B 提出问题', en: 'A asks about B' }
+}
+
+
 export function edgeLabel(kind: string, locale: string): string {
   const style = EDGE_STYLE[kind as EdgeKind]
   if (!style) return kind
   return locale.startsWith('zh') ? style.label.zh : style.label.en
+}
+
+/**
+ * 连线粗细 = 词表基准宽度 × 强度倍率。
+ *
+ * 强度以提示词的缺省值 5 为 1.0 档：`1 → 0.73`、`5 → 1.0`、`10 → 1.33`；
+ * 未给出强度（旧图、聚合后的合并边）返回基准宽度，观感与加这个字段之前一致。
+ *
+ * 规则放在词表里，是为了让**界面渲染与导出 SVG 用同一条** —— 各写一遍必然漂移，
+ * 于是导出出来的图线和屏幕上看到的不一样粗。
+ */
+export function edgeStrokeWidth(kind: string, strength?: number | null): number {
+  const base = EDGE_STYLE[kind as EdgeKind]?.width ?? 1.5
+  if (typeof strength !== 'number' || !Number.isFinite(strength)) return base
+  const clamped = Math.max(1, Math.min(10, strength))
+  return Number((base * (1 + ((clamped - 5) / 9) * 0.6)).toFixed(2))
 }
 
 export function nodeLabel(kind: string, locale: string): string {

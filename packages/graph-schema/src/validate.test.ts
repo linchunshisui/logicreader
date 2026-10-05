@@ -195,3 +195,108 @@ describe('按 evidence 引文重新锚定（弱模型坐标全错但引文是对
     expect(result.value?.dropped).toBe(1)
   })
 })
+
+describe('片段内相对偏移（源文件切片提交）', () => {
+  it('模型给的片段内偏移经翻译回全文坐标后保留', () => {
+    const fragment = '甲乙丙丁戊己庚辛壬癸'.repeat(40) // 400 字
+    const ctx = {
+      charStart: 1000,
+      charEnd: 1400,
+      chunkText: fragment,
+      translateFromChunk: (local: number) => (local >= 0 && local < fragment.length ? 1000 + local : null)
+    }
+    const raw = JSON.stringify({
+      entities: [{ name: '甲', type: 'claim', summary: '', evidence: '', spans: [{ charStart: 10, charEnd: 20 }] }],
+      relations: []
+    })
+    const result = parseExtraction(raw, ctx)
+    expect(result.value?.entities).toHaveLength(1)
+    // 10 会被翻译成 1010；如果被当成全局偏移就会落进 [1000,1400) 之外/之内都说不通
+    expect(result.value?.entities[0].spans[0]).toEqual({ charStart: 1010, charEnd: 1020 })
+  })
+
+  it('翻译优先级高于"看起来像全局坐标"的解释（契约变更就落在这里）', () => {
+    const fragment = 'x'.repeat(400)
+    const ctx = {
+      charStart: 50,
+      charEnd: 450,
+      chunkText: fragment,
+      translateFromChunk: (local: number) => (local >= 0 && local < fragment.length ? 50 + local : null)
+    }
+    const raw = JSON.stringify({
+      entities: [{ name: 'A', type: 'claim', summary: '', evidence: '', spans: [{ charStart: 100, charEnd: 120 }] }],
+      relations: []
+    })
+    const spans = parseExtraction(raw, ctx).value?.entities[0].spans[0]
+    expect(spans).toEqual({ charStart: 150, charEnd: 170 })
+  })
+
+  it('translateFromChunk 越界返回 null → 回落到全局偏移的旧契约', () => {
+    const fragment = 'y'.repeat(400)
+    const ctx = {
+      charStart: 100,
+      charEnd: 500,
+      chunkText: fragment,
+      translateFromChunk: () => null
+    }
+    const raw = JSON.stringify({
+      entities: [{ name: 'A', type: 'claim', summary: '', evidence: '', spans: [{ charStart: 120, charEnd: 130 }] }],
+      relations: []
+    })
+    const entity = parseExtraction(raw, ctx).value?.entities[0]
+    expect(entity?.spans[0]).toEqual({ charStart: 120, charEnd: 130 })
+  })
+
+  it('evidence 重锚定在片段文本里找到后，也过一遍翻译', () => {
+    const fragment = '循环结构在前，之后是结论。'
+    const ctx = {
+      charStart: 1000,
+      charEnd: 1400,
+      chunkText: fragment,
+      translateFromChunk: (local: number) => (local >= 0 && local < fragment.length ? 1000 + local : null)
+    }
+    const raw = JSON.stringify({
+      entities: [
+        { name: '循环', type: 'claim', summary: 's', evidence: '循环结构在前', spans: [{ charStart: 9000, charEnd: 9100 }] }
+      ],
+      relations: []
+    })
+    const entity = parseExtraction(raw, ctx).value?.entities[0]
+    expect(entity).toBeDefined()
+    // 引文落在片段开头 → 映射到 1000 起
+    expect(entity?.spans[0].charStart).toBe(1000)
+    expect(entity?.spans[0].charEnd).toBe(1006)
+  })
+})
+
+describe('关系强度', () => {
+  const ctx = { charStart: 0, charEnd: 1000 }
+  const withStrength = (strength: unknown): number | undefined => {
+    const raw = JSON.stringify({
+      entities: [
+        { name: 'A', type: 'claim', summary: '', evidence: '', spans: [{ charStart: 10, charEnd: 20 }] },
+        { name: 'B', type: 'conclusion', summary: '', evidence: '', spans: [{ charStart: 30, charEnd: 40 }] }
+      ],
+      relations: [
+        { from: 'A', to: 'B', type: 'supports', label: '', evidence: '', spans: [{ charStart: 10, charEnd: 20 }], strength }
+      ]
+    })
+    return parseExtraction(raw, ctx).value?.relations[0]?.strength
+  }
+
+  it('缺省不写（渲染层按"未给出"处理）', () => {
+    expect(withStrength(undefined)).toBeUndefined()
+    expect(withStrength('高')).toBeUndefined()
+  })
+
+  it('越界夹回 1..10', () => {
+    expect(withStrength(99)).toBe(10)
+    expect(withStrength(0)).toBe(1)
+    expect(withStrength(-5)).toBe(1)
+  })
+
+  it('合法值原样保留', () => {
+    expect(withStrength(7)).toBe(7)
+    expect(withStrength(10)).toBe(10)
+  })
+})

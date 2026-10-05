@@ -151,7 +151,18 @@ function tryExtraction(input: PromptInput): string | null {
   const end = Number(match[2])
   const span = Math.max(1, Math.min(end - start, 400))
   const trim = (value: string): string => value.replace(/\s+/g, ' ').trim()
-  const bodyStart = input.text.indexOf('【片段原文】') >= 0 ? input.text.indexOf('【片段原文】') + 6 : input.text.indexOf('[FRAGMENT]') + 10
+  /**
+   * 正文标记必须**按字面找到**，找不到就放弃这次抽取（返回 null）。
+   *
+   * 早先写成 `indexOf(...) + 10` 一算到底：标记一旦对不上字面（例如被改成
+   * `【片段原文（…）】`），`indexOf` 返回 -1，加 10 却还是个正数 ——
+   * 于是把**提示词的开头**当成正文去抽，静默产出一张又小又烂的图，
+   * 而且看起来像"图生成成功了"。宁可这次空手而归，在日志里留个破绽。
+   */
+  const zhIndex = input.text.indexOf('【片段原文】')
+  const enIndex = input.text.indexOf('[FRAGMENT]')
+  const bodyStart = zhIndex >= 0 ? zhIndex + 6 : enIndex >= 0 ? enIndex + 10 : -1
+  if (bodyStart < 0) return null
   const body = trim(input.text.slice(bodyStart, bodyStart + 700))
   const topics = body
     .split(/[。.!?；;\n]/)

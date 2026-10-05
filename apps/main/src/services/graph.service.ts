@@ -5,10 +5,12 @@
 import { createId } from '@logicreader/shared'
 import type { GraphPrecision } from '@logicreader/shared'
 import {
+  buildChunkSourceMap,
   chunkDocument,
   createAnchor,
   finalizeDocumentModel,
   estimateTokens,
+  mapChunkOffset,
   similarity,
   type Anchor,
   type Block,
@@ -16,9 +18,11 @@ import {
 } from '@logicreader/document-model'
 import {
   EDGE_KINDS,
+  EDGE_SEMANTIC,
   NODE_KIND_COLOR,
   PRECISION_PROFILES,
   PROMPT_VERSION,
+  edgeStrokeWidth,
   emptyStats,
   parseExtraction,
   validateGraphDocument,
@@ -247,7 +251,19 @@ export function heuristicMinutes(chunkCount: number, concurrency: number, chunkC
   return [Math.max(1, Math.round((totalMs / 60000) * 0.75)), Math.max(2, Math.round((totalMs / 60000) * 1.5))]
 }
 
-function mapPrompt(input: {
+/** 把受控词表的边语义拼成一行（例：`causes=A 导致 B；supports=A 为 B 提供论据支持；…`）。 */
+function edgeSemanticsLine(edgeKinds: readonly string[], zh: boolean): string {
+  return edgeKinds
+    .map((kind) => {
+      const semantic = EDGE_SEMANTIC[kind as EdgeKind]
+      if (!semantic) return kind
+      return kind + '=' + (zh ? semantic.zh : semantic.en)
+    })
+    .join('；')
+}
+
+/** 导出供单测断言提示词契约（边语义、片段内相对偏移、强度）。 */
+export function mapPrompt(input: {
   chunkText: string
   headingPath: string[]
   title: string
@@ -258,55 +274,79 @@ function mapPrompt(input: {
   locale: string
   /** 档位抽取密度（实体数/千字符），给模型一个"抽多细"的数量指导 */
   density: number
+  /**
+   * 提交的片段文本是否**源文件原文切片**（而不是剥掉标记的拼块文本）。
+   * 只影响给模型的一句说明：两者都要求"片段内相对偏移"，措辞上说明清楚结构是原样的。
+   */
+  sourceFormat?: boolean
 }): string {
   const zh = input.locale.startsWith('zh')
   const kindList = input.nodeKinds.join(' | ')
   const edgeList = input.edgeKinds.join(' | ')
+  const semantics = edgeSemanticsLine(input.edgeKinds, zh)
   const expected = Math.max(3, Math.round((input.chunkText.length / 1000) * input.density))
+  const fragmentLabel = zh ? '【片段原文】' : '[FRAGMENT]'
+  /**
+   * 源格式说明**单独成行**，不拼进上面的标记里。
+   *
+   * 标记是给下游按字面找正文用的（mock 适配器的抽取分支就是 `indexOf('【片段原文】')`），
+   * 往标记里塞说明会让 `indexOf` 落空、正文被切到别处 —— 而且**静默**退化成一张烂图。
+   */
+  const sourceNote = input.sourceFormat
+    ? zh
+      ? '（本片段保留源文件格式：标题层级、表格、列表符号原样）'
+      : '(this fragment preserves the source format: heading levels, tables, list markers)'
+    : null
   if (zh) {
     return [
       '你是严谨的文档逻辑结构抽取器。下面给出《' + input.title + '》的一个片段。',
       '片段所属章节：' + (input.headingPath.length > 0 ? input.headingPath.join(' > ') : '（无标题）'),
-      '该片段在全文中的字符范围：[ ' + input.charStart + ', ' + input.charEnd + ' )',
+      '该片段在全文中的字符范围：[ ' + input.charStart + ', ' + input.charEnd + ' )（仅供定位参考，与你输出的 spans 无关）',
       '',
       '抽取要求：',
       '1. 只抽取片段中明确出现的内容，不要脑补；',
       '2. 节点类型只能是：' + kindList + '；',
-      '3. 关系类型只能是：' + edgeList + '；',
-      '4. 每个节点与每条关系都必须给出原文摘句 evidence，以及 spans（相对全文的字符范围，必须落在上面给出的区间内）；',
-      '5. 无法给出原文依据的条目一律不要输出；',
-      '6. 本片段体量约 ' + Math.round(input.chunkText.length / 1000) + ' 千字符，期望抽取约 ' + expected + ' 个实体（允许 ±40% 浮动；内容确实不足时可以更少，但不要为凑数编造）；',
-      '7. 节点名称必须与片段中的原文用词一致，同一概念在片段内多次出现时只建一个节点；',
-      '8. 只输出 JSON，不要输出任何解释文字或 Markdown 代码围栏。',
-      '9. 不要使用任何工具（不要读写文件、不要执行命令、不要联网检索），直接把 JSON 作为回答正文输出。',
+      '3. 关系类型只能是：' + edgeList + '；关系方向一律是 from → to，含义为：' + semantics + '；',
+      '4. 每个节点与每条关系都必须给出原文摘句 evidence（必须是片段里逐字出现的原句）；',
+      '5. spans 是**相对本片段文本、从 0 开始**的字符范围（不是全文偏移），且必须落在片段文本长度之内；',
+      '6. 每条关系再给出 strength：1-10 的整数，10 表示原文措辞最强、最明确，缺省按 5；',
+      '7. 无法给出原文依据的条目一律不要输出；',
+      '8. 本片段体量约 ' + Math.round(input.chunkText.length / 1000) + ' 千字符，期望抽取约 ' + expected + ' 个实体（允许 ±40% 浮动；内容确实不足时可以更少，但不要为凑数编造）；',
+      '9. 节点名称必须与片段中的原文用词一致，同一概念在片段内多次出现时只建一个节点；',
+      '10. 只输出 JSON，不要输出任何解释文字或 Markdown 代码围栏。',
+      '11. 不要使用任何工具（不要读写文件、不要执行命令、不要联网检索），直接把 JSON 作为回答正文输出。',
       '',
       '输出结构：',
       '{"entities":[{"name":"简短名称(不超过14字)","type":"claim","summary":"一句话摘要(不超过40字)","evidence":"原文摘句","spans":[{"charStart":0,"charEnd":0}]}],',
-      ' "relations":[{"from":"实体name","to":"实体name","type":"supports","label":"简短标签","evidence":"原文摘句","spans":[{"charStart":0,"charEnd":0}]}]}',
+      ' "relations":[{"from":"实体name","to":"实体name","type":"supports","label":"简短标签","strength":5,"evidence":"原文摘句","spans":[{"charStart":0,"charEnd":0}]}]}',
       '',
-      '【片段原文】',
+      ...(sourceNote ? [sourceNote] : []),
+      fragmentLabel,
       input.chunkText
     ].join('\n')
   }
   return [
     'You are a rigorous document logic extractor. Below is a fragment of "' + input.title + '".',
     'Section: ' + (input.headingPath.length > 0 ? input.headingPath.join(' > ') : '(untitled)'),
-    'Global character range: [ ' + input.charStart + ', ' + input.charEnd + ' )',
+    'Global character range: [ ' + input.charStart + ', ' + input.charEnd + ' ) (for orientation only; unrelated to the spans you output)',
     '',
     'Rules:',
     '1. Extract only what is explicitly present.',
     '2. Node kinds: ' + kindList,
-    '3. Edge kinds: ' + edgeList,
-    '4. Every entity and relation must carry verbatim evidence and spans (global character offsets inside the range above).',
-    '5. Drop anything without a source anchor.',
-    '6. This fragment is about ' + Math.round(input.chunkText.length / 1000) + 'k characters; expect roughly ' + expected + ' entities (±40% is fine; fewer if the content truly warrants it, but never invent filler).',
-    '7. Node names must use the fragment\'s own wording; mention the same concept multiple times → one node only.',
-    '8. Output JSON only, no prose, no code fences.',
-    '9. Do not use any tool (no file reads or writes, no shell commands, no web search); answer with the JSON body directly.',
+    '3. Edge kinds: ' + edgeList + '. Direction is always from → to, meaning: ' + semantics,
+    '4. Every entity and relation must carry verbatim evidence copied word-for-word from the fragment.',
+    '5. spans are 0-based character ranges **relative to the fragment text** (not global offsets), and must stay within the fragment length.',
+    '6. Each relation also carries strength: an integer 1-10, where 10 means the source states it most strongly; default 5.',
+    '7. Drop anything without a source anchor.',
+    '8. This fragment is about ' + Math.round(input.chunkText.length / 1000) + 'k characters; expect roughly ' + expected + ' entities (±40% is fine; fewer if the content truly warrants it, but never invent filler).',
+    '9. Node names must use the fragment\'s own wording; mention the same concept multiple times → one node only.',
+    '10. Output JSON only, no prose, no code fences.',
+    '11. Do not use any tool (no file reads or writes, no shell commands, no web search); answer with the JSON body directly.',
     '',
-    '{"entities":[{"name":"...","type":"claim","summary":"...","evidence":"...","spans":[{"charStart":0,"charEnd":0}]}],"relations":[{"from":"...","to":"...","type":"supports","label":"...","evidence":"...","spans":[{"charStart":0,"charEnd":0}]}]}',
+    '{"entities":[{"name":"...","type":"claim","summary":"...","evidence":"...","spans":[{"charStart":0,"charEnd":0}]}],"relations":[{"from":"...","to":"...","type":"supports","label":"...","strength":5,"evidence":"...","spans":[{"charStart":0,"charEnd":0}]}]}',
     '',
-    '[FRAGMENT]',
+    ...(sourceNote ? [sourceNote] : []),
+    fragmentLabel,
     input.chunkText
   ].join('\n')
 }
@@ -484,6 +524,8 @@ export class GraphService {
       inherited?: boolean
       /** 继承连线的原权重（重跑分块新抽出的连线没有这个字段，从 1 计） */
       weight?: number
+      /** 原文对这一关系的断言强度 1..10（模型给的；只进 edge.meta，不参与任何过滤） */
+      strength?: number
     }
 
     const entities: RawEntity[] = []
@@ -530,11 +572,28 @@ export class GraphService {
       })
     }
 
+    /** 全文块按 id 索引：源文件切片要按 chunk.blockIds 取回块对象 */
+    const blockById = new Map(model.blocks.map((block) => [block.id, block] as const))
+    /** Markdown / 纯文本解析器会把整份源码留在 meta.source；PDF / DOCX / 表格没有 */
+    const docSource = typeof model.meta?.source === 'string' ? (model.meta.source as string) : null
+
     const runChunk = async (index: number): Promise<void> => {
       const chunk = chunks[index]
       if (this.cancelled.has(taskId)) return
+      /**
+       * 提交给模型的片段文本：有文本源文件时用**源文件原文切片**
+       * （标题层级、表格、列表符号原样保留），并给出"片段内偏移 → 全文偏移"的映射。
+       * 模型返回的 spans 因此按**片段内相对偏移**解释（见 parseExtraction 的 translateFromChunk）。
+       */
+      const sourceMap = buildChunkSourceMap({
+        source: docSource,
+        blocks: model.blocks,
+        chunkBlocks: chunk.blockIds.map((id) => blockById.get(id)).filter((block): block is Block => Boolean(block)),
+        chunkText: chunk.text
+      })
+      const fragment = sourceMap?.text ?? chunk.text
       const prompt = mapPrompt({
-        chunkText: chunk.text,
+        chunkText: fragment,
         headingPath: chunk.headingPath,
         title: model.title,
         charStart: chunk.charStart,
@@ -542,7 +601,8 @@ export class GraphService {
         nodeKinds: nodeWhitelist ?? ['claim', 'conclusion', 'evidence', 'definition', 'data', 'method'],
         edgeKinds: edgeWhitelist,
         locale,
-        density: profileDensityPerKiloChars(profile)
+        density: profileDensityPerKiloChars(profile),
+        sourceFormat: sourceMap?.fromSource === true
       })
       let raw = ''
       let parsed: ReturnType<typeof parseExtraction> | null = null
@@ -592,7 +652,7 @@ export class GraphService {
               contextMode: 'fulltext',
               documentDir: documentDirOf(model.filePath),
               // 超时预算随分块长度走：大块需要更长的思考时间，小块不必等那么久（见 chunkTimeoutFor）
-              timeoutMs: chunkTimeoutFor(chunk.text.length)
+              timeoutMs: chunkTimeoutFor(fragment.length)
             })
             if (attempt.note) {
               warnings.push('分块 ' + index + '：' + attempt.note)
@@ -621,8 +681,14 @@ export class GraphService {
         parsed = parseExtraction(raw, {
           charStart: chunk.charStart,
           charEnd: chunk.charEnd,
-          // 分块原文：锚点彻底坏了时按 evidence 引文在本块内重新定位（弱模型最常见失败模式的直接对策）
-          chunkText: chunk.text,
+          // 提交给模型的片段文本：锚点彻底坏了时按 evidence 引文在这段文本里重新定位
+          // （弱模型最常见失败模式的直接对策）
+          chunkText: fragment,
+          /**
+           * 片段内偏移 → 全文偏移。给了它就走"片段内相对偏移"的新契约；
+           * 建不出映射（sourceMap 为 null）时不传，退回"spans 就是全局偏移"的旧契约。
+           */
+          translateFromChunk: sourceMap ? (local: number) => mapChunkOffset(sourceMap, local) : undefined,
           nodeKindWhitelist: nodeWhitelist,
           edgeKindWhitelist: edgeWhitelist
         })
@@ -677,7 +743,8 @@ export class GraphService {
           label: relation.label.slice(0, 24),
           evidence: relation.evidence,
           charStart: span.charStart,
-          charEnd: span.charEnd
+          charEnd: span.charEnd,
+          strength: relation.strength
         })
       }
       finishChunk(index, Date.now() - chunkStarted, null)
@@ -766,7 +833,8 @@ export class GraphService {
           charStart: firstAnchor ? firstAnchor.charStart : 0,
           charEnd: firstAnchor ? firstAnchor.charEnd : 1,
           inherited: true,
-          weight: oldEdge.weight
+          weight: oldEdge.weight,
+          strength: typeof oldEdge.meta?.strength === 'number' ? oldEdge.meta.strength : undefined
         })
       }
       if (inherited > 0) logMain('info', 'graph', '增量重试：从上一张图继承 ' + inherited + ' 个节点与 ' + previousGraph.edges.length + ' 条连线')
@@ -882,7 +950,13 @@ export class GraphService {
         const spans = ((existing.meta?.spans as { charStart: number; charEnd: number }[] | undefined) ?? []).concat([
           { charStart: relation.charStart, charEnd: relation.charEnd }
         ])
-        existing.meta = { ...(existing.meta ?? {}), spans }
+        /**
+         * 同一对端点的同类型关系被多块确认：`weight` 计次数（阈值过滤与增量重试都建在它上面），
+         * `strength` 取多次里**最强**的那次 —— 一处强断言足以说明这条关系成立。
+         */
+        const previousStrength = typeof existing.meta?.strength === 'number' ? existing.meta.strength : 0
+        const strength = Math.max(previousStrength, relation.strength ?? 0)
+        existing.meta = { ...(existing.meta ?? {}), spans, ...(strength > 0 ? { strength } : {}) }
         continue
       }
       edgeMap.set(key, {
@@ -902,7 +976,8 @@ export class GraphService {
           evidence: relation.evidence,
           charStart: relation.charStart,
           charEnd: relation.charEnd,
-          spans: [{ charStart: relation.charStart, charEnd: relation.charEnd }]
+          spans: [{ charStart: relation.charStart, charEnd: relation.charEnd }],
+          ...(relation.strength == null ? {} : { strength: relation.strength })
         }
       })
     }
@@ -1227,7 +1302,7 @@ export class GraphService {
       const to = positions.get(edge.to)
       if (!from || !to) continue
       parts.push(
-        '<line x1="' + (from.x + 130) + '" y1="' + (from.y + 28) + '" x2="' + (to.x + 130) + '" y2="' + (to.y + 28) + '" stroke="#9a9a9a" stroke-width="1.5" marker-end="url(#arrow)"/>'
+        '<line x1="' + (from.x + 130) + '" y1="' + (from.y + 28) + '" x2="' + (to.x + 130) + '" y2="' + (to.y + 28) + '" stroke="#9a9a9a" stroke-width="' + edgeStrokeWidth(edge.kind, typeof edge.meta?.strength === 'number' ? edge.meta.strength : null) + '" marker-end="url(#arrow)"/>'
       )
       parts.push(
         '<text x="' + ((from.x + to.x) / 2 + 130) + '" y="' + ((from.y + to.y) / 2 + 20) + '" font-size="11" fill="#666" text-anchor="middle">' +

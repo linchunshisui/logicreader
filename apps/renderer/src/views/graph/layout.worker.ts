@@ -48,9 +48,26 @@ async function layered(request: LayoutRequest): Promise<Record<string, { x: numb
     layoutOptions: {
       'elk.algorithm': 'layered',
       'elk.direction': request.direction ?? 'RIGHT',
-      'elk.layered.spacing.nodeNodeBetweenLayers': '120',
-      'elk.spacing.nodeNode': '48',
+      /**
+       * 分层布局的可读性参数（键名已按本机 elkjs 0.12 的 `org.eclipse.elk.*` 选项表核对过，
+       * 写错会被 ELK 静默忽略 —— 图看起来"没变"但没人知道为什么）。
+       *
+       * 三个方向：
+       * 1. **少交叉**：交叉数是节点连线图可读性最核心的指标（每条交叉都是视线的一次断裂）。
+       * 2. **多直边、少折点**：折线越多越难从 A 跟到 B，去掉无谓拐点、优先直边。
+       * 3. **留白**：节点、连线、连线标签之间都要留缝，否则标签会压在框上互相盖住。
+       */
+      'elk.layered.spacing.nodeNodeBetweenLayers': '140',
+      'elk.spacing.nodeNode': '56',
+      'elk.layered.crossingMinimization.strategy': 'LAYER_SWEEP',
       'elk.layered.nodePlacement.strategy': 'NETWORK_SIMPLEX',
+      'elk.layered.nodePlacement.favorStraightEdges': 'true',
+      'elk.layered.unnecessaryBendpoints': 'true',
+      'elk.spacing.edgeNode': '24',
+      'elk.spacing.edgeEdge': '10',
+      'elk.layered.spacing.edgeNodeBetweenLayers': '24',
+      // 连线标签是 10px 的小底色块，和边挤在一起时最先被压掉
+      'elk.spacing.edgeLabel': '6',
       'elk.edgeRouting': 'SPLINES'
     },
     children: request.nodes.map((node) => ({

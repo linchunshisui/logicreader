@@ -92,6 +92,8 @@ export async function parseTextDocument(ctx: ParseContext): Promise<DocumentMode
     text: '',
     outline: [],
     pageCount: null,
-    meta: { lineCount: lines.length }
+    // 保留源码：关系图抽取按**原文切片**提交给 Agent（Markdown 标记 / 列表符号原样保留），
+    // 不再用剥掉标记的拼块文本 —— 只留 lineCount 的话纯文本文档会静默退化成拼块文本。
+    meta: { lineCount: lines.length, sourceLength: raw.length, source: raw }
   })
 }

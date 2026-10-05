@@ -475,6 +475,8 @@ export const zhCN = {
     clusterDrill: '双击下钻',
     clusterEdgeCount: '{{count}} 条关系',
     aggregateHint: '按社区聚合中（共 {{clusters}} 个社区）—— 双击超级节点可下钻到成员',
+    legendCommunities: '社区（按连线聚集）',
+    legendCommunitySize: '{{count}} 项',
     filter: '过滤',
     nodeKinds: '节点类型',
     searchPlaceholder: '搜索节点',

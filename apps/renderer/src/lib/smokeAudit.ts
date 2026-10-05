@@ -400,6 +400,120 @@ const AUDITS: Record<string, (arg?: string) => Promise<CheckResult | null>> = {
   },
 
   /**
+   * 关系图可读性：**按度数分级**的节点尺寸 + **社区着色**的描边（第八十三轮）。
+   *
+   * 为什么值得一条断言：这两项都是"看着差不多"型的坏法 —— 尺寸没生效（所有点一样大）、
+   * 社区色算错（相邻社区撞色）在截图里都不显眼。判据落在**实测宽度的偏序**与
+   * **描边色是否等于该社区在调色板里的色**上。
+   *
+   * 度数全一样（尺寸无从比较）又没有可校验的社区色时返回 null → SKIP，不把"测不出"记成通过。
+   */
+  'smoke.assertGraphReadability': async () => {
+    const { useGraph } = await import('../state/graph.store')
+    const { degreesOf, GRAPH_NODE_BASE_WIDTH } = await import('./graphNodeSize')
+    const { communityColors } = await import('./graphClusters')
+
+    /**
+     * 视口缩放。画布是 CSS transform 缩放的，`getBoundingClientRect` 量到的是**屏幕**尺寸 ——
+     * 不做归一化就没法把"这一次量的宽度"和"上一次量的宽度"放在一起比
+     * （实测两次测量之间缩放会变，直接比会得出完全错误的结论）。
+     */
+    const viewportScale = (): number => {
+      const el = document.querySelector<HTMLElement>('.react-flow__viewport')
+      const match = el ? /matrix\(([-\d.]+)/.exec(getComputedStyle(el).transform) : null
+      return match ? Math.abs(Number(match[1])) || 1 : 1
+    }
+    const cssWidthOf = (glyph: HTMLElement): number => glyph.getBoundingClientRect().width / viewportScale()
+
+    // 与 assertClusterView 同样的轮询理由：命令与图生成是并发触发的
+    const deadline = Date.now() + 30000
+    while (Date.now() < deadline) {
+      const current = useGraph.getState().graph
+      if (current && current.nodes.length >= 4 && current.edges.length >= 2) break
+      await sleep(500)
+    }
+    // 聚合视图下画的是超级节点（刻意固定尺寸、不代表单个节点），先把开关关掉
+    if (useGraph.getState().aggregated) {
+      useGraph.getState().toggleAggregate()
+      await sleep(400)
+    }
+    const graph = useGraph.getState().graph
+    if (!graph || graph.nodes.length < 4 || graph.edges.length < 2) return null
+
+    const degrees = degreesOf(graph.edges)
+    const maxDegree = degrees.size > 0 ? Math.max(...degrees.values()) : 0
+    if (!(maxDegree > 1)) return null
+
+    /** 画布开了视口裁剪：只对**真的在 DOM 里**的节点量尺寸 */
+    const measured: { id: string; width: number; border: string; degree: number }[] = []
+    for (const wrapper of Array.from(document.querySelectorAll<HTMLElement>('.react-flow__node[data-id]'))) {
+      const id = wrapper.dataset.id ?? ''
+      if (id.startsWith('cluster:')) continue
+      const glyph = wrapper.querySelector<HTMLElement>('.lr-gnode')
+      if (!glyph) continue
+      measured.push({
+        id,
+        width: Math.round(cssWidthOf(glyph)),
+        border: getComputedStyle(glyph).borderTopColor,
+        degree: degrees.get(id) ?? 0
+      })
+    }
+    if (measured.length < 2) return null
+
+    const byDegree = [...measured].sort((a, b) => b.degree - a.degree)
+    const hub = byDegree[0]
+    const leaf = byDegree[byDegree.length - 1]
+    const sizeJudgeable = hub.degree > leaf.degree
+
+    /** 颜色两种写法（调色板 hex 与 computed 的 rgb()）都要归一化才能比 */
+    const toHex = (value: string): string => {
+      const ctx = document.createElement('canvas').getContext('2d')
+      if (!ctx) return value.toLowerCase()
+      ctx.fillStyle = value
+      return String(ctx.fillStyle).toLowerCase()
+    }
+    const { colorOf } = communityColors(graph.nodes, graph.edges)
+    const colorChecked = measured
+      .map((item) => ({ ...item, expected: colorOf.get(item.id) }))
+      .filter((item): item is typeof item & { expected: string } => Boolean(item.expected))
+    const mismatched = colorChecked.filter((item) => toHex(item.border) !== toHex(item.expected))
+
+    if (!sizeJudgeable && colorChecked.length === 0) return null
+
+    /**
+     * 再切到聚合视图：超级节点要**比基准尺寸的普通节点更宽**。
+     *
+     * 判据刻意落在"基准宽"而不是"比所有普通节点都宽"上 —— 后者是错的：
+     * 满档枢纽是 220×1.4 = 308，比超级节点的 260 还宽，拿它当基准会假失败（本轮踩过）。
+     * 这条断言真正要守的是 CSS 里 `.lr-gnode[data-cluster='true'] { width: 260px }` 不被
+     * 内联 width 盖掉 —— 盖掉之后超级节点会悄悄缩回 220，而两张截图看起来"都挺正常"。
+     */
+    useGraph.getState().toggleAggregate()
+    await sleep(500)
+    const clusterWidths: number[] = []
+    for (const wrapper of Array.from(document.querySelectorAll<HTMLElement>(".react-flow__node[data-id^='cluster:']"))) {
+      const glyph = wrapper.querySelector<HTMLElement>('.lr-gnode')
+      if (glyph) clusterWidths.push(Math.round(cssWidthOf(glyph)))
+    }
+    const clusterOk = clusterWidths.length === 0 ? null : Math.max(...clusterWidths) > GRAPH_NODE_BASE_WIDTH
+
+    return {
+      ok: (!sizeJudgeable || hub.width > leaf.width) && mismatched.length === 0 && (clusterOk === null || clusterOk),
+      detail: {
+        hub: { id: hub.id, degree: hub.degree, width: hub.width },
+        leaf: { id: leaf.id, degree: leaf.degree, width: leaf.width },
+        sizeJudgeable,
+        colorChecked: colorChecked.length,
+        mismatched: mismatched.map((item) => ({ id: item.id, border: item.border, expected: item.expected })),
+        domNodes: measured.length,
+        clusterWidths,
+        baseWidth: GRAPH_NODE_BASE_WIDTH,
+        clusterOk
+      }
+    }
+  },
+
+  /**
    * P1-10 关系图三个浮层不许全开、不许互相压；外加**控件颜色要跟着主题走**。
    *
    * 判据：质量报告与图例默认收起；图例（左上）、迷你地图（右下）、检查器（右上）

@@ -7,6 +7,7 @@ import type { EdgeKind, GraphEdge, GraphNode, LogicGraph, NodeKind } from '@logi
 import { EDGE_KINDS, NODE_KINDS } from '@logicreader/graph-schema'
 import { api } from '../lib/api'
 import { exportGraphImage } from '../lib/graphImage'
+import { degreesOf, nodeSizeOf } from '../lib/graphNodeSize'
 import { graphDisplayName } from '../lib/graphName'
 import { canLinkNodes, createManualEdge, type LinkFailure } from './graphEdits'
 import { notify } from './notifications.store'
@@ -67,6 +68,13 @@ interface GraphState {
    * 这里管"按社区聚合"（走 Louvain 算出的社区）。两者互不干扰。
    */
   expandedClusters: string[]
+  /**
+   * "大图自动聚合"已经为哪张图做过判定。
+   *
+   * 只记图 id：用户手动关掉聚合开关之后，reload 不该把开关又推回去
+   * （那会变成"我明明关了它又自己弹回来"）。换一张图才重新判定一次。
+   */
+  aggregateAutoAppliedFor: string | null
   /** 由命令/快捷键发起的"打开生成配置面板"请求（非 0 即待处理） */
   generateRequest: number
   /** 由别处（逻辑链面板等）发起的"把某个节点居中并选中"请求 */
@@ -132,15 +140,15 @@ export interface GenerateRequest {
   retryChunkIndexes?: number[]
 }
 
-const NODE_W = 220
-const NODE_H = 64
+/**
+ * "大图"的节点数阈值：超过它才自动切社区聚合视图。
+ *
+ * 取 120 是启发式（规划书 FR-7.7 要求 200+ 节点可用；220px 宽的节点盒在这一量级已经开始糊）。
+ * 阈值偏高而不是偏低：自动切视图会改变默认观感，宁可在确实糊了之后才切。
+ */
+const AGGREGATE_AUTO_THRESHOLD = 120
 
-function nodeSize(node: GraphNode): { width: number; height: number } {
-  return { width: NODE_W, height: node.meta?.isSection ? 44 : NODE_H }
-}
-
-export const useGraph = create<GraphState>((set, get) => ({
-  docId: null,
+export const useGraph = create<GraphState>((set, get) => ({  docId: null,
   graph: null,
   summaries: [],
   loading: false,
@@ -156,6 +164,7 @@ export const useGraph = create<GraphState>((set, get) => ({
   aggregated: false,
   collapsedIds: [],
   expandedClusters: [],
+  aggregateAutoAppliedFor: null,
   generateRequest: 0,
   focusRequest: null,
 
@@ -194,6 +203,20 @@ export const useGraph = create<GraphState>((set, get) => ({
         if (node.x != null && node.y != null) positions[node.id] = { x: node.x, y: node.y }
       }
       set({ graph, positions, loading: false, collapsedIds: graph.nodes.filter((n) => n.collapsed).map((n) => n.id) })
+      /**
+       * 大图自动聚合：设置项 `graph.aggregate` 此前只是个**没有行为的偏好**
+       * （执行记录 §101 登记的遗留）。节点数过阈值时默认切到社区聚合视图 ——
+       * 几百个点的图在屏幕上是糊的，先给"一团一团"的概览 + 双击下钻比糊图有用。
+       * 只对一张图判定一次，用户随时可以手动关掉，不会被下一次 reload 推回来。
+       */
+      if (get().aggregateAutoAppliedFor !== graph.id) {
+        const settings = useSettings.getState().settings
+        const shouldAggregate = settings.graph.aggregate && graph.nodes.length >= AGGREGATE_AUTO_THRESHOLD
+        set({
+          aggregateAutoAppliedFor: graph.id,
+          ...(shouldAggregate ? { aggregated: true, expandedClusters: [] } : {})
+        })
+      }
       if (Object.keys(positions).length < graph.nodes.length) await get().runLayout(get().layoutMode)
     } catch (error) {
       set({ loading: false })
@@ -288,6 +311,9 @@ export const useGraph = create<GraphState>((set, get) => ({
       if (node.pinned?.position && node.x != null && node.y != null) frozen[node.id] = { x: node.x, y: node.y }
     }
     set({ layoutMode: mode })
+    /** 节点尺寸按重要度分级：布局要按真实包围盒留间距，否则放大的枢纽会被邻居压住 */
+    const degrees = degreesOf(graph.edges)
+    const maxDegree = degrees.size > 0 ? Math.max(...degrees.values()) : 0
     try {
       const worker = new Worker(new URL('../views/graph/layout.worker.ts', import.meta.url), { type: 'module' })
       const result = await new Promise<{ ok: boolean; positions?: Record<string, { x: number; y: number }>; error?: string }>(
@@ -299,7 +325,10 @@ export const useGraph = create<GraphState>((set, get) => ({
           }
           worker.postMessage({
             mode,
-            nodes: graph.nodes.map((node) => ({ id: node.id, ...nodeSize(node), parentId: node.parentId })),
+            nodes: graph.nodes.map((node) => {
+              const { width, height } = nodeSizeOf(node, degrees.get(node.id) ?? 0, maxDegree)
+              return { id: node.id, width, height, parentId: node.parentId }
+            }),
             edges: graph.edges.map((edge) => ({ id: edge.id, source: edge.from, target: edge.to })),
             frozen
           })

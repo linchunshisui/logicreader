@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { GraphEdge, GraphNode } from '@logicreader/graph-schema'
-import { buildAggregatedGraph, computeCommunities } from './graphClusters'
+import { buildAggregatedGraph, communityColors, computeCommunities } from './graphClusters'
 
 /**
  * 社区检测与折叠的单测。
@@ -201,5 +201,28 @@ describe('聚合视图（支持部分展开）', () => {
     const superA = buildAggregatedGraph(nodes, edges).nodes.find((item) => item.id === 'cluster:a1')
     expect(superA?.size).toBe(3)
     expect(superA?.memberIds.slice().sort()).toEqual(['a1', 'a2', 'a3'])
+  })
+})
+
+describe('社区着色（普通视图）', () => {
+  it('每个节点都拿到颜色，同一社区同色、不同社区不同色', () => {
+    const { nodes, edges } = twoTriangles()
+    const { clusters, colorOf, clusterColorOf } = communityColors(nodes, edges)
+    expect(clusters).toHaveLength(2)
+    for (const item of nodes) expect(colorOf.get(item.id)).toBeTruthy()
+    const colors = new Set(clusters.map((cluster) => clusterColorOf.get(cluster.id)))
+    expect(colors.size).toBe(2)
+    // 同一社区的成员颜色一致
+    const first = clusters[0]
+    const memberColors = new Set(first.members.map((member) => colorOf.get(member.id)))
+    expect(memberColors.size).toBe(1)
+  })
+
+  it('重算结果稳定：同一张图两次调用配色完全一致', () => {
+    const { nodes, edges } = twoTriangles()
+    const first = communityColors(nodes, edges)
+    const second = communityColors(nodes, edges)
+    expect([...second.clusterColorOf.entries()]).toEqual([...first.clusterColorOf.entries()])
+    expect([...second.colorOf.entries()]).toEqual([...first.colorOf.entries()])
   })
 })

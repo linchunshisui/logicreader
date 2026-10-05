@@ -467,6 +467,8 @@ export const enUS: Dictionary = {
     clusterDrill: 'Double-click to expand',
     clusterEdgeCount: '{{count}} relations',
     aggregateHint: 'Aggregated into {{clusters}} communities — double-click a super-node to expand it',
+    legendCommunities: 'Communities (grouped by links)',
+    legendCommunitySize: '{{count}} items',
     filter: 'Filter',
     nodeKinds: 'Node types',
     searchPlaceholder: 'Search nodes',
