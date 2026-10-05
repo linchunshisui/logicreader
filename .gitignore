@@ -1,4 +1,7 @@
 node_modules/
+# 旧流程会把官方 Claude Code CLI（约 234 MB）复制到这里带进产物；v0.3 起不再内置它，
+# 这条忽略规则留着当保险：万一旧产物残留，也不至于被 git add -A 吞进仓库。
+resources/claude-cli/
 out/
 release/
 release-*/
