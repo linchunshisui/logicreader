@@ -7,6 +7,7 @@ import {
   looksLikePlan,
   decidePermission,
   classifyPermission,
+  isPermissionMode,
   type AgentCapabilityView,
   type AgentConfigOption,
   type AgentEventPayload,
@@ -77,6 +78,11 @@ interface AgentState {
   contextMode: ContextMode
   /** 授权模式：写入/命令逐次询问，还是按策略自动放行（对应界面上那颗模式按钮） */
   permissionMode: PermissionMode
+  /**
+   * **该通道自己那些档位**当前选中的值（Claude 的 permissionMode / Codex 的 approvalPolicy+sandbox）。
+   * 只存"用户显式拨过"的值；没拨过时按能力声明的默认值走（见 effectiveConfigValues）。
+   */
+  configValues: Record<string, string>
   /** 扩展档：Agent 声明了更高思考强度档位时才可用 */
   ultracode: boolean
   sessionId: string | null
@@ -136,10 +142,31 @@ interface AgentState {
    * （本轮实测：seeded 的 edit 档被覆盖成 manual，写文件于是被按手动档挡下）。
    */
   hydratedFromSnapshot: boolean
+  /**
+   * 正在读会话快照（`bindDocument` 里 `api.session.load()` 还没回来）。
+   *
+   * 这个窗口里 `refreshAgents` **不许**执行"没选定就用默认 Agent"那条路径：
+   * 它会顺手把选择落盘，而快照还没读进来 —— 种子画像里写的 `agentId: 'mock'`
+   * 就是这样在启动的一瞬间被改写成真实的 Claude Code（无人值守冒烟于是偷偷连了真模型）。
+   * 这是"读快照"与"选默认"之间的竞态，靠 `hydratedFromSnapshot` 挡不住：
+   * 那个标记本身就只在读完之后才置位。
+   */
+  hydrationPending: boolean
   initialized: boolean
   lastError: string | null
   /** 最近一次提问的完整载荷（重试时原样重发；只存内存，会话重启后为 null） */
   lastPrompt: { text: string; systemContext?: string; locationLabel?: string; anchorIds?: string[] } | null
+  /**
+   * 待用户确认的「通读全文」提议。
+   *
+   * 规划书 FR-7 的原话是"**首先请求用户询问是否激活 Agent 工具将打开的文件通读**"，
+   * 而旧实现是文档一打开就 `send()` 一整篇全文上下文 —— 用户什么都没点，
+   * 面板里就出现自己发的"总结理解与阅读参考（通读全文）"，并且真的花掉一次模型调用。
+   * 现在这里只立一张询问卡片，发不发由用户决定（`startDocumentRead`）。
+   */
+  readAsk: { docId: string; title: string } | null
+  /** 本次运行里用户已经明确"暂不"的文档：不再重复提议（重开同一篇不打扰） */
+  readAskDeclined: string[]
 
   init: () => Promise<void>
   refreshAgents: (force?: boolean) => Promise<void>
@@ -163,16 +190,27 @@ interface AgentState {
   /** 删除一条历史会话（界面先确认；不支持删除的通道提示后返回） */
   deleteHistorySession: (remoteSessionId: string) => Promise<void>
   /**
-   * 文档默认会话：没有会话时自动发起首轮"通读"（论文全文为上下文 → 总结理解 + 阅读参考）。
-   * 条件不满足（未装 Agent / 文档太短 / 已有会话）时静默退出，用户发第一条消息时自然建会话。
+   * 文档默认会话：没有会话时**提议**一轮"通读"（全文为上下文 → 总结理解 + 阅读参考）。
+   *
+   * 只立询问卡片，不发送 —— 是否消耗一次模型调用由用户点「开始通读」决定（见 readAsk）。
+   * 条件不满足（未装 Agent / 文档太短 / 已有会话）时静默退出。
    */
-  ensureDocumentSession: () => Promise<void>
+  ensureDocumentRead: () => Promise<void>
+  /** 用户点了「开始通读」：真正把全文上下文与那轮提问发出去 */
+  startDocumentRead: () => Promise<void>
+  /** 用户点了「暂不」：收起卡片，且这次运行里不再为这篇文档提议 */
+  dismissDocumentRead: () => Promise<void>
   /** 从某个历史会话分叉：复制它的历史开新会话，原会话不动 */
   forkSession: (remoteSessionId: string) => Promise<void>
   setModel: (modelId: string | null) => void
   setThinkingEffort: (effort: string | null) => void
   setContextMode: (mode: ContextMode) => void
   setPermissionMode: (mode: PermissionMode) => Promise<void>
+  /**
+   * 切一个**该通道自己的**授权档位（Claude 的 permissionMode / Codex 的 approvalPolicy、sandbox）。
+   * 走活动会话切换还是重建，由控制项自己的 `rebuild` 决定。
+   */
+  setConfigValue: (controlId: string, value: string) => Promise<void>
   setUltracode: (value: boolean) => void
   bindDocument: (docId: string | null) => Promise<void>
   setDraft: (value: string) => void
@@ -229,6 +267,33 @@ function currentCapability(agents: AgentRegistrationView[], agentId: string | nu
   return agents.find((agent) => agent.id === agentId)?.capability ?? null
 }
 
+/**
+ * 当前通道**真实提供**的授权控制项（能力里 `category === 'permission'` 的那些）。
+ *
+ * 界面只认这一条：有就按它渲染（并允许切换），没有就不许摆一个切不动的档位。
+ * 这是"每个 Agent 工具对应的功能"的落点 —— 上限来自协议，不是本程序的取舍。
+ */
+function permissionControls(state: AgentState): AgentConfigOption[] {
+  const capability = currentCapability(state.agents, state.selectedAgentId)
+  return (capability?.configOptions ?? []).filter((option) => option.category === 'permission')
+}
+
+/**
+ * 实际要发给主进程的档位值：用户拨过的优先，没拨过用能力声明的默认值。
+ *
+ * 一定要**显式带上默认值**，不能留空让适配器自己兜底 ——
+ * 否则界面显示的（默认值）与适配器实际用的（它自己的兜底）可能不是一回事。
+ */
+function effectiveConfigValues(state: AgentState): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const control of permissionControls(state)) {
+    const picked = state.configValues[control.id]
+    const value = picked ?? (typeof control.currentValue === 'string' ? control.currentValue : '')
+    if (value) out[control.id] = value
+  }
+  return out
+}
+
 export const useAgent = create<AgentState>((set, get) => ({
   agents: [],
   selectedAgentId: null,
@@ -237,6 +302,7 @@ export const useAgent = create<AgentState>((set, get) => ({
   configOptions: [],
   contextMode: 'fulltext',
   permissionMode: DEFAULT_PERMISSION_MODE,
+  configValues: {},
   ultracode: false,
   sessionId: null,
   conversationId: null,
@@ -256,10 +322,13 @@ export const useAgent = create<AgentState>((set, get) => ({
   activeModel: null,
   contextUsage: null,
   hydratedFromSnapshot: false,
+  hydrationPending: false,
   initialized: false,
   lastError: null,
   /** 最近一次提问的完整载荷（重试用；会话内记忆，重启后为 null 走退化路径） */
   lastPrompt: null,
+  readAsk: null,
+  readAskDeclined: [],
 
   init: async () => {
     if (get().initialized) return
@@ -283,6 +352,16 @@ export const useAgent = create<AgentState>((set, get) => ({
   },
 
   refreshAgents: async (force = false) => {
+    /**
+     * 每次刷新清单都顺手重判一次"通读提议"（`ensureDocumentRead` 幂等）。
+     *
+     * 探测/刷新可能让"可用 Agent"从无到有，而 agents 数组的**长度不变**（同一条目补上了 capability）——
+     * 组件 effect 里拿 length 当依赖是发现不了这件事的，卡片会一直不出现（本轮实测踩到）。
+     * 所以这条判定挂在"数据变了的唯一入口"上，而不是挂在渲染时机上。
+     */
+    const recheckReadAsk = (): void => {
+      void get().ensureDocumentRead()
+    }
     try {
       let agents = await api.agent.list()
       // 自愈：注册表里有真实 Agent 但都还没有能力信息时，主动探测一次
@@ -293,6 +372,11 @@ export const useAgent = create<AgentState>((set, get) => ({
         agents = await api.agent.list()
       }
       set({ agents })
+      // 快照还在读盘：先别急着"选默认 Agent"（它会落盘，把快照里的选择直接覆盖掉）
+      if (get().hydrationPending) {
+        recheckReadAsk()
+        return
+      }
       const available = agents.filter((agent) => agent.capability?.available)
       const current = get().selectedAgentId
       /**
@@ -304,6 +388,7 @@ export const useAgent = create<AgentState>((set, get) => ({
         if (capability && get().configOptions.length === 0 && (capability.configOptions?.length ?? 0) > 0) {
           set({ configOptions: capability.configOptions })
         }
+        recheckReadAsk()
         return
       }
       if (!current || !available.some((agent) => agent.id === current)) {
@@ -337,6 +422,7 @@ export const useAgent = create<AgentState>((set, get) => ({
         set({ agents: await api.agent.list() })
         void probed
       }
+      recheckReadAsk()
     } catch (error) {
       set({ lastError: error instanceof Error ? error.message : String(error) })
     }
@@ -626,10 +712,59 @@ export const useAgent = create<AgentState>((set, get) => ({
    * （clientCapabilities.fs.writeTextFile），已建立的会话改不回来。
    * 实测形态就是"切到自动档却依然写不了文件"。对话记录保留，下一次提问用新会话。
    */
+  /**
+   * 切一个**该通道自己的**授权档位。
+   *
+   * 两条路，由控制项自己声明（`rebuild`），而不是由"哪家 Agent"决定：
+   *   - `rebuild: false`（Claude Code 的授权模式）→ 在当前会话上直接切（SDK 控制通道
+   *     `setPermissionMode`），对话与上下文都留着；
+   *   - `rebuild: true`（Codex 的审批策略 / 沙箱）→ 协议只在建会话/建线程时认这两个值，
+   *     所以丢掉会话，下一次提问按新值重建（值是 configValues，随快照落盘）。
+   */
+  setConfigValue: async (controlId, value) => {
+    const state = get()
+    const control = permissionControls(state).find((item) => item.id === controlId)
+    if (!control) return
+    set({ configValues: { ...state.configValues, [controlId]: value } })
+    /*
+     * Claude 的授权档位就是它自己的 permissionMode，与我们客户端的放行策略是同一回事：
+     * 一起改，免得"界面显示自动、客户端却还按手动判定"。
+     */
+    if (controlId === 'permissionMode' && isPermissionMode(value)) {
+      set({ permissionMode: value })
+    }
+    const sessionId = state.sessionId
+    if (control.rebuild) {
+      if (sessionId) {
+        set({ sessionId: null })
+        await api.agent.sessionDispose(sessionId).catch(() => undefined)
+      }
+    } else if (sessionId) {
+      try {
+        await api.agent.setConfigOption(sessionId, controlId, value)
+      } catch (error) {
+        // 活动切换失败就退化成"重建会话"，别让用户点了没反应（主进程会写明原因）
+        set({ sessionId: null })
+        await api.agent.sessionDispose(sessionId).catch(() => undefined)
+        notify(error instanceof Error ? error.message : String(error), 'warning')
+      }
+    }
+    await persistAgentState(get)
+  },
+
   setPermissionMode: async (mode) => {
     const next = normalizePermissionMode(mode)
     const previous = get().permissionMode
     if (next === previous) return
+    /**
+     * Claude Code 的授权模式是**它自己的档位** → 交给 setConfigValue 走活动会话切换（不重建）；
+     * 其余通道（ACP / mock 没有原生档位）用的是客户端策略，而能力位是握手时声明死的 → 只能重建。
+     */
+    const own = permissionControls(get()).find((item) => item.id === 'permissionMode')
+    if (own && !own.rebuild) {
+      await get().setConfigValue('permissionMode', next)
+      return
+    }
     const sessionId = get().sessionId
     set({ permissionMode: next, sessionId: null })
     if (sessionId) await api.agent.sessionDispose(sessionId).catch(() => undefined)
@@ -654,22 +789,24 @@ export const useAgent = create<AgentState>((set, get) => ({
       pendingPlan: null,
       activeModel: null,
       contextUsage: null,
-      resolvedModels: []
+      resolvedModels: [],
+      // 询问卡片属于上一份文档：换文档就撤掉，由下面的 ensureDocumentRead 为新文档重新判断
+      readAsk: null
     })
     // 从会话快照恢复 Agent 状态（会话、模式、模型、草稿）
+    set({ hydrationPending: true })
     try {
       const report = await api.session.load()
       const key = docId ?? globalConversationKey
       const saved = report?.snapshot.windows[0]?.agent?.[key]
       logDebug('恢复 Agent 快照 ' + key + '：' + (saved ? '命中（模式=' + String(saved.permissionMode) + '）' : '没有记录'))
-      // 无论命中与否都算"水合过"：没命中就是默认值，也不该被选默认 Agent 的路径再改一次
-      set({ hydratedFromSnapshot: true })
       if (saved) {
         set({
           conversationId: saved.conversationId,
           contextMode: (saved.contextMode as ContextMode) ?? 'fulltext',
           // 旧快照没有 permissionMode：回落到最保守的一档，绝不"继承"一个更宽的授权
           permissionMode: normalizePermissionMode(saved.permissionMode),
+          configValues: saved.configValues ?? {},
           ultracode: saved.ultracode === true,
           selectedAgentId: saved.agentId ?? get().selectedAgentId,
           modelId: saved.modelId ?? get().modelId,
@@ -678,32 +815,91 @@ export const useAgent = create<AgentState>((set, get) => ({
         })
         if (saved.conversationId) await loadMessages(saved.conversationId, set)
       }
+      /**
+       * 快照没给出会话 id（或压根没有这条记录）→ **从库里把这篇文档的默认会话找回来**。
+       *
+       * 文档 ↔ 默认会话的绑定是事实（`conversations.doc_id`），不该只靠会话快照记着：
+       * 快照被清过、换了 profile、或在另一个窗口里通读的，都会让面板"看起来没有默认会话"，
+       * 于是又弹出"是否通读"的询问卡片 —— 而库里明明还躺着那条会话（用户的原话：
+       * "存在默认会话…实现文献和默认对话绑定，直接显示默认对话，没有再提示是否建立默认会话"）。
+       *
+       * 只认**当前 Agent** 建的那条：会话里挂着它自己的远端 session id，
+       * 跨通道借历史是禁止的（见 §1.9「通道之间不许互相借用历史」）。
+       */
+      if (docId && !get().conversationId) {
+        const rows = (await api.store.conversationList(docId).catch(() => [])) as { id?: string; agent_id?: string }[]
+        const agentId = get().selectedAgentId
+        const latest = agentId
+          ? rows.find((row) => row.id && row.agent_id === agentId)
+          : rows.find((row) => row.id)
+        if (latest?.id) {
+          logDebug('默认会话从库里找回：' + latest.id + '（docId=' + docId + '）')
+          set({ conversationId: latest.id })
+          await loadMessages(latest.id, set)
+        }
+      }
     } catch {
       /* 快照不可用时忽略 */
+    } finally {
+      /**
+       * 无论命中与否都算"水合过"，而且必须在这里（finally）落地：
+       * 旧代码写在 try 里，读快照一抛异常这条标记就永远为假 ——
+       * 之后任何一次 `refreshAgents` 都能把恢复出来的档位/模型覆盖回默认值。
+       */
+      set({ hydratedFromSnapshot: true, hydrationPending: false })
     }
     /**
-     * 文档默认会话（用户要求）：打开文档就有一个"通读会话"——首轮把论文作为上下文发给 Agent，
-     * 要一份**总结理解 + 阅读参考**；之后这篇文档的所有提问（解释选中内容等）都默认在这条会话里进行，
+     * 文档默认会话：打开文档时**提议**一轮"通读"——把论文作为上下文发给 Agent 要一份
+     * 总结理解 + 阅读参考；之后这篇文档的所有提问（解释选中内容等）都默认落在这条会话里，
      * Agent 手里始终带着论文上下文。同一篇文档共用一个历史对话；用户手动「新建会话」才另起一条。
+     *
+     * ★ 这里只立询问卡片，**不发送**：是否花掉一次模型调用由用户点「开始通读」决定（FR-7）。
      */
-    void get().ensureDocumentSession()
+    void get().ensureDocumentRead()
   },
 
   /**
-   * 确保文档有默认会话：没有 conversationId 时自动发起首轮"通读"。
-   * 条件全部满足才发（避免误触发）：绑定了文档、文档已解析、有可用 Agent、不在流式中、
-   * 没有待发/挂起的会话、面板已水合过快照（否则恢复逻辑还没跑完）。
+   * 提议"通读全文"：条件全部满足才立卡片（避免误触发）——
+   * 绑定了文档、文档已解析、有可用 Agent、不在流式中、还没有会话、
+   * 面板已水合过快照（否则恢复逻辑还没跑完）、用户没对这篇文档说过"暂不"。
    * 失败（未装 Agent 等）静默退出 —— 面板仍是可用的空会话，用户发第一条消息时自然建会话。
    */
-  ensureDocumentSession: async () => {
+  ensureDocumentRead: async () => {
     const state = get()
-    if (!state.docId || state.conversationId || state.sessionId || state.streaming || state.resumeSessionId) return
-    if (!state.hydratedFromSnapshot) return
+    const docId = state.docId
+    /**
+     * 前置条件有七个，而界面上的表现**全都是"卡片没出现"** ——
+     * 所以这里每一个静默退出都要在日志里留下原因，否则只能靠猜（本轮就靠它定位到"Agent 清单还没到"）。
+     */
+    const skip = (reason: string): void => logDebug('未提议通读：' + reason)
+    if (!docId) return skip('没有绑定文档')
+    if (state.conversationId || state.sessionId) return skip('会话已存在')
+    if (state.streaming) return skip('正在流式输出')
+    if (state.readAsk?.docId === docId) return skip('已经提议过')
+    if (state.readAskDeclined.includes(docId)) return skip('用户已选「暂不」')
+    if (!state.hydratedFromSnapshot) return skip('会话快照还没水合')
     const { useDocuments } = await import('./documents.store')
-    const model = useDocuments.getState().models[state.docId] ?? null
-    if (!model || model.text.trim().length < 200) return
+    const model = useDocuments.getState().models[docId] ?? null
+    if (!model) return skip('文档模型未就绪')
+    if (model.text.trim().length < 200) return skip('文档太短（' + model.text.trim().length + ' 字）')
     const capability = currentCapability(state.agents, state.selectedAgentId)
-    if (!capability?.available) return
+    if (!capability?.available) return skip('没有可用的 Agent（当前选择：' + String(state.selectedAgentId) + '）')
+    set({ readAsk: { docId, title: model.title } })
+    logDebug('已提议通读《' + model.title + '》')
+  },
+
+  /**
+   * 用户点了「开始通读」：把全文上下文与那轮提问真正发出去。
+   * 走的是与其它提问完全相同的 `send()` —— 于是授权模式、会话建立、对话入图这些链路一条都不用另写。
+   */
+  startDocumentRead: async () => {
+    const ask = get().readAsk
+    const docId = ask?.docId ?? get().docId ?? null
+    set({ readAsk: null })
+    if (!docId) return
+    const { useDocuments } = await import('./documents.store')
+    const model = useDocuments.getState().models[docId] ?? null
+    if (!model) return
     const locale = currentLocale()
     const zh = locale === 'zh-CN'
     const question = zh
@@ -726,6 +922,13 @@ export const useAgent = create<AgentState>((set, get) => ({
     })
   },
 
+  /** 用户点了「暂不」：收起卡片，并记下这篇文档（本次运行里不再提议） */
+  dismissDocumentRead: async () => {
+    const ask = get().readAsk
+    if (!ask) return
+    set({ readAsk: null, readAskDeclined: [...get().readAskDeclined, ask.docId] })
+  },
+
   setDraft: (value) => {
     set({ draft: value })
     void persistAgentState(get)
@@ -742,7 +945,10 @@ export const useAgent = create<AgentState>((set, get) => ({
       permissionNotes: [],
       checkpoints: [],
       streaming: false,
-      contextUsage: null
+      contextUsage: null,
+      readAsk: null,
+      // 「新建会话」是明确的"重开一轮"意图：把这篇文档的"暂不"清掉，可以再提议通读
+      readAskDeclined: get().readAskDeclined.filter((id) => id !== get().docId)
     })
     await persistAgentState(get)
   },
@@ -787,7 +993,7 @@ export const useAgent = create<AgentState>((set, get) => ({
       createdAt: Date.now(),
       status: 'streaming'
     }
-    set({ messages: [...state.messages, userMessage, assistantMessage], streaming: true, draft: '' })
+    set({ messages: [...state.messages, userMessage, assistantMessage], streaming: true, draft: '', readAsk: null })
     // 记下这次提问的完整载荷：失败后"重试"要原样重发（含选区上下文与位置头），而不是只重发干巴巴的问题文本
     set({
       lastPrompt: {
@@ -811,6 +1017,8 @@ export const useAgent = create<AgentState>((set, get) => ({
           modelId: state.modelId,
           thinkingEffort: state.thinkingEffort,
           permissionMode: state.permissionMode,
+          // 通道自己的档位（Codex 的 approvalPolicy / sandbox）：适配器建线程时要用
+          configValues: effectiveConfigValues(state),
           // 续聊：把用户选中的历史会话 id 传给 SDK 的 resume；分叉时同时带 forkSession
           resumeSessionId: options?.forkFrom ?? state.resumeSessionId,
           forkSession: Boolean(options?.forkFrom),
@@ -1288,6 +1496,7 @@ async function persistAgentState(get: () => AgentState): Promise<void> {
               conversationId: state.conversationId,
               contextMode: state.contextMode,
               permissionMode: state.permissionMode,
+              configValues: state.configValues,
               ultracode: state.ultracode,
               nodeId: null,
               agentId: state.selectedAgentId,

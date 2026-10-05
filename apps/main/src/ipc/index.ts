@@ -1,8 +1,8 @@
 /** IPC 路由注册：渲染进程只能通过这些白名单通道访问主进程能力。 */
 import { app, BrowserWindow, dialog, nativeTheme, shell } from 'electron'
 import { CH, FILE_FILTERS } from '@logicreader/shared'
-import type { AnchorRecord, AnnotationRecord, BlockRecord, DocumentRecord, LogEntry, PermissionMode } from '@logicreader/shared'
-import { assertArray, assertNumber, assertObject, assertPath, assertString, broadcast, handle, logMain } from '../util/ipc'
+import type { AnchorRecord, AnnotationRecord, BlockRecord, DocumentRecord, EditAction, LogEntry, PermissionMode } from '@logicreader/shared'
+import { assertArray, assertNumber, assertObject, assertPath, assertString, broadcast, handle, isPlainStringRecord, logMain } from '../util/ipc'
 import { fsService } from '../services/fs.service'
 import { settingsService } from '../services/settings.service'
 import { sessionService } from '../services/session.service'
@@ -110,6 +110,22 @@ export function registerIpc(ctx: IpcContext): void {
     if (!win) return
     const clamped = Math.min(2, Math.max(0.6, value))
     win.webContents.setZoomFactor(clamped)
+  })
+
+  /*
+   * 编辑菜单：走 Electron 的 webContents 角色命令。
+   *
+   * 渲染进程侧的 `document.execCommand('undo'|'cut'|'paste'|…)` 是废弃 API，
+   * 其中 `paste` 在 Chromium 里没有实现 —— 菜单项按下去毫无反应（用户报的就是这个）。
+   * 白名单动作，只作用在窗口自己的 webContents 上。
+   */
+  handle(CH.app.edit, (event, action) => {
+    const name = assertString(action, 'action')
+    const allowed: EditAction[] = ['undo', 'redo', 'cut', 'copy', 'paste', 'selectAll']
+    if (!allowed.includes(name as EditAction)) throw new Error('不支持的编辑动作：' + name)
+    const win = ctx.getWindow()
+    if (!win || win.webContents.id !== event.sender.id) return
+    win.webContents[name as EditAction]()
   })
 
   // ------------------------------------------------------------- window
@@ -248,6 +264,10 @@ export function registerIpc(ctx: IpcContext): void {
     storeService.saveBlocks(assertString(docId, 'docId'), assertArray(blocks, 'blocks') as unknown as BlockRecord[])
   })
   handle(CH.store.getBlocks, (_e, docId) => storeService.getBlocks(assertString(docId, 'docId')))
+  // 跨文档全文检索：limit 由渲染进程给（结果面板要显示多少条），缺省交给 store 自己兜
+  handle(CH.store.searchBlocks, (_e, query, limit) =>
+    storeService.searchBlocks(assertString(query, 'query'), typeof limit === 'number' ? limit : undefined)
+  )
   handle(CH.store.saveAnchors, (_e, anchors) => {
     storeService.saveAnchors(assertArray(anchors, 'anchors') as unknown as AnchorRecord[])
   })
@@ -366,7 +386,9 @@ export function registerIpc(ctx: IpcContext): void {
       forkSession: obj.forkSession === true,
       resumeSessionAt: obj.resumeSessionAt == null ? null : String(obj.resumeSessionAt),
       documentDir: obj.documentDir == null ? null : String(obj.documentDir),
-      permissionMode: obj.permissionMode == null ? null : (String(obj.permissionMode) as PermissionMode)
+      permissionMode: obj.permissionMode == null ? null : (String(obj.permissionMode) as PermissionMode),
+      // 通道自己的档位（Codex 的 approvalPolicy / sandbox）：只收字符串键值，其余忽略
+      configValues: isPlainStringRecord(obj.configValues) ? obj.configValues : undefined
     })
   })
   handle(CH.agent.revertHunks, (_e, sessionId, toolUseId, indices) =>

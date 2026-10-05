@@ -5,7 +5,7 @@
  */
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import type {
-  AnchorRecord, AnnotationRecord, BlockRecord, DocumentRecord
+  AnchorRecord, AnnotationRecord, BlockRecord, DocumentRecord, SearchHit
 } from '@logicreader/shared'
 import { emptyStats, type EdgeKind, type GraphEdge, type GraphNode, type LogicGraph, type NodeKind } from '@logicreader/graph-schema'
 import { logMain } from '../util/ipc'
@@ -177,6 +177,36 @@ const SCHEMA = [
   )`
 ]
 
+/**
+ * 库级全文检索索引（跨文档搜索）。
+ *
+ * 为什么用 FTS5 而不是继续 `indexOf`：文档内查找可以在内存里扫，但"在所有打开过的文档里找一句话"
+ * 只能靠索引 —— 把每个块都读进内存再扫一遍，文档一多就不可用。
+ *
+ * 为什么是 **trigram** 分词而不是默认的 unicode61：`unicode61` 会把一整串汉字当成**一个词**
+ * （"逻辑阅读器"是一个 token），查"逻辑"就查不到；trigram 按三字滑窗建索引，得到的是**子串匹配**，
+ * 中英文都能用 —— 也正好与用户已有的"文档内查找"手感一致（那里就是子串匹配）。
+ *
+ * 独立表（不是 external-content）：`saveBlocks` 本来就是"先删后插"整篇重写，
+ * 这里跟着同一套动作同步，比挂触发器更好推理；而且 `block_id`/`doc_id`/`seq` 都存进来，
+ * 命中后不必再回表取这几列。
+ */
+const FTS_SCHEMA = [
+  `CREATE VIRTUAL TABLE IF NOT EXISTS blocks_fts USING fts5(
+    block_id UNINDEXED,
+    doc_id   UNINDEXED,
+    seq      UNINDEXED,
+    text,
+    tokenize = 'trigram'
+  )`
+]
+
+/**
+ * trigram 索引最短只能匹配 3 个字符：比这短的词（"AI"、"熵"）走 LIKE 扫描兜底，
+ * 否则用户会发现"两个字就是搜不到"——而这正是中文里最常见的情况。
+ */
+const FTS_MIN_QUERY = 3
+
 function str(v: unknown): string {
   return typeof v === 'string' ? v : v == null ? '' : String(v)
 }
@@ -209,6 +239,8 @@ export class StoreService {
   private db: Db | null = null
   private file = ''
   private usingFallback = false
+  /** FTS5 全文索引是否可用（不可用时跨文档检索退回逐行扫描） */
+  private ftsReady = false
 
   open(file: string): void {
     this.file = file
@@ -232,6 +264,7 @@ export class StoreService {
        * 旧库补列后历史消息 summary 为 NULL，回放退回显示 content。
        */
       ensureColumn(this.db, 'messages', 'summary', 'TEXT')
+      this.ftsReady = this.initFts(this.db)
       logMain('info', 'store', 'SQLite 主库已就绪：' + file)
     } catch (error) {
       this.db = null
@@ -242,6 +275,45 @@ export class StoreService {
 
   backendName(): 'sqlite' | 'json' {
     return this.db ? 'sqlite' : 'json'
+  }
+
+  /**
+   * 建全文索引，并做一次**自证式回填**。
+   *
+   * 为什么必须回填：索引是派生数据。老库升级上来时 `blocks` 里已经有几百篇文档的分块，
+   * 而 `blocks_fts` 是刚建的、空的 —— 不回填的话"搜什么都搜不到"，而且**不报错**。
+   * 判据用行数比对（派生数据必须能自证）：对不上就整批重建，与"锚点/文本层映射"同一套思路。
+   *
+   * 返回索引是否可用；建表失败（运行环境没编 FTS5）时返回 false，检索退回逐行扫描而不是静默失效。
+   */
+  private initFts(db: Db): boolean {
+    try {
+      for (const sql of FTS_SCHEMA) db.exec(sql)
+    } catch (error) {
+      logMain('warn', 'store', 'FTS5 不可用，跨文档检索退回逐行扫描', String(error))
+      return false
+    }
+    try {
+      const blocks = db.prepare('SELECT count(*) AS n FROM blocks').get() as { n?: number } | undefined
+      const indexed = db.prepare('SELECT count(*) AS n FROM blocks_fts').get() as { n?: number } | undefined
+      if (num(blocks?.n) !== num(indexed?.n)) {
+        this.rebuildFts(db)
+        logMain('info', 'store', '全文索引行数与 blocks 不一致，已整批重建')
+      }
+    } catch (error) {
+      logMain('warn', 'store', '全文索引自检失败，整批重建', String(error))
+      this.rebuildFts(db)
+    }
+    return true
+  }
+
+  /** 从 blocks 整批重建全文索引（首次建索引、自检不过、或索引写坏时用）。 */
+  private rebuildFts(db: Db): void {
+    db.exec('DELETE FROM blocks_fts')
+    db.exec(
+      `INSERT INTO blocks_fts (block_id, doc_id, seq, text)
+       SELECT id, doc_id, seq, text FROM blocks`
+    )
   }
 
   private requireDb(): Db {
@@ -290,6 +362,7 @@ export class StoreService {
     }
     const db = this.requireDb()
     db.prepare('DELETE FROM blocks WHERE doc_id = ?').run(id)
+    if (this.ftsReady) db.prepare('DELETE FROM blocks_fts WHERE doc_id = ?').run(id)
     db.prepare('DELETE FROM anchors WHERE doc_id = ?').run(id)
     db.prepare('DELETE FROM annotations WHERE doc_id = ?').run(id)
     db.prepare('DELETE FROM documents WHERE id = ?').run(id)
@@ -312,6 +385,16 @@ export class StoreService {
       )
       for (const b of blocks) {
         stmt.run(b.id, b.docId, b.seq, b.kind, b.level, b.text, b.charStart, b.charEnd, b.locatorJson, b.parentId)
+      }
+      /**
+       * 全文索引与 blocks 在**同一个事务**里同步：索引必须与正文同源，
+       * 否则会出现"检索命中了一个已经不存在（或已改写）的块"，点进去跳转落空。
+       * 整篇重写的代价可以接受 —— saveBlocks 本来就是"先删后插"。
+       */
+      if (this.ftsReady) {
+        db.prepare('DELETE FROM blocks_fts WHERE doc_id = ?').run(docId)
+        const ftsStmt = db.prepare('INSERT INTO blocks_fts (block_id, doc_id, seq, text) VALUES (?,?,?,?)')
+        for (const b of blocks) ftsStmt.run(b.id, b.docId, b.seq, b.text)
       }
       db.exec('COMMIT')
     } catch (error) {
@@ -340,6 +423,110 @@ export class StoreService {
           parentId: row.parent_id == null ? null : str(row.parent_id)
         } satisfies BlockRecord
       })
+  }
+
+  /**
+   * 跨文档全文检索：在**所有打开过的文档**里找一段文字。
+   *
+   * 三条路径，优先级从好到兜底，但**结果形状完全一致**（调用方不需要知道走的是哪条）：
+   *   ① FTS5 trigram 索引（最短 3 字符）—— 默认路径；
+   *   ② 查询词太短（"AI"、"熵"）时，FTS5 的 trigram 索引根本建不出匹配项，退回 LIKE 扫描；
+   *   ③ 整个 SQLite 后端都不可用（JSON 降级模式）时，在内存里扫。
+   * 之所以短词要单独兜底而不是让它静默返回空：两个字的中文词太常见了，
+   * "搜不到还不报错"是最难排查的一类问题。
+   */
+  searchBlocks(query: string, limit = 50): SearchHit[] {
+    const q = query.trim()
+    if (q.length === 0 || limit <= 0) return []
+    const needle = q.toLowerCase()
+
+    /** 命中位置用于把结果滚到正文里的那一处；大小写不敏感，与文档内查找同一口径。 */
+    const toHit = (row: Record<string, unknown>): SearchHit => {
+      const text = str(row.text)
+      return {
+        docId: str(row.doc_id),
+        docTitle: str(row.doc_title),
+        docPath: str(row.doc_path),
+        blockId: str(row.block_id),
+        blockKind: str(row.block_kind),
+        seq: num(row.seq),
+        text,
+        charStart: num(row.char_start),
+        charEnd: num(row.char_end),
+        matchStart: text.toLowerCase().indexOf(needle)
+      }
+    }
+
+    if (!this.db) {
+      const state = this.fallbackRead()
+      const hits: SearchHit[] = []
+      for (const block of state.blocks) {
+        if (!block.text.toLowerCase().includes(needle)) continue
+        const doc = state.documents.find((d) => d.id === block.docId)
+        hits.push(
+          toHit({
+            block_id: block.id,
+            doc_id: block.docId,
+            doc_title: doc?.title ?? '',
+            doc_path: doc?.path ?? '',
+            block_kind: block.kind,
+            seq: block.seq,
+            text: block.text,
+            char_start: block.charStart,
+            char_end: block.charEnd
+          })
+        )
+        if (hits.length >= limit) break
+      }
+      return hits
+    }
+
+    const db = this.requireDb()
+    if (this.ftsReady && q.length >= FTS_MIN_QUERY) {
+      /**
+       * 把用户输入整体当作**一个短语**（双引号包裹、内部引号转义）：
+       * FTS5 的查询串有自己的语法（AND / OR / NEAR / 前缀 * / 列限定），
+       * 用户随手输入的括号或减号会被当成语法，轻则结果诡异、重则直接抛错。
+       * 用引号包起来就只剩"找这段连续文字"一种含义，也正好是子串匹配。
+       */
+      const phrase = '"' + q.replace(/"/g, '""') + '"'
+      const rows = db
+        .prepare(
+          `SELECT blocks_fts.block_id AS block_id,
+                  blocks_fts.doc_id   AS doc_id,
+                  blocks_fts.seq      AS seq,
+                  blocks_fts.text     AS text,
+                  b.char_start AS char_start,
+                  b.char_end   AS char_end,
+                  b.kind       AS block_kind,
+                  d.title      AS doc_title,
+                  d.path       AS doc_path
+             FROM blocks_fts
+             JOIN blocks    b ON b.id = blocks_fts.block_id
+             JOIN documents d ON d.id = blocks_fts.doc_id
+            WHERE blocks_fts MATCH ?
+            ORDER BY bm25(blocks_fts)
+            LIMIT ?`
+        )
+        .all(phrase, limit)
+      return rows.map((r) => toHit(r as Record<string, unknown>))
+    }
+
+    // LIKE 兜底：`\` `%` `_` 是 LIKE 的通配符，必须转义，否则用户输入的 % 会变成"匹配任意"，结果全中
+    const like = '%' + q.replace(/[\\%_]/g, (c) => '\\' + c) + '%'
+    const rows = db
+      .prepare(
+        `SELECT b.id AS block_id, b.doc_id AS doc_id, b.seq AS seq, b.text AS text,
+                b.char_start AS char_start, b.char_end AS char_end, b.kind AS block_kind,
+                d.title AS doc_title, d.path AS doc_path
+           FROM blocks b
+           JOIN documents d ON d.id = b.doc_id
+          WHERE b.text LIKE ? ESCAPE '\\'
+          ORDER BY b.doc_id, b.seq
+          LIMIT ?`
+      )
+      .all(like, limit)
+    return rows.map((r) => toHit(r as Record<string, unknown>))
   }
 
   // --------------------------------------------------------------- anchors

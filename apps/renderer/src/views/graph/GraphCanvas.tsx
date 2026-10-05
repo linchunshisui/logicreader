@@ -78,6 +78,19 @@ function GraphCanvasInner({ docId }: { docId: string }): JSX.Element {
   const activeTab = tabs.groups.flatMap((group) => group.tabs).find((tab) => tab.kind === 'graph' && tab.docId === docId)
 
   /**
+   * 两个可折叠浮层的展开状态（质量报告 / 图例）。
+   *
+   * 存在标签的 view 里 → 跟会话快照一起落盘，用户上次怎么摆的，下次打开还是那样。
+   * 默认**都收起**：三个浮层全开时画布中央被压掉一大块（用户报的"三层浮层全开"）。
+   */
+  const graphTab = activeTab && activeTab.kind === 'graph' ? activeTab : null
+  const overlays = graphTab?.view.overlays ?? { quality: false, legend: false }
+  const toggleOverlay = (key: 'quality' | 'legend', value: boolean): void => {
+    if (!graphTab) return
+    useTabs.getState().updateGraphView(graphTab.id, { overlays: { ...overlays, [key]: value } })
+  }
+
+  /**
    * 标签标题 = "文档名 · 逻辑关系图"。
    * 会话恢复回来的旧标签（那时还叫"关系图"）、以及运行中切换界面语言，
    * 都在这里对齐一次 —— 标题是用户分辨"这张图属于哪篇论文"的唯一线索。
@@ -361,7 +374,7 @@ function GraphCanvasInner({ docId }: { docId: string }): JSX.Element {
         </div>
       ) : (
         <>
-          <QualityReport />
+          <QualityReport open={overlays.quality} onToggle={(value) => toggleOverlay('quality', value)} />
           <div className="lr-graph__canvas">
             <ReactFlow
               nodes={nodes}
@@ -443,7 +456,7 @@ function GraphCanvasInner({ docId }: { docId: string }): JSX.Element {
               />
               <Controls showInteractive={false} />
             </ReactFlow>
-            <GraphLegend />
+            <GraphLegend open={overlays.legend} onToggle={(value) => toggleOverlay('legend', value)} />
             <NodeInspector
               onJump={(anchorIds, kind, context) => void jumpToAnchor(anchorIds, kind, context)}
               onFocus={(node: GraphNode) => {

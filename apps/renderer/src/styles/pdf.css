@@ -186,29 +186,36 @@
   background: var(--vscode-sideBar-background);
 }
 
-.lr-pdf-rail__tabs {
+/*
+ * 侧栏里的"块"：缩略图 / 标注各是一块，**可以同时存在**（用户要求），
+ * 所以不是页签而是上下排列的两块，各自滚动、各自能关。
+ * 只开一块时它会占满整条高度（flex: 1 1 0 在只有一个子项时自然撑满）。
+ */
+.lr-pdf-rail__section {
   display: flex;
-  gap: 2px;
-  padding: 4px 6px;
+  flex-direction: column;
+  flex: 1 1 0;
+  min-height: 0;
+}
+
+.lr-pdf-rail__section + .lr-pdf-rail__section {
+  border-top: 1px solid var(--vscode-sideBar-border);
+}
+
+.lr-pdf-rail__section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  flex: 0 0 auto;
+  padding: 2px 2px 2px 8px;
+  font-size: var(--lr-fs-xs);
+  color: var(--vscode-sideBar-foreground);
+  opacity: 0.9;
   border-bottom: 1px solid var(--vscode-sideBar-border);
 }
 
-.lr-pdf-rail__tab {
-  flex: 1;
-  padding: 3px 4px;
-  font-size: var(--lr-fs-xs);
-  border-radius: var(--lr-radius);
-  color: var(--vscode-sideBar-foreground);
-  opacity: 0.75;
-}
-
-.lr-pdf-rail__tab[data-active='true'] {
-  background: var(--vscode-list-activeSelectionBackground);
-  color: var(--vscode-list-activeSelectionForeground);
-  opacity: 1;
-}
-
-.lr-pdf-rail__body {
+.lr-pdf-rail__section-body {
   flex: 1;
   min-height: 0;
   overflow: auto;
@@ -280,6 +287,18 @@
   padding: 1px 6px;
 }
 
+/* 查找条：折叠态只占一个图标，展开后是一整组（计数 + 上下 + 关闭） */
+.lr-reader__find-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* 视图模式下拉：三种模式的名字都是两三个字，别让它无限拉宽工具栏 */
+.lr-reader__viewmode {
+  max-width: 104px;
+}
+
 .lr-pdf-flash-indicator {
   position: absolute;
   right: 16px;
@@ -321,6 +340,49 @@
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: none;
+  /*
+   * 工具栏自己做容器：阅读区被两侧面板挤到多窄，工具栏就退化多少。
+   * 实测 960px 窗口 + 侧栏(280) + 辅助栏(430) 时阅读区只剩 202px ——
+   * 再多的「收进更多菜单」也救不了，只能按**自身宽度**逐档收起次要分组。
+   */
+  container-type: inline-size;
+  container-name: reader-toolbar;
+}
+
+/*
+ * 逐档退化（窄 → 宽）：标注组 → 视图模式 → 适应宽度/页面 → 缩放 → 页码输入。
+ * 收起的每一项都能从命令面板调到（下划线/删除线/单页/连续/双页/缩放都有命令），
+ * 「更多」菜单里也放了标注与视图模式，所以不存在"收起来就找不到了"。
+ */
+@container reader-toolbar (max-width: 620px) {
+  .lr-reader__toolbar [data-group='annotate'] {
+    display: none;
+  }
+}
+
+@container reader-toolbar (max-width: 520px) {
+  .lr-reader__toolbar [data-group='viewmode'] {
+    display: none;
+  }
+}
+
+@container reader-toolbar (max-width: 430px) {
+  .lr-reader__toolbar [data-group='zoomfit'] {
+    display: none;
+  }
+}
+
+@container reader-toolbar (max-width: 340px) {
+  .lr-reader__toolbar [data-group='zoom'],
+  .lr-reader__toolbar .lr-zoom-input {
+    display: none;
+  }
+}
+
+@container reader-toolbar (max-width: 300px) {
+  .lr-reader__toolbar [data-group='page'] {
+    display: none;
+  }
 }
 
 .lr-reader__toolbar::-webkit-scrollbar {

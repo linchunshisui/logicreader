@@ -3,7 +3,10 @@ import {
   classifyPermission,
   decidePermission,
   findDangerousPattern,
+  defaultControlValues,
   normalizePermissionMode,
+  permissionControlsOf,
+  policyFromControls,
   permissionEvidence,
   permissionModeReminder,
   type PermissionMode
@@ -136,5 +139,78 @@ describe('模式解析与提示词', () => {
     expect(permissionModeReminder('auto', 'zh-CN')).toContain('自动')
     expect(permissionModeReminder('manual', 'zh-CN')).toBeNull()
     expect(permissionModeReminder('edit', 'en-US')).toContain('edit')
+  })
+})
+
+/**
+ * 各通道自己的档位 → 客户端放行策略的折算。
+ *
+ * 这层之所以必须有：界面拨的是各协议自己的旋钮（Claude 的授权模式 / Codex 的审批策略+沙箱），
+ * 而 `decidePermission` 与握手能力位只认客户端策略这一套。折算错了，就会出现
+ * "界面选了只读、我们却还放行写入"这种只在真机上才暴露的错。
+ */
+describe('policyFromControls：协议档位 → 客户端策略', () => {
+  it('Claude Code：控制项本身就是那四个档，一一对应', () => {
+    expect(policyFromControls('sdk', 'manual', { permissionMode: 'plan' })).toBe('plan')
+    expect(policyFromControls('sdk', 'auto', { permissionMode: 'edit' })).toBe('edit')
+    expect(policyFromControls('claude-code', 'manual', { permissionMode: 'auto' })).toBe('auto')
+  })
+
+  it('Claude Code：控制项缺值时回落到客户端策略；值非法时 **fail closed**', () => {
+    expect(policyFromControls('sdk', 'edit', {})).toBe('edit')
+    // 值非法 → 不许"沿用更宽的客户端策略"，回落到最保守的一档（与 normalizePermissionMode 同一口径）：
+    // 授权判定宁可多问一次，也不能因为一个读不懂的值就自动放行。
+    expect(policyFromControls('sdk', 'auto', { permissionMode: 'nonsense' })).toBe('manual')
+  })
+
+  it('Codex：沙箱只读时不许改任何东西（等价于 plan）', () => {
+    expect(policyFromControls('codex', 'auto', { sandbox: 'read-only', approvalPolicy: 'on-request' })).toBe('plan')
+    expect(policyFromControls('app-server', 'auto', { sandbox: 'read-only' })).toBe('plan')
+  })
+
+  it('Codex：可写 + 每次都问 → manual；可写 + 按需放行 → edit', () => {
+    expect(policyFromControls('codex', 'auto', { sandbox: 'workspace-write', approvalPolicy: 'untrusted' })).toBe('manual')
+    expect(policyFromControls('codex', 'manual', { sandbox: 'workspace-write', approvalPolicy: 'on-request' })).toBe('edit')
+  })
+
+  it('Codex：两个值都缺时按可写 + 按需放行（与适配器的兜底一致）', () => {
+    expect(policyFromControls('codex', 'manual', {})).toBe('edit')
+  })
+
+  it('ACP / mock 没有档位：直接用界面上的客户端放行策略', () => {
+    expect(policyFromControls('acp', 'auto', {})).toBe('auto')
+    expect(policyFromControls('mock', 'plan', { permissionMode: 'auto' })).toBe('plan')
+  })
+})
+
+describe('permissionControlsOf：每个通道真实提供什么', () => {
+  it('Claude Code 有授权模式且可活动会话切换（不重建）', () => {
+    const controls = permissionControlsOf('sdk')
+    expect(controls.map((control) => control.id)).toEqual(['permissionMode'])
+    expect(controls[0].rebuild).toBe(false)
+    expect(controls[0].options.map((option) => option.value)).toEqual(['manual', 'edit', 'plan', 'auto'])
+  })
+
+  it('Codex 有审批策略 + 沙箱两项，且都必须重建线程', () => {
+    const controls = permissionControlsOf('codex')
+    expect(controls.map((control) => control.id)).toEqual(['approvalPolicy', 'sandbox'])
+    expect(controls.every((control) => control.rebuild)).toBe(true)
+    expect(controls[1].options.map((option) => option.value)).toEqual(['read-only', 'workspace-write'])
+  })
+
+  it('ACP（DeepSeek Harness）与 mock **一项都没有** —— 别给它们造档位', () => {
+    expect(permissionControlsOf('acp')).toEqual([])
+    expect(permissionControlsOf('mock')).toEqual([])
+  })
+
+  it('默认值取**显式声明**的那一项（不是列表第一项）', () => {
+    expect(defaultControlValues(permissionControlsOf('sdk'))).toEqual({ permissionMode: 'manual' })
+    // Codex 的沙箱默认 workspace-write：列表里 read-only 排第一只是展示顺序，
+    // 默认成只读会把"能写但要批"悄悄降级成"根本写不了"（用户还没法用卡片批准）
+    expect(defaultControlValues(permissionControlsOf('codex'))).toEqual({
+      approvalPolicy: 'untrusted',
+      sandbox: 'workspace-write'
+    })
+    expect(defaultControlValues(permissionControlsOf('acp'))).toEqual({})
   })
 })

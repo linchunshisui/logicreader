@@ -14,9 +14,9 @@
     "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.web.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "build:win": "electron-vite build && node scripts/copy-claude-cli.mjs && electron-builder --win --config electron-builder.yml",
-    "build:win:full": "cross-env LR_FULL=1 electron-vite build && node scripts/copy-claude-cli.mjs && electron-builder --win --config electron-builder.yml",
-    "build:unpack": "electron-vite build && node scripts/copy-claude-cli.mjs && electron-builder --win --dir --config electron-builder.yml",
+    "build:win": "electron-vite build && electron-builder --win --config electron-builder.yml",
+    "build:win:full": "cross-env LR_FULL=1 electron-vite build && electron-builder --win --config electron-builder.yml",
+    "build:unpack": "electron-vite build && electron-builder --win --dir --config electron-builder.yml",
     "trust:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/trust-windows.ps1",
     "launch:doctor": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/launch-doctor.ps1",
     "shortcut": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/make-shortcut.ps1",
@@ -30,6 +30,7 @@
   },
   "devDependencies": {
     "@agentclientprotocol/sdk": "^1.5.1",
+    "@e965/xlsx": "^0.20.3",
     "@types/d3-force": "^3.0.10",
     "@types/node": "^24.10.1",
     "@types/react": "^19.2.2",
@@ -49,15 +50,12 @@
     "immer": "^11.1.18",
     "jszip": "^3.10.2",
     "katex": "^0.18.9",
-    "mammoth": "^1.13.0",
-    "monaco-editor": "^0.57.0",
     "pdf-lib": "^1.17.1",
     "pdfjs-dist": "^6.3.289",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "react-i18next": "^17.0.15",
     "react-markdown": "^10.1.0",
-    "react-resizable-panels": "^4.14.1",
     "rehype-katex": "^7.0.1",
     "remark-gfm": "^4.0.1",
     "remark-parse": "^11.0.0",
@@ -67,15 +65,13 @@
     "unist-util-visit": "^5.0.0",
     "vite": "^7.3.6",
     "vitest": "^3.2.4",
-    "xlsx": "^0.18.5",
     "zustand": "^5.0.15"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
       "electron",
       "esbuild",
-      "electron-winstaller",
-      "better-sqlite3"
+      "electron-winstaller"
     ]
   }
 }

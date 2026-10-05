@@ -50,6 +50,9 @@ DOM 选区
 - **必须能自证**：任何持久化的派生数据（映射 / 锚点 / 缓存）在使用前抽样校验，不通过就整批丢弃并现算。
 - **必须带版本**：改算法也要 +1，不能只靠"文本指纹"（文本没变、算法变了同样会错）。
 - **坐标与内容同源**：不允许"位置来自 A 份数据、文字区间来自 B 份数据"。
+- **全文索引跟着正文走同一个事务**：`blocks_fts` 是派生数据，`saveBlocks` 在**同一事务**里删旧插新，
+  否则会出现"检索命中一个已改写或不存在的块"，点进去跳转落空。老库升级（索引空、`blocks` 非空）
+  由**行数比对**自证并整批重建（`store.service.ts:initFts`）—— 不回填的表现是"搜什么都搜不到"且不报错。
 
 ### 1.4 跨视图定位（跳转）
 | 不变量 | 判据 |
@@ -119,6 +122,7 @@ DOM 选区
 | **Agent 的输出一律按 markdown 渲染** | 模型回的就是 markdown：正文（本轮结束态）与**计划卡片**都走 `AgentMarkdown`（remark-gfm + rehype-katex + 懒加载 Shiki，与阅读器同一套插件，**不启用 HTML 直通**、外链走系统浏览器）。原来是原样输出源码 —— 用户看到的是 `### 标题`、`| 表头 |`、`**加粗**`。流式过程中保持纯文本（token 级增量下每字重解析 markdown 是白烧 CPU），`done` 时换成渲染版 |
 | **计划模式不是"每条回复都要审批"** | 计划档的约束是"别乱动东西"，不是"每次走一遍审批流程"：`planModeReminder` 要求模型**先判断任务是否需要计划**（只读问题直接答）；渲染进程的兜底也只在回答**确实像方案**时才弹卡片（`looksLikePlan`：太短不算 / 有方案小标题算 / ≥3 条分步且出现"步骤·阶段·先…再"才算）。旧行为是"本轮一结束就把最后一段当方案"，用户的原话是"死板" |
 | 计划卡片里的按钮**不许写死厂商名** | "让 XXX 继续完善"里的名字取自当前选中的 Agent（`displayName`）。实测踩过：面板里跑的是 DeepSeek Harness，按钮却写着"让 Claude 继续完善" |
+| **历史会话的"核心诉求"必须先摘掉我们注入的前导块** | 回放读的是 **Agent 自己的报文日志**，那里的"用户消息"是我们拼好的 `systemContext + '\n\n' + 问题`（拼装见 `services/agent/sdk.ts` 的 `prompt`），于是开头就是授权模式提醒 / 引用位置 / 引用原文。提炼走 `askFlow.stripInjectedPreamble`：短块按空行切掉，大块（全文/摘要/子图/历史）取最后一段（提问总在最末尾）。判据：`tests/core-intent.test.ts` + 冒烟 `smoke.assertHistoryReplay`（在**真日志**上验证，上游改拼装形状会立刻变红） |
 | **历史会话要给"人能看懂的名字"** | 命名优先级只有一份实现（`services/agent/session-title.ts` 的 `resolveSessionTitle`）：用户手改/AI 总结（`session_titles` 表，最高）→ Agent 自己给的标题 → 我们自己记的首条提问（`conversations.remote_session_id` 关联）→ Agent 给的首条提问。全都没有就显示"未命名会话 · 短 id"，**不许把整串 UUID 摆出来** |
 | **dsh 的标题与第一句提问要从它自己的日志读** | ACP 的 `session/list` **只回 sessionId + cwd**（实测 0.2.0-rc.2），但 dsh 把 `session/title`（含 LLM 生成的那份）与 `user/message` 写在 `~/.dsh/sessions/**/<id>/session.v4.jsonl.zstd`。那份日志是**多帧拼接**的 zstd，Node 只解第一帧 —— 按魔数 `28 B5 2F FD` 切帧逐个解，并且**只读开头 512KB**（标题与第一句在头几条记录里）。实现见 `services/agent/dsh-session-log.ts`，有单测 |
 | **通道之间不许互相"借用"历史** | ACP 列表拿不到就到此为止（空列表 + warn），**不要**落回 SDK 的 `listSessions` —— 实测会把另一个工具（Claude Code）的会话列在 dsh 名下，用户看到一堆毫不相干的条目。顺带：我们自己的内部任务（图谱抽取这类 `runOnce`）也会被 CLI 存成会话，历史列表里要按提示词特征**滤掉**（`isInternalSession`） |
@@ -127,6 +131,11 @@ DOM 选区
 | 换 Agent = **换通道**：先释放旧会话 | `selectAgent` 必须先 `sessionDispose` 旧会话（SDK / app-server 都是**常驻**子进程，只把 sessionId 置空会留下一个不走的进程），再清掉会话态（消息 / 模型清单 / 命令 / 历史）—— 新通道没有旧会话的上下文，界面留着旧对话就是"答非所问"。旧会话仍在各自的持久化里（历史会话可续） |
 | **换 Agent 只有一条路：Agent 选择器** | 输入区上那个"切换到 XXX"快捷芯片已**下线**（用户明确不要）：Agent 选择器本来就把所有可用通道列全（含 DSH / Gemini / 自建），旁边再放一个"切换到某一家"的按钮只会重复、而且它指向谁完全取决于当前选中的是谁，读起来像噪声。切换语义不变：换 Agent = 换通道，先 `sessionDispose` 旧会话、再清会话态（见 agent.store.selectAgent） |
 | **Agent 的"能不能用"必须看得见且可修** | 设置 → Agent 有一份 Agent 管理器：显示每个 Agent 的协议 / 版本 / 可用性（附探测失败原因）/ 是否需要密钥，并且能改**可执行文件与启动参数**（保存后立即重探、同步刷新面板）。装好了却不可用时的排查入口只有这一个，不许让用户去翻日志 |
+| **档位按通道自己的协议渲染，"有什么画什么"** | 判据来源是 `AgentCapability.configOptions` 里 `category === 'permission'` 的控制项（`shared/permissions.ts` 的 `SDK_PERMISSION_CONTROLS` / `CODEX_PERMISSION_CONTROLS`），每项自带 `rebuild`：Claude Code 的授权模式 `rebuild:false`（`query.setPermissionMode()` 在活动会话上切）；Codex 的 `approvalPolicy` / `sandbox` `rebuild:true`（只在 `thread/start` 认）。**没有原生档位的通道一项都不许摆**（DeepSeek Harness 的 ACP 实测 `session/set_mode` → `-32601 Method not found`，见 §1.10c）；冒烟 `smoke.assertPermissionControls` 断言"界面 chip 与能力控制项一一对应，且与「客户端放行策略」互斥" |
+| **那四个档是客户端的放行策略，不是"每家都有计划模式"** | `manual/edit/plan/auto` 决定**我们**怎么应答授权请求与握手能力位；通道自己的档位经 `policyFromControls()` 折算成它（纯函数 + 单测）。因此没有原生档位的通道（ACP / mock）界面上标题写「客户端放行策略」并带脚注说明，而不是暗示那个工具支持这些模式 |
+| **重新打开面板不许自动跳转** | 面板在辅助栏里是**按需挂载**的（切走就卸载）。滚动三条规则（`AgentSidebarView`，全用 ref 不进 state）：① 挂载时按 docId 放回上次位置（内存记忆；没记录就停在顶部，**不**主动贴底）；② 只有"用户自己滚过且现在在底部"时新内容才贴底；③ 用户自己发消息（`stickToBottom()`）永远贴底。判据 `smoke.assertAgentScroll`：滚到顶 → 切走再切回 → 位置不变（修复前实测 `{top:0}→{top:526}`）**且**刚发完消息仍在底部 |
+| **提问不许换会话** | `askFlow.ask` 只在**选区明确指向另一篇文档**时才 `bindDocument(selectionDocId)`。旧写法用 `selection?.docId ?? null` 当目标：面板里直接打字（没有选区）会把绑定换成 `null`＝全局会话，**论文那条默认会话连同消息被丢掉**（用户看到"消息没了/界面跳了"）。判据 `smoke.assertAgentScroll` 里的 `docIdBefore == docIdAfter` |
+| **文档 ↔ 默认会话的绑定从库里恢复，不只靠快照** | `bindDocument` 读快照拿不到 `conversationId` 时，用 `conversationList(docId)` 把这篇文档的会话找回来（**只认当前 Agent 那条**：会话挂着它自己的远端 session id，跨通道借历史是禁止的，见 §1.9）。于是"**存在默认会话就直接显示它、不再问**"，只有真的没有才弹询问卡片。判据 `smoke.assertDefaultConversation`：库里有会话 → `conversationId` 非空 + 消息可见 + `askCardShown:false`；库里没有 → 允许出现询问卡片（第七十轮"先问再做"的约定） |
 
 ---
 
@@ -139,7 +148,7 @@ DOM 选区
 | **必须** `settingSources: ['user']` | 用户的 Claude Code 可能指向第三方代理（`~/.claude/settings.json` 的 `env` 块）。传 `[]` 会丢掉鉴权与模型映射，表现为 `Not logged in · Please run /login`（本轮实测踩过） |
 | 权限判定仍只有一份 | SDK 的 `canUseTool` → `runtime.decideSdkPermission` → `@logicreader/shared/permissions` 的 `decidePermission`；**只在需要授权时**被调用（读文件、cwd 内只读命令不会来），因此它不能当审计钩子 |
 | 档位切换走控制通道 | `setPermissionMode()` 可在**活动会话**上直接切换（自研 ACP 把权限写死在握手时，切档必须重建会话；SDK 没有这个限制） |
-| 原生 CLI 必须在 asar 外 | 打包时由 `scripts/copy-claude-cli.mjs` 复制到 `resources/claude-cli/`（extraResources），运行时优先从 `process.resourcesPath` 解析；asar 里的可执行文件起不来，pnpm 的子包路径还带哈希 |
+| **原生 CLI 不进产物** | **本产物不内置官方 Claude Code CLI**：那是 Anthropic 的二进制，再分发条款需单独确认，且与"Agent 中立"的定位相悖。`electron-builder.yml` 既不再复制 `resources/claude-cli/`，也把 SDK 的平台子包排除在 asar 之外。打包后 `findSdkCli()` 返回 null → 回落到用户自己安装的 `claude`（`cli.ts` 的 PATH 查找）。可执行文件本来就不能从 asar 启动，所以"塞回产物"不是一条可行的退路 |
 | 工具调用与结果同 id | `tool-call` / `tool-result` 共用 `tool_use_id`（SDK 的 `assistant.tool_use.id` 与 `user.tool_result.tool_use_id`） |
 | 日志要能判"是不是登录问题" | 错误 result 的 **`subtype` 仍是 `success`**，必须看 `is_error`：只判 subtype 会把"未登录"当成成功 |
 
@@ -177,6 +186,7 @@ DOM 选区
 | **找可执行文件要补两个来源** | ① 注册表里的 PATH（安装器改完 PATH，已运行的进程看不到快照）；② 应用自带的命令目录（dsh 桌面端按卸载表 `InstallLocation` → `resources\runtime\cli\bin`，或 `HKCU\Software\DeepSeekHarness\Command`）。cmd.exe 兜底路径必须用 `cmdCommandArgs` 的引号规则（`/s /c` 会剥一层引号） |
 | **配置项的取值按 Agent 的形态编码** | `session/set_config_option` 的 value 由 Agent 定：dsh 的 `model` 是 `[provider, model]` 路由且**只认 JSON 字符串**（实测裸模型名回 `unknown model option`，还会被客户端吞成 warn）。唯一实现是 `config-value.ts` 的 `encodeConfigValue` / `parseModelRoute`，有单测 + 对着真实 dsh 的 live 测试 |
 | 上游边界要如实写在文档里 | DSH 的 ACP **只给**标准语义更新，没有计划卡片 / 工具细节 / 分叉 / 附加目录 —— 界面上的能力差异来自协议，不是本程序的缺陷 |
+| **DSH 没有授权档位** | 离线探针实测（2026-10-04，dsh 0.2.0-rc.2）：`session/new` 只回 `{sessionId, configOptions}`（`configOptions` 只有 `model` / `reasoning_effort`），`initialize` 的 `sessionCapabilities` 是 `{close, list, resume}`，`session/set_mode` 直接 `-32601 Method not found`。所以界面**不为它造档位**：面板上那颗「客户端放行策略」说的是我们客户端的策略（它确实有效 —— 决定怎么应答 dsh 的写入/执行请求）。复现：`node scripts/probe-dsh-acp.mjs "<dsh.cmd>"` |
 
 
 ### 1.11 文件改动：基线、差异、检查点
@@ -333,6 +343,18 @@ DOM 选区
 
 ---
 
+### 1.25 PDF 阅读器自带侧栏：**两块独立面板**，可同时存在
+
+| 不变量 | 判据 |
+| --- | --- |
+| 缩略图与标注是**两块**，不是二选一的页签 | 状态存在 `ReaderViewState.railPanels`（两个布尔，**允许同时为 true**）；`.lr-pdf-rail` 里是上下两块 `.lr-pdf-rail__section`（各带标题 + ✕ + 独立滚动），一块都不开时**整条侧栏不渲染** |
+| 唤起入口只有工具栏上那两个按钮 | `[data-panel="thumbnails"|"annotations"]`，带 `title` 与 `data-active`。它们**不参与**窄窗口的收组分档 —— 唯一入口不许被收掉 |
+| 目录不在这里重复 | PDF 内嵌书签只在全局活动栏的「大纲」里有一份（`model.outline` 就是那份书签，见 §1.9） |
+| 旧快照必须读得懂 | 只有 `sidebarView`（三选一的页签）的老数据经 `railPanelsOf()` 翻译：`'annotations'` → 只开标注；其余 → 只开缩略图。纯函数 + 单测（`tests/reader-rail.test.ts`） |
+| 闸门 | `smoke.assertRailPanels`：点真按钮断言"都关 → 侧栏消失 / 只开一块 / 两块**同时在** / 还原" |
+
+---
+
 ## 2. 模块职责（不要越界）
 
 | 模块 | 只做这件事 | 不要在这里做的事 |
@@ -352,11 +374,14 @@ DOM 选区
 | `services/graph.service.renderSvg` | 关系图 → SVG 文本（`background` 决定画不画底） | 不要做光栅化（主进程没有光栅化器）、不要校验用户输入之外的颜色 |
 | `packages/shared/permissions.ts` | 授权模式的**唯一判定**（纯函数：模式 × 类别 × 证据 → 自动放行 / 自动拒绝 / 转人工） | 不要读设置、不要碰 DOM、不要在这里发 IPC |
 | `services/agent/sdk.ts` | 官方 Claude Agent SDK 通道：动态加载、消息翻译、授权模式映射、`canUseTool` 转接 | 不要在里判定权限（交给 `decideSdkPermission`）；不要静态 import SDK（ESM-only） |
-| `scripts/copy-claude-cli.mjs` | 打包前把 SDK 自带的原生 CLI 复制到 `resources/claude-cli/` | 不要在运行时去 asar 里找可执行文件 |
+| `services/agent/sdk.ts:findSdkCli` | 解析 SDK 平台子包里的原生 CLI（**开发态可用；打包后必然返回 null**） | 不要为了让它"在产物里也能用"而把二进制塞回产物 —— 那正是被移除的再分发问题；也不要在运行时去 asar 里找可执行文件 |
 | `services/agent/runtime.ts` | 会话生命周期 + 权限往返；把 `permissionMode` 落成会话级能力位（`canWrite` / `canExecute`） | 不要自己判断"这个命令危不危险"（那是 permissions.ts） |
 | `features/agent/AgentSidebarView.tsx` | 面板的两副面孔：欢迎块 / 消息流 / 输入卡片 / 档位选择器 | 不要在这里再实现一套授权规则（只负责展示与选择） |
 | `state/agent.store.ts` | 面板状态、模式持久化、权限自动应答、提示词拼装 | 不要在这里做滚动/高亮，也不要把模式写进 settings（它是**会话级**的） |
 | `views/reader/*` | 只用上面这些，负责渲染与交互 | 不要再自建一套偏移/选区算术 |
+| `lib/sheetWindow.ts` | 表格窗口渲染的**两套坐标换算**（容器坐标 ↔ 表格内部坐标）：`computeSheetWindow` / `rowScrollOffset` | 不要在这里碰 DOM；也不要把 `zoom` 的换算搬到视图里心算 —— 表格带 `zoom: scale`，混用坐标的症状是"滚到底行号对不上"且不报错 |
+| `services/store.service.ts:searchBlocks` | 跨文档全文检索（FTS5 trigram / LIKE 兜底 / JSON 内存扫描，**三条路径结果形状一致**） | 不要在视图里自己拼 SQL；也不要让短查询静默返回空（<3 字走 LIKE 兜底） |
+| `features/search/SearchView.tsx` | 两种范围：本文档（内存子串，即时）与全部文档（走库索引） | 库级命中要打开**没打开过**的文档时，必须复用 `openFileInWorkbench`（去重/建标签/记最近），不要自己拼标签 |
 | `apps/main/src/index.ts` | 启动顺序、降级、日志 | 不要塞业务逻辑 |
 
 ---
@@ -513,6 +538,46 @@ $env:LR_SMOKE_COMMAND='smoke.anchorZoomText'
 > `AGENT_PAYLOAD_FAIL 没能建立选区`（阅读器被别条冒烟切走）。
 > **结论：动了标签/选区/画布的冒烟，一次启动只跑一条**（本轮起按这个方式验证）；
 > 确实要连跑时，先确认它们互不触碰这三样东西。
+
+### 4.0b 界面契约断言：`smoke.assert*`（第六十五轮新增）
+
+上面那些是"点一遍、走真实交互"的脚本（慢、依赖时序）；这一组是**纯断言**：
+输入是当前 DOM / store，输出一条 `ASSERT_*_OK / _FAIL / _SKIP`。
+实现集中在 `apps/renderer/src/lib/smokeAudit.ts`，前缀与既有的 `smoke.auditAnchor` / `smoke.auditMapping` 刻意区分开。
+
+```powershell
+$env:LR_SMOKE='26000'
+$env:LR_SMOKE_COMMAND='smoke.assertTree,smoke.assertStatusBar,smoke.assertAgentChips,smoke.assertAgentCopy,smoke.assertPdfToolbar,smoke.assertNoAutoRead,smoke.assertReadAskStart,smoke.assertEscDraft,smoke.assertEditMenu'
+& 'D:\Apps\LogicReader\LogicReader.exe' <PDF 路径> --no-sandbox --user-data-dir=<隔离画像>
+# 另按文档类型各跑一条：xlsx → smoke.assertSheet / smoke.assertSheetFit
+#                     有图的关系图标签 → smoke.assertGraphOverlays
+#                     全新画像 → smoke.assertWizard（需要 wizardSeen=false）
+```
+
+| 闸门 | 判据（不成立即 FAIL） |
+| --- | --- |
+| `ASSERT_TREE_OK` | 树行与标签的 computed `text-align` 都是 left（资源管理器/最近打开的居中问题） |
+| `ASSERT_STATUSBAR_OK` | Agent 项形如 `<名字> · <空闲/正在工作>`；构建项带「构建」标签；**五条边框（活动栏/状态栏/标题栏/侧栏/辅助栏）的底色亮度与主题同向**（浅色 >0.5、深色 <0.25，没渲染出来的层不算数）—— 活动栏与状态栏都曾"浅色主题下还是深色" |
+| `ASSERT_AGENTCHIPS_OK` | 输入卡片的 chip 行 `flex-wrap: wrap`、每个 chip `flex-shrink: 0` 且 `scrollWidth ≤ clientWidth`（不被截成残句） |
+| `ASSERT_AGENTCOPY_OK` | 面板文本里没有 `// TODO`、没有裸露的文案键 |
+| `ASSERT_PDFTOOLBAR_OK` | 工具栏每个 button 都含 SVG 图标、每个控件都有 `title`、`scrollWidth ≤ clientWidth`（并按容器宽度收组，报告里给 `visibleGroups/hiddenGroups`） |
+| `ASSERT_NOAUTOREAD_OK` | 打开文档后**消息流为空、没有会话**（把"用户没点就花了模型调用"钉死），并回报 `selectedAgentId`（种子画像是否被采用） |
+| `ASSERT_READASKSTART_OK` | 点「开始通读」后真的发出（消息 ≥2）；**只在选中 mock 时才点**，否则拒绝执行以免烧真实额度 |
+| `ASSERT_ESCDRAFT_OK` | 输入框里草稿非空时按 Esc：草稿清空、`streaming` 与消息流不变（Esc 不再掐断回合） |
+| `ASSERT_PDFPAGETHEME_OK` | PDF 的"纸色"（`.lr-pdf-page` 背景亮度）随**生效的阅读区主题**同向：`readerThemeOverride === 'inherit'` 时跟随应用主题，否则用覆盖值。阅读区深色 + 纸面 `pdfDarkMode=off` 时，白纸四周会露出一圈黑 —— 那不是 bug，是"深色桌面"；但"阅读区主题不再跟随应用主题"是真 bug |
+| `ASSERT_THEMETOGGLE_OK` | 点状态栏那颗「主题：X」：**应用主题变了**、`readerThemeOverride` **没变**（旧实现显示应用主题却去改阅读区主题）、标签跟着变 |
+| `ASSERT_PERMISSIONCONTROLS_OK` | 面板上的档位 chip 与能力里 `category==='permission'` 的控制项**一一对应**，且与「客户端放行策略」chip **互斥**（有原生档位就不摆客户端策略，没有就必须摆）。实测：`mock`/`dsh` → 无控制项 + 客户端策略；`codex` → `approvalPolicy`+`sandbox`；`claude-code` → `permissionMode` |
+| `ASSERT_HISTORYREPLAY_OK` | 在**真实的 Agent 报文日志**上验证提炼规则：每条用户消息的 `coreIntentOf` 结果都不再以注入头（`【授权模式：` / `[Permission mode:`）开头，并同时打印 `rawHead` 与 `intent` 供比对。`smoke.assertHistoryReplay[:<remoteSessionId>]` |
+| `ASSERT_LIVESWITCH_OK` | 对"可活动切换"的控制项（Claude Code 的授权模式）真调一次 `setConfigOption`：**会话不重建**（`main.log` 有「档位切换（活动会话，不重建）：…」）。建会话不发提示词，所以这条不烧模型额度 |
+| `ASSERT_CODEXTHREAD_OK` | 带 `configValues` 建 Codex 会话 → `main.log` 出现「新建线程：审批策略=X 沙箱=Y」，证明界面拨的值真的进了 `thread/start` 报文 |
+| `ASSERT_RAILPANELS_OK` | PDF 自带侧栏：点真按钮断言"两块都关 → 整条侧栏消失 / 只开一块 / **两块同时在**（用户要求）/ 还原"。旧快照的页签式 `sidebarView` 由 `railPanelsOf()` 翻译（`tests/reader-rail.test.ts`） |
+| `ASSERT_AGENTSCROLL_OK` | 消息流滚动 + 会话绑定：滚到顶 → 切走辅助栏再切回 → **位置不变**（`jumpedToBottom:false`）、`docIdBefore == docIdAfter`（提问不换会话）、刚发完消息仍贴底（`stuckAfterSend:true`） |
+| `ASSERT_DEFAULTCONVERSATION_OK` | 文档 ↔ 默认会话绑定：库里有这篇文档的会话 → `conversationId` 非空、消息可见、`askCardShown:false`（真实画像上实测：库里两条会话 + 快照 null → 修复前空面板 + 询问卡）；库里没有 → 允许询问卡片 |
+| `ASSERT_EDITMENU_OK` | 走 `app:edit` 的「全选」能选中输入框内容（编辑菜单不是废弃的 `execCommand`，且菜单项不抢焦点） |
+| `ASSERT_SHEET_OK` / `_SHEETFIT_OK` | 状态栏说「工作表 N / M」；小表在容器里左右留白相等；「适应宽度」后表宽贴合视口（≤2%） |
+| `ASSERT_GRAPHOVERLAYS_OK` | 质量报告与图例默认 `data-open=false`；图例（左上）/ 迷你地图（右下）/ 检查器（右上）矩形两两不相交；**React Flow 左下缩放控件的图标色 / 底色对比度 ≥ 3**（它自带浅色默认值，深色下只有 1.71 —— 白底上几乎看不见符号） |
+| `ASSERT_NAVDEDUPE_OK` | 活动栏没有「标注」项、PDF 阅读器侧栏没有「目录」页签 |
+| `ASSERT_WIZARD_OK` | 步骤条数量 == 屏数；第 1 屏没有「上一步」、有「跳过」、没有「取消」；下一步→1、上一步→0 |
 
 ---
 

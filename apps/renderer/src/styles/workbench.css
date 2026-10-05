@@ -295,6 +295,12 @@
   overflow: hidden;
   text-overflow: ellipsis;
   cursor: pointer;
+  /*
+   * 这些行是 <button>，UA 样式带 text-align: center；行内标签是 flex: 1 的普通容器，
+   * 会把它继承下去 —— 于是文件名在整行里居中、"最近打开"的目录名被挤到最右贴边。
+   * 显式左对齐，与 .lr-search-result / .lr-annotation-row 的写法保持一致。
+   */
+  text-align: left;
 }
 
 .lr-tree__row:hover {
@@ -317,11 +323,15 @@
   overflow: hidden;
   text-overflow: ellipsis;
   flex: 1;
+  text-align: left;
 }
 
+/* 右侧的次要信息列（目录名 / 时间）：自己右对齐，不靠继承 */
 .lr-tree__meta {
   opacity: 0.6;
   font-size: var(--lr-fs-xs);
+  text-align: right;
+  flex: 0 0 auto;
 }
 
 .lr-empty {

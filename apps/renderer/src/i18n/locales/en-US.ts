@@ -45,7 +45,6 @@ export const enUS: Dictionary = {
     outline: 'Outline',
     graph: 'Logic Graph',
     agent: 'Agent',
-    annotations: 'Annotations',
     search: 'Search',
     settings: 'Settings',
     title: 'Activity Bar'
@@ -55,7 +54,6 @@ export const enUS: Dictionary = {
     outline: 'Outline',
     graph: 'Logic Graph',
     agent: 'Agent',
-    annotations: 'Annotations',
     search: 'Search',
     openEditors: 'Open Editors',
     recent: 'Recent',
@@ -66,10 +64,14 @@ export const enUS: Dictionary = {
     graphEmpty: 'No logic graph yet',
     graphEmptyHint: 'Open a document and let an Agent read it to build an interactive logic graph.',
     annotationsEmpty: 'No annotations in this document yet',
-    annotationsFilterAll: 'All',
     searchPlaceholder: 'Find in document',
     searchEmpty: 'No results',
     searchResults: '{{count}} results',
+    searchScopeDoc: 'This document',
+    searchScopeLibrary: 'All documents',
+    searchLibraryPlaceholder: 'Find across all documents you have opened',
+    searchLibraryHint: 'Library-wide search: click a hit to open that document and jump to it',
+    searchOpenFailed: 'Failed to open document: {{message}}',
     documentOutline: 'Document Outline'
   },
   welcome: {
@@ -118,6 +120,10 @@ export const enUS: Dictionary = {
     yes: 'Yes',
     no: 'No',
     confirm: 'Confirm',
+    back: 'Back',
+    next: 'Next',
+    skip: 'Skip',
+    done: 'Done',
     search: 'Search',
     filter: 'Filter',
     more: 'More',
@@ -164,7 +170,11 @@ export const enUS: Dictionary = {
     tokens: '{{value}} tok',
     positions: 'Page {{page}}',
     selection: '{{count}} chars selected',
-    restoreMs: 'Restored in {{value}}ms'
+    restoreMs: 'Restored in {{value}}ms',
+    build: 'Build {{value}}',
+    agentIdle: 'Idle',
+    sheetOf: 'Sheet {{index}} of {{total}}',
+    agentState: '{{agent}} · {{state}}'
   },
   tab: {
     welcome: 'Welcome',
@@ -326,8 +336,10 @@ export const enUS: Dictionary = {
     viewSingle: 'Single',
     viewContinuous: 'Continuous',
     viewSpread: 'Two pages',
+    viewMode: 'View mode',
     find: 'Find',
     findPlaceholder: 'Find',
+    findClose: 'Close find',
     findNext: 'Next match',
     findPrevious: 'Previous match',
     findCount: '{{index}} of {{total}}',
@@ -350,6 +362,7 @@ export const enUS: Dictionary = {
     fullscreen: 'Full screen',
     more: 'More',
     thumbnails: 'Thumbnails',
+    railHide: 'Hide this panel',
     outline: 'Outline',
     annotations: 'Annotations',
     search: 'Search',
@@ -383,7 +396,6 @@ export const enUS: Dictionary = {
     },
     sheet: {
       formulas: 'Formulas',
-      truncatedRows: 'Only the first {{rows}} rows are rendered',
       loadFailed: 'Failed to load sheet data: {{message}}'
     }
   },
@@ -537,9 +549,6 @@ export const enUS: Dictionary = {
     importTitle: 'Import logic graph JSON',
     imported: 'Logic graph imported',
     importFailed: 'Import failed: {{message}}',
-    naturalLanguagePlaceholder: 'Describe a layout change, e.g. "top to bottom"',
-    naturalLanguageApply: 'Apply',
-    naturalLanguageApplied: 'Layout updated: {{result}}',
     inquiryLane: 'Inquiry lane',
     mergeIntoGraph: 'Merge into graph'
   },
@@ -551,7 +560,13 @@ export const enUS: Dictionary = {
     inputPlaceholder: 'Ask something… (Enter to send, Shift+Enter for a new line)',
     send: 'Send',
     stop: 'Stop',
-    welcomeHint: '// TODO: Everything. Let\'s start.',
+    welcomeHint: 'Point the Agent at this document, or just ask it something.',
+    readAskTitle: 'Read "{{title}}" in full?',
+    readAskBody:
+      'A full read sends the whole document as context and spends one model request. Once you agree, every question about this document continues in that same session.',
+    readAskStart: 'Start full read',
+    readAskLater: 'Not now',
+    readAskDismissed: 'Skipped the full read. Ask anything whenever you like.',
     statusWorking: 'Working',
     statusDone: 'Done',
     statusStopped: 'Stopped',
@@ -637,6 +652,25 @@ export const enUS: Dictionary = {
       auto: {
         name: 'Auto',
         description: 'Safe actions are approved automatically; risky ones pause for you'
+      }
+    },
+    policyTitle: 'Client-side allow policy',
+    policyNote: '{{agent}} has no permission modes of its own; this controls how the client answers its write / execute requests.',
+    permission: {
+      permissionMode: { name: 'Permission mode' },
+      approvalPolicy: {
+        name: 'Approval policy',
+        untrusted: 'Ask every time',
+        'untrusted.description': 'Writes and commands both need your confirmation',
+        'on-request': 'On request',
+        'on-request.description': 'Codex decides; it only asks when it needs to'
+      },
+      sandbox: {
+        name: 'Sandbox',
+        'read-only': 'Read-only',
+        'read-only.description': 'Reads only; changes are blocked by its own sandbox',
+        'workspace-write': 'Workspace write',
+        'workspace-write.description': 'Writes inside the working directory are allowed'
       }
     },
     contextPreview: 'Context preview',

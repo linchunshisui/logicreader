@@ -79,6 +79,13 @@ export interface AppSettings {
   snapshotDebounceMs: number
   recentLimit: number
   libreOfficePath: string | null
+  /**
+   * 首启向导是否已经看过。
+   *
+   * 用独立的标记，而不是"本机有没有会话快照"：用户主动「清除已保存的会话」后重启，
+   * 不该再被当成第一次启动（旧判据 `!outcome.restored` 就会这么干）。
+   */
+  wizardSeen: boolean
   agent: AgentSettings
   graph: GraphSettings
   reader: ReaderSettings
@@ -100,6 +107,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   snapshotDebounceMs: 15000,
   recentLimit: 30,
   libreOfficePath: null,
+  wizardSeen: false,
   agent: {
     workspaceMode: 'document',
     allowWrite: false,

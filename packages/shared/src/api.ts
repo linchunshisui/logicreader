@@ -2,7 +2,7 @@
 import type {
   AppInfo, AnnotationRecord, AnchorRecord, BlockRecord, DocumentRecord,
   FileStat, LogEntry, MessageDialogOptions, RecentEntry, SaveDialogOptions,
-  Unsubscribe, WindowState
+  SearchHit, Unsubscribe, WindowState
 } from './ipc'
 import type { AppSettings } from './settings'
 import type { PermissionMode } from './permissions'
@@ -24,6 +24,14 @@ export interface AgentConfigOption {
   /** 可能是数组：dsh 的 `model` 项是 `[provider, model]` 路由（见 services/agent/config-value.ts）。 */
   currentValue: string | boolean | unknown[] | null
   options?: AgentConfigOptionValue[]
+  /**
+   * 改这一项要不要**重建会话/线程**。
+   *
+   * `false` = 协议支持在活动会话上直接切（Claude Code 的授权模式走控制通道）；
+   * `true` = 只能在建会话/建线程时指定（Codex 的 `approvalPolicy` / `sandbox`、ACP 的能力位）。
+   * 界面据此决定"切档后要不要把会话丢掉重建"，不再靠"哪家 Agent"来猜。
+   */
+  rebuild?: boolean
 }
 
 export interface AgentModelView {
@@ -101,6 +109,12 @@ export interface AgentSessionRequest {
   documentDir?: string | null
   /** 授权模式：会话创建时即确定写文件 / 执行命令的许可（见 shared/permissions.ts） */
   permissionMode?: PermissionMode | null
+  /**
+   * **该通道自己那些档位**的值（Codex 的 `approvalPolicy` / `sandbox`）。
+   * 与 `permissionMode`（客户端放行策略）分开传：主进程用 `policyFromControls` 折算后者，
+   * 前者原样交给适配器（它才知道怎么发报文）。
+   */
+  configValues?: Record<string, string>
   /** 分叉已有会话的历史开新会话（原会话不动） */
   forkSession?: boolean
   /** 从某个用户消息处开始（配合 fork） */
@@ -202,6 +216,9 @@ export interface RestoreReport {
   crashed: boolean
 }
 
+/** 编辑菜单的标准动作（与 Electron `webContents` 上的同名方法一一对应）。 */
+export type EditAction = 'undo' | 'redo' | 'cut' | 'copy' | 'paste' | 'selectAll'
+
 export interface LogicReaderApi {
   app: {
     info(): Promise<AppInfo>
@@ -209,6 +226,14 @@ export interface LogicReaderApi {
     quit(): Promise<void>
     relaunch(): Promise<void>
     setUiScale(scale: number): Promise<void>
+    /**
+     * 编辑菜单的标准动作。
+     *
+     * 走主进程的 `webContents.undo()/.redo()/.cut()/.copy()/.paste()/.selectAll()`：
+     * 渲染进程侧的 `document.execCommand` 已是废弃 API，其中 `paste` 在 Chromium 里
+     * 根本没有实现（菜单项按下去毫无反应）。
+     */
+    edit(action: EditAction): Promise<void>
     onOpenFiles(cb: (files: string[]) => void): Unsubscribe
     takePendingFiles(): Promise<string[]>
     onMenuCommand(cb: (payload: { commandId: string; args?: unknown }) => void): Unsubscribe
@@ -266,6 +291,7 @@ export interface LogicReaderApi {
     removeDocument(id: string): Promise<void>
     saveBlocks(docId: string, blocks: BlockRecord[]): Promise<void>
     getBlocks(docId: string): Promise<BlockRecord[]>
+    searchBlocks(query: string, limit?: number): Promise<SearchHit[]>
     saveAnchors(anchors: AnchorRecord[]): Promise<void>
     getAnchor(id: string): Promise<AnchorRecord | null>
     listAnchors(docId: string): Promise<AnchorRecord[]>

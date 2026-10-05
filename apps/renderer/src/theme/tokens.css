@@ -169,10 +169,17 @@
   --vscode-menubar-selectionBackground: #0000001a;
   --vscode-menubar-selectionForeground: #000000;
 
-  --vscode-activityBar-background: #2c2c2c;
-  --vscode-activityBar-foreground: #ffffff;
-  --vscode-activityBar-inactiveForeground: #ffffff80;
-  --vscode-activityBar-activeBorder: #ffffff;
+  /*
+   * 活动栏：浅色主题下**必须跟着切浅**。
+   *
+   * 原来这里是 `#2c2c2c` + 白图标（"VS Code 深色"的那套）——
+   * 于是整个浅色界面里只有最左这一竖栏还是深的，用户的原话是"浅色的左边这一栏未调整为浅色"。
+   * 取值照 VS Code Light+：栏底比侧栏（#f3f3f3）略亮，图标深灰、选中项用蓝色左边框。
+   */
+  --vscode-activityBar-background: #f8f8f8;
+  --vscode-activityBar-foreground: #424242;
+  --vscode-activityBar-inactiveForeground: #616161cc;
+  --vscode-activityBar-activeBorder: #007acc;
   --vscode-activityBarBadge-background: #007acc;
   --vscode-activityBarBadge-foreground: #ffffff;
 
@@ -209,13 +216,18 @@
   --vscode-panelTitle-inactiveForeground: #42424299;
   --vscode-panelTitle-activeBorder: #424242;
 
-  --vscode-statusBar-background: #000000;
-  --vscode-statusBar-foreground: #e8e8e8;
-  --vscode-statusBar-border: #000000;
-  --vscode-statusBarItem-hoverBackground: #ffffff24;
+  /*
+   * 状态栏：浅色主题下原来也是纯黑（`#000000` + 白字）——
+   * 继活动栏之后**第二块"没跟着切浅"**的地方（用户："最底下的一栏在浅色模式下仍是黑色"）。
+   * 取值与同属浅色的侧栏一致（#f3f3f3 / #3b3b3b / #e0e0e0），悬停用浅色下通用的深色半透明。
+   */
+  --vscode-statusBar-background: #f3f3f3;
+  --vscode-statusBar-foreground: #3b3b3b;
+  --vscode-statusBar-border: #e0e0e0;
+  --vscode-statusBarItem-hoverBackground: #0000001a;
   --vscode-statusBarItem-remoteBackground: #16825d;
   --vscode-statusBarItem-errorBackground: #c72e0f;
-  --vscode-statusBar-itemHighlight: #ffffff;
+  --vscode-statusBar-itemHighlight: #000000;
 
   --vscode-list-hoverBackground: #e8e8e8;
   --vscode-list-activeSelectionBackground: #0060c0;

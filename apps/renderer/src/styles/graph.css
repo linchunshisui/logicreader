@@ -8,6 +8,29 @@
   position: relative;
 }
 
+/*
+ * React Flow 自带的那几块 UI（左下角缩放控件、迷你地图、署名）用的是**它自己的默认色**：
+ * `--xy-*-default` 是浅色主题（白底 #fefefe、浅灰边 #eee），只有给容器加 `.dark` 类才换成深色。
+ * 我们没加那个类，于是深色界面里它是一块**看不出符号的白板** —— 用户报的"放大/缩小没跟着暗色模式走"
+ * （实测：深色下控件底色 `rgb(254,254,254)` + 图标 `rgb(197,197,197)`，对比度只有 1.71）。
+ *
+ * 这里把它的颜色变量接到本项目的令牌上（令牌随 `data-theme` 切换），不去猜它内部加了什么类。
+ * ★ 必须写在 `.react-flow` 上：这些 `--xy-*` 是 React Flow **自己声明在 `.react-flow` 元素上**的，
+ * 只挂在祖先 `.lr-graph` 上会被它的声明盖掉（本轮第一版就是这么无效的，靠断言里的对比度数字照出来的）。
+ */
+.lr-graph .react-flow {
+  --xy-controls-button-background-color-default: var(--vscode-editorWidget-background);
+  --xy-controls-button-background-color-hover-default: var(--vscode-list-hoverBackground);
+  --xy-controls-button-color-default: var(--vscode-icon-foreground);
+  --xy-controls-button-color-hover-default: var(--vscode-foreground);
+  --xy-controls-button-border-color-default: var(--vscode-widget-border);
+  /* 迷你地图："视口外"的遮罩用中性灰，浅底深底都读得出"当前看到的是哪一块" */
+  --xy-minimap-background-color-default: var(--graph-canvas);
+  --xy-minimap-mask-background-color-default: rgba(127, 127, 127, 0.25);
+  /* 右下角的 "React Flow" 署名：默认是半透明白，深色里就是一小块白斑 */
+  --xy-attribution-background-color-default: transparent;
+}
+
 .lr-graph__toolbar {
   display: flex;
   align-items: center;
@@ -197,10 +220,15 @@
 }
 
 /* ---------------------------------------------------------- 图例/检查器 */
+/*
+ * 四个浮层各占一个角，互不重叠：
+ *   左上 = 图例、右上 = 选中项检查器、左下 = React Flow 控件、右下 = 迷你地图。
+ * 旧布局把图例放在左下（和控件叠在一起）、检查器放在右下（被迷你地图压住）。
+ */
 .lr-graph__legend {
   position: absolute;
   left: 10px;
-  bottom: 10px;
+  top: 10px;
   z-index: 5;
   background: var(--vscode-editorWidget-background);
   border: 1px solid var(--vscode-widget-border);
@@ -237,8 +265,11 @@
 .lr-graph__inspector {
   position: absolute;
   right: 10px;
-  bottom: 10px;
+  top: 10px;
   width: 300px;
+  /* 迷你地图在右下角：检查器改到右上，长内容自己滚，不去压地图 */
+  max-height: calc(100% - 20px);
+  overflow: auto;
   z-index: 5;
   background: var(--vscode-editorWidget-background);
   border: 1px solid var(--vscode-widget-border);

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type UIEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { CMD, PERMISSION_MODES, type PermissionMode } from '@logicreader/shared'
 import { estimateTokens } from '@logicreader/document-model'
@@ -10,16 +10,27 @@ import {
   type ToolCallView,
   type ToolDiffView
 } from '../../state/agent.store'
+import type { AgentConfigOption } from '@logicreader/shared'
 import { useTabs } from '../../state/tabs.store'
 import { useDocuments } from '../../state/documents.store'
 import { useUiStore } from '../../state/ui.store'
 import { executeCommand } from '../../state/commands.store'
 import { notify } from '../../state/notifications.store'
 import { api } from '../../lib/api'
-import { IconAgent, IconChevronDown, IconChevronRight, IconPlus } from '../../workbench/icons'
+import {
+  IconAgent,
+  IconChevronDown,
+  IconChevronRight,
+  IconGauge,
+  IconHistory,
+  IconModel,
+  IconPlus,
+  IconSend,
+  IconStop
+} from '../../workbench/icons'
 import { AgentMarkdown } from './AgentMarkdown'
 
-type Popover = 'none' | 'mode' | 'model' | 'effort' | 'history' | 'agent'
+type Popover = 'none' | 'mode' | 'control' | 'model' | 'effort' | 'history' | 'agent'
 
 /** 协议 → 选择器里那行小字（告诉用户这条通道是怎么接的）。 */
 const PROTOCOL_KEY: Record<string, string> = {
@@ -48,6 +59,8 @@ export function AgentSidebarView(): JSX.Element {
   const scrollRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const [popover, setPopover] = useState<Popover>('none')
+  /** 打开弹层时选中的是哪个授权控制项（Codex 有两项，所以要记住是哪一项） */
+  const [openControl, setOpenControl] = useState<AgentConfigOption | null>(null)
   /** 斜杠面板里当前选中的下标（键盘导航用） */
   const [slashIndex, setSlashIndex] = useState(0)
   /** 历史会话：正在改名的会话 id 与草稿；以及"总结命名"进行中的会话 id */
@@ -85,13 +98,19 @@ export function AgentSidebarView(): JSX.Element {
   }, [docId])
 
   /**
-   * 文档默认会话的**就绪重试**：面板挂载时文档模型可能还没解析完（恢复会话的标签是异步打开的），
-   * 第一轮 ensureDocumentSession 会因"拿不到模型"静默退出 —— 文档就绪后再补一次。
-   * ensureDocumentSession 自己有幂等守卫（已有会话/已在流式就不再发），重复调用无副作用。
+   * 「通读全文」询问卡片的**就绪重试**：面板挂载时文档模型可能还没解析完（恢复会话的标签是异步打开的），
+   * 第一轮 ensureDocumentRead 会因"拿不到模型"静默退出 —— 文档就绪后再补一次。
+   * ensureDocumentRead 有自己的幂等守卫（已有会话/已在流式/已提议过就不再提），重复调用无副作用。
    */
   useEffect(() => {
     if (!docId || !model) return
-    void useAgent.getState().ensureDocumentSession()
+    void useAgent.getState().ensureDocumentRead()
+    /*
+     * 这里只管"文档模型还没解析完"这一半的重试。
+     * 另一半是"Agent 清单/可用性还没探测回来"——那一次重判放在 refreshAgents 内部：
+     * 探测完成时 agents.length 往往没变（同一条目只是补上了能力），
+     * 用 length 当依赖根本不会触发，卡片就永远不出现（实测踩到）。
+     */
   }, [docId, model, agent.hydratedFromSnapshot])
 
   /**
@@ -112,12 +131,55 @@ export function AgentSidebarView(): JSX.Element {
     if (preferred) void useAgent.getState().selectAgent(preferred.id)
   }, [availableIds, agent.selectedAgentId, agent.agents])
 
-  // 新内容到达时贴底（面板本身是"对话流"，不贴底会看不到最新一行）
+  /**
+   * 消息流的滚动：**重新打开面板不许自动跳转**（用户报的："每次打开 agent 工具的时候自动跳转"）。
+   *
+   * 面板是按需挂载的（辅助栏切走就卸载），旧的贴底 effect 依赖整个 `messages` 数组，
+   * 重新挂载（以及恢复会话）时都会把视图甩到最下面 —— 用户正在读中间那段时尤其刺眼。
+   *
+   * 三条规则：
+   *  1. 挂载时把**上次的位置**放回去（按 docId 记在内存里；没有记录就停在顶部，不主动贴底）；
+   *  2. 只有"用户自己滚过、且现在就在底部"时，新内容才贴底 —— 读了中间那段就别把他拽走；
+   *  3. 用户自己发消息永远贴底（他当然要看回复）。
+   *
+   * 全部走 ref，不进 React state：滚动事件非常频繁，进 state 会让整条消息流重渲染
+   * （与"面板拖拽不进 state"同一个理由，见 ARCHITECTURE §1.20）。
+   */
+  const nearBottom = useRef(true)
+  const userScrolled = useRef(false)
+  const scrollMemory = useRef<Map<string, number>>(new Map())
+  const restoredFor = useRef<string | null>(null)
+  const scrollKey = agent.docId ?? 'global'
+
+  const onStreamScroll = (event: UIEvent<HTMLDivElement>): void => {
+    const element = event.currentTarget
+    userScrolled.current = true
+    nearBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight < 48
+    scrollMemory.current.set(scrollKey, element.scrollTop)
+  }
+
   useEffect(() => {
     const element = scrollRef.current
     if (!element) return
+    if (restoredFor.current !== scrollKey) {
+      // 第一次拿到这个文档的内容：放回上次的位置（没记录 → 停在顶部，**不**贴底）
+      restoredFor.current = scrollKey
+      userScrolled.current = false
+      element.scrollTop = scrollMemory.current.get(scrollKey) ?? 0
+      nearBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight < 48
+      return
+    }
+    if (!userScrolled.current || !nearBottom.current) return
     element.scrollTop = element.scrollHeight
-  }, [agent.messages, agent.permissionNotes, agent.streaming])
+    // 依赖用 `messages` 的**数组身份**而不是长度：流式输出期间长度不变、内容在长，
+    // 靠身份变化才能跟着贴底；已经用 nearBottom / userScrolled 两道闸门挡住了"乱贴底"。
+  }, [agent.messages, agent.permissionNotes, agent.streaming, scrollKey])
+
+  /** 用户发消息：这一次必须贴底（他要看回复） */
+  const stickToBottom = (): void => {
+    userScrolled.current = true
+    nearBottom.current = true
+  }
 
   // 点面板任何地方都关掉弹层（弹层自己 stopPropagation）
   useEffect(() => {
@@ -159,6 +221,40 @@ export function AgentSidebarView(): JSX.Element {
   const thoughtLevels = currentModel?.thoughtLevels ?? []
   const currentEffort = thoughtLevels.find((level) => level.id === agent.thinkingEffort) ?? null
   const extraHigh = thoughtLevels.find((level) => /xhigh|extra|max|ultra/i.test(level.id + level.name)) ?? null
+
+  /**
+   * 当前通道**真实提供**的授权控制项（能力里 `category === 'permission'` 的配置项）。
+   *
+   * 上限来自协议，不是本程序的取舍：Claude Code 给授权模式（还能在活动会话上切），
+   * Codex 给审批策略 + 沙箱（只能在建线程时定），DeepSeek Harness 一项都没有 ——
+   * 它那边 `session/set_mode` 直接 `Method not found`（离线探针实测）。
+   * 所以界面**有什么画什么**：没有就不摆一个切不动的档位。
+   */
+  const permissionControls = (capability?.configOptions ?? []).filter((option) => option.category === 'permission')
+  const controlValueOf = (control: AgentConfigOption): string =>
+    agent.configValues[control.id] ?? (typeof control.currentValue === 'string' ? control.currentValue : '')
+  /** 依次尝试几个文案键，返回第一个真正存在的（i18next 缺键会原样返回键名）。 */
+  const pickText = (keys: string[]): string | null => {
+    for (const key of keys) {
+      const text = t(key)
+      if (text !== key) return text
+    }
+    return null
+  }
+  const controlTitle = (control: AgentConfigOption): string =>
+    pickText(['agent.permission.' + control.id + '.name']) ?? control.name
+  /**
+   * 候选项的名字与说明：Claude Code 的四个档位沿用既有的 `agent.mode.*` 文案（那是它自己的词汇），
+   * 其余按 `agent.permission.<控件 id>.<值>` 取；再取不到就用协议原文（如 Codex 的 `untrusted`）。
+   */
+  const optionName = (control: AgentConfigOption, value: string, fallback: string): string =>
+    pickText(control.id === 'permissionMode' ? ['agent.mode.' + value + '.name'] : []) ??
+    pickText(['agent.permission.' + control.id + '.' + value]) ??
+    fallback
+  const optionHint = (control: AgentConfigOption, value: string, fallback?: string): string | undefined =>
+    pickText(control.id === 'permissionMode' ? ['agent.mode.' + value + '.description'] : []) ??
+    pickText(['agent.permission.' + control.id + '.' + value + '.description']) ??
+    fallback
   /**
    * 上下文占用：**Agent 报的真实值优先**（事件/拉取共同刷新，跟着对话走）；
    * 没有真实值时才退到"文档体量的静态估算"——并明说它是估算，别让用户把文档大小当成对话占用。
@@ -267,6 +363,7 @@ export function AgentSidebarView(): JSX.Element {
   const send = (): void => {
     const text = agent.draft.trim()
     if (text.length === 0 || agent.streaming) return
+    stickToBottom()
     const selection = useUiStore.getState().selection
     const includeSelection = selection && selection.docId === docId
     void (async () => {
@@ -300,7 +397,7 @@ export function AgentSidebarView(): JSX.Element {
 
   return (
     <div className="lr-agent" data-empty={agent.messages.length === 0}>
-      <div className="lr-agent__stream lr-scroll" ref={scrollRef}>
+      <div className="lr-agent__stream lr-scroll" ref={scrollRef} onScroll={onStreamScroll}>
         {agent.messages.length === 0 ? (
           <div className="lr-agent__welcome">
             <div className="lr-agent__welcome-mark">
@@ -320,6 +417,24 @@ export function AgentSidebarView(): JSX.Element {
         )}
 
         {/* 计划审阅卡片：kind='plan' 的权限请求由它接管，不再画通用权限卡片 */}
+        {agent.readAsk && agent.messages.length === 0 ? (
+          /*
+           * 「通读全文」询问卡片（规划书 FR-7：**先请求用户询问**是否激活 Agent 工具把打开的文件通读）。
+           * 旧行为是文档一打开就把整篇全文发出去 —— 用户没点过任何东西，模型调用已经花掉了。
+           */
+          <div className="lr-agent__askcard" data-ask="read">
+            <div className="lr-agent__askcard-title">{t('agent.readAskTitle', { title: agent.readAsk.title })}</div>
+            <p className="lr-agent__askcard-body">{t('agent.readAskBody')}</p>
+            <div className="lr-agent__askcard-actions">
+              <button className="lr-button" onClick={() => void agent.startDocumentRead()}>
+                {t('agent.readAskStart')}
+              </button>
+              <button className="lr-button lr-button--secondary" onClick={() => void agent.dismissDocumentRead()}>
+                {t('agent.readAskLater')}
+              </button>
+            </div>
+          </div>
+        ) : null}
         {agent.pendingPlan ? <PlanReviewCard plan={agent.pendingPlan} /> : null}
         {agent.permissions
           .filter((permission) => permission.kind !== 'plan')
@@ -418,11 +533,34 @@ export function AgentSidebarView(): JSX.Element {
         {popover !== 'none' ? (
           <div className="lr-agent__popover" onMouseDown={(event) => event.stopPropagation()}>
             {popover === 'mode' ? (
+              /*
+               * 走到这里说明**这个通道自己没有授权档位**（能力里没有任何 permission 控制项）：
+               * 显示的是我们客户端的放行策略，标题与脚注都要写清这一点，
+               * 别让用户以为 DeepSeek Harness 有"计划模式"这种功能。
+               */
               <ModePicker
                 value={agent.permissionMode}
+                title={t('agent.policyTitle')}
+                note={t('agent.policyNote', { agent: capability?.displayName ?? t('agent.title') })}
                 onPick={(mode) => {
                   setPopover('none')
                   void agent.setPermissionMode(mode)
+                }}
+              />
+            ) : null}
+            {popover === 'control' && openControl ? (
+              <OptionPicker
+                title={controlTitle(openControl)}
+                options={(openControl.options ?? []).map((option) => ({
+                  id: option.value,
+                  name: optionName(openControl, option.value, option.name),
+                  hint: optionHint(openControl, option.value, option.description)
+                }))}
+                value={controlValueOf(openControl)}
+                emptyHint=""
+                onPick={(value) => {
+                  setPopover('none')
+                  void agent.setConfigValue(openControl.id, value)
                 }}
               />
             ) : null}
@@ -723,8 +861,13 @@ export function AgentSidebarView(): JSX.Element {
                 send()
               }
               if (event.key === 'Escape') {
+                /*
+                 * 顺序即语义（与全局快捷键的分工见 keybindings.ts）：
+                 * 先关浮层，再放弃草稿，最后才是"停止生成" —— 别让打字打一半的 Esc 掐掉回合。
+                 */
                 if (popover !== 'none') setPopover('none')
-                else void agent.stop()
+                else if (agent.draft.trim().length > 0) agent.setDraft('')
+                else if (agent.streaming) void agent.stop()
               }
             }}
           />
@@ -753,22 +896,53 @@ export function AgentSidebarView(): JSX.Element {
             onMouseDown={(event) => event.stopPropagation()}
             onClick={() => setPopover((value) => (value === 'agent' ? 'none' : 'agent'))}
           >
+            <IconAgent size={13} />
+            {/* 主信息：当前 Agent 的名字完整可读（辅助栏最窄时也不许截成 "Clau…"） */}
             {capability?.displayName ?? t('agent.selectAgent')}
           </button>
 
-          {/* 一键对切 Claude Code ↔ Codex：对方可用时才出现，切过去就自动消失 */}
-          <button
-            className="lr-agent__mode"
-            data-mode={agent.permissionMode}
-            title={t('agent.modeTitle')}
-            onMouseDown={(event) => event.stopPropagation()}
-            onClick={() => setPopover((value) => (value === 'mode' ? 'none' : 'mode'))}
-          >
-            <span className="lr-agent__mode-icon" aria-hidden="true">
-              {MODE_GLYPH[agent.permissionMode]}
-            </span>
-            {t('agent.mode.' + agent.permissionMode + '.name')}
-          </button>
+          {/*
+           * 授权档位：**有什么画什么**。
+           *  - 该通道自己声明了档位（Claude Code 的授权模式 / Codex 的审批策略+沙箱）→ 一项一个 chip；
+           *  - 一项都没有（DeepSeek Harness 的 ACP 里没有 modes、mock 也没有）→ 才显示
+           *    **客户端**的放行策略（它仍然有效：决定客户端怎么应答写入/执行请求）。
+           */}
+          {permissionControls.map((control) => (
+            <button
+              key={control.id}
+              className="lr-agent__mode"
+              data-mode={control.id}
+              title={controlTitle(control)}
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={() => {
+                setOpenControl(control)
+                setPopover((value) => (value === 'control' ? 'none' : 'control'))
+              }}
+            >
+              <span className="lr-agent__mode-icon" aria-hidden="true">
+                {control.id === 'sandbox' ? '🔒' : '⚖'}
+              </span>
+              {permissionControls.length > 1
+                ? controlTitle(control) + '：' + optionName(control, controlValueOf(control), controlValueOf(control))
+                : optionName(control, controlValueOf(control), controlValueOf(control))}
+            </button>
+          ))}
+          {permissionControls.length === 0 ? (
+            <button
+              className="lr-agent__mode"
+              data-mode={agent.permissionMode}
+              /* 标记"这是客户端策略，不是那个工具自己的档位"（冒烟断言据此区分两类 chip） */
+              data-policy="true"
+              title={t('agent.policyTitle')}
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={() => setPopover((value) => (value === 'mode' ? 'none' : 'mode'))}
+            >
+              <span className="lr-agent__mode-icon" aria-hidden="true">
+                {MODE_GLYPH[agent.permissionMode]}
+              </span>
+              {t('agent.mode.' + agent.permissionMode + '.name')}
+            </button>
+          ) : null}
 
           <button
             className="lr-agent__chip"
@@ -781,10 +955,9 @@ export function AgentSidebarView(): JSX.Element {
               if (next === 'history') void agent.refreshHistory(documentDirectory())
             }}
           >
+            <IconHistory />
             {t('agent.historyButton')}
           </button>
-
-          <div className="lr-agent__composer-spacer" />
 
           {extraHigh ? (
             <button
@@ -805,6 +978,7 @@ export function AgentSidebarView(): JSX.Element {
               onMouseDown={(event) => event.stopPropagation()}
               onClick={() => setPopover((value) => (value === 'model' ? 'none' : 'model'))}
             >
+              <IconModel />
               {/* 显示**真实在跑的模型**：换 API 之后别名（sonnet/opus）已经说明不了问题 */}
               {agent.activeModel ?? currentModel?.name ?? t('graph.manualModel')}
             </button>
@@ -817,13 +991,17 @@ export function AgentSidebarView(): JSX.Element {
               onMouseDown={(event) => event.stopPropagation()}
               onClick={() => setPopover((value) => (value === 'effort' ? 'none' : 'effort'))}
             >
+              <IconGauge />
               {currentEffort?.name ?? t('graph.effort')}
             </button>
           ) : null}
 
+          {/* 占位放在最后：chip 换行时第二行从左边起排，发送键始终留在最后一行的右端 */}
+          <div className="lr-agent__composer-spacer" />
+
           {agent.streaming ? (
             <button className="lr-agent__send" data-stop="true" title={t('agent.stop')} onClick={() => void agent.stop()}>
-              ◼
+              <IconStop />
             </button>
           ) : (
             <button
@@ -832,7 +1010,7 @@ export function AgentSidebarView(): JSX.Element {
               title={t('agent.send')}
               onClick={send}
             >
-              ↑
+              <IconSend />
             </button>
           )}
         </div>
@@ -849,18 +1027,29 @@ const MODE_GLYPH: Record<PermissionMode, string> = {
   auto: '⚡'
 }
 
+/**
+ * 那四个档位的选择器（**客户端放行策略**）。
+ *
+ * 只在"该通道自己没有授权档位"时出现（DeepSeek Harness 的 ACP 里没有 modes，
+ * `session/set_mode` 直接 Method not found）。此时标题与说明要写清"这是我们这边的策略"，
+ * 否则用户会以为这是那个工具的功能。Claude Code 走的是它自己的授权模式（另一条路径）。
+ */
 function ModePicker({
   value,
-  onPick
+  onPick,
+  title,
+  note
 }: {
   value: PermissionMode
   onPick: (mode: PermissionMode) => void
+  title?: string
+  note?: string
 }): JSX.Element {
   const { t } = useTranslation()
   return (
     <div className="lr-agent__picker">
       <div className="lr-agent__picker-head">
-        <span>{t('agent.modeTitle')}</span>
+        <span>{title ?? t('agent.modeTitle')}</span>
         <span className="lr-agent__picker-hint">{t('agent.modeSwitchHint')}</span>
       </div>
       {PERMISSION_MODES.map((mode) => (
@@ -880,6 +1069,7 @@ function ModePicker({
           {value === mode ? <span className="lr-agent__picker-check">✓</span> : null}
         </button>
       ))}
+      {note ? <div className="lr-agent__picker-note">{note}</div> : null}
     </div>
   )
 }

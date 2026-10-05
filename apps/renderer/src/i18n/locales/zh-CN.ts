@@ -43,7 +43,6 @@ export const zhCN = {
     outline: '大纲',
     graph: '关系图',
     agent: 'Agent',
-    annotations: '标注',
     search: '搜索',
     settings: '设置',
     title: '活动栏'
@@ -53,7 +52,6 @@ export const zhCN = {
     outline: '大纲',
     graph: '关系图',
     agent: 'Agent',
-    annotations: '标注',
     search: '搜索',
     openEditors: '已打开的编辑器',
     recent: '最近打开',
@@ -64,10 +62,14 @@ export const zhCN = {
     graphEmpty: '尚未生成关系图',
     graphEmptyHint: '打开文档后可让 Agent 通读全文并生成逻辑关系图。',
     annotationsEmpty: '当前文档还没有标注',
-    annotationsFilterAll: '全部',
     searchPlaceholder: '在文档中查找',
     searchEmpty: '没有搜索结果',
     searchResults: '{{count}} 个结果',
+    searchScopeDoc: '本文档',
+    searchScopeLibrary: '全部文档',
+    searchLibraryPlaceholder: '在所有打开过的文档中查找',
+    searchLibraryHint: '跨文档检索：命中后点一下会打开对应文档并跳到该处',
+    searchOpenFailed: '打开文档失败：{{message}}',
     documentOutline: '文档大纲'
   },
   welcome: {
@@ -116,6 +118,10 @@ export const zhCN = {
     yes: '是',
     no: '否',
     confirm: '确认',
+    back: '上一步',
+    next: '下一步',
+    skip: '跳过',
+    done: '完成',
     search: '搜索',
     filter: '过滤',
     more: '更多',
@@ -162,7 +168,11 @@ export const zhCN = {
     tokens: '{{value}} tok',
     positions: '第 {{page}} 页',
     selection: '已选中 {{count}} 字',
-    restoreMs: '恢复 {{value}}ms'
+    restoreMs: '恢复 {{value}}ms',
+    build: '构建 {{value}}',
+    agentIdle: '空闲',
+    sheetOf: '工作表 {{index}} / {{total}}',
+    agentState: '{{agent}} · {{state}}'
   },
   tab: {
     welcome: '欢迎',
@@ -329,8 +339,10 @@ export const zhCN = {
     viewSingle: '单页',
     viewContinuous: '连续',
     viewSpread: '双页',
+    viewMode: '视图模式',
     find: '查找',
     findPlaceholder: '查找内容',
+    findClose: '关闭查找',
     findNext: '下一个',
     findPrevious: '上一个',
     findCount: '第 {{index}} / {{total}} 项',
@@ -357,6 +369,7 @@ export const zhCN = {
     fullscreen: '全屏',
     more: '更多',
     thumbnails: '缩略图',
+    railHide: '隐藏这一栏',
     outline: '目录',
     annotations: '标注',
     search: '搜索',
@@ -390,7 +403,6 @@ export const zhCN = {
     },
     sheet: {
       formulas: '公式',
-      truncatedRows: '仅渲染前 {{rows}} 行',
       loadFailed: '表格数据加载失败：{{message}}'
     }
   },
@@ -545,9 +557,6 @@ export const zhCN = {
     importTitle: '导入关系图 JSON',
     imported: '已导入关系图',
     importFailed: '导入失败：{{message}}',
-    naturalLanguagePlaceholder: '用一句话调整布局，如"改成从上到下"',
-    naturalLanguageApply: '应用',
-    naturalLanguageApplied: '已应用布局调整：{{result}}',
     inquiryLane: '提问泳道',
     mergeIntoGraph: '融入图'
   },
@@ -559,7 +568,13 @@ export const zhCN = {
     inputPlaceholder: '输入问题…（Enter 发送，Shift+Enter 换行）',
     send: '发送',
     stop: '停止',
-    welcomeHint: '// TODO: 让 Agent 读文档、查关系图，或者直接问它问题。',
+    welcomeHint: '让 Agent 读这篇文档，或者直接问它问题。',
+    readAskTitle: '要通读《{{title}}》全文吗？',
+    readAskBody:
+      '通读会把全文作为上下文发给 Agent，并消耗一次模型额度。同意之后，这篇文档的提问都在这条会话里继续。',
+    readAskStart: '开始通读',
+    readAskLater: '暂不',
+    readAskDismissed: '已跳过通读。随时可以直接提问。',
     statusWorking: '正在工作',
     statusDone: '已完成',
     statusStopped: '已停止',
@@ -645,6 +660,30 @@ export const zhCN = {
       auto: {
         name: '自动',
         description: '安全检查通过的操作自动通过，风险操作停下来问你'
+      }
+    },
+    /*
+     * 各 Agent 工具**自己的**授权档位。名字与说明都按"那个工具的词汇"写，
+     * 取不到时才退回协议原文（Codex 的 untrusted 这类标识符）。
+     * 上限来自协议：DeepSeek Harness 一项都没有（它那边 session/set_mode 是 Method not found）。
+     */
+    policyTitle: '客户端放行策略',
+    policyNote: '{{agent}} 本身不提供授权档位；这里控制的是客户端如何应答它的写入 / 执行请求。',
+    permission: {
+      permissionMode: { name: '授权模式' },
+      approvalPolicy: {
+        name: '审批策略',
+        untrusted: '每次都问',
+        'untrusted.description': '写入与执行命令都要你先确认',
+        'on-request': '按需放行',
+        'on-request.description': '由 Codex 自己判断，需要时才来问你'
+      },
+      sandbox: {
+        name: '沙箱',
+        'read-only': '只读',
+        'read-only.description': '只能读；改动会被它自己的沙箱挡下',
+        'workspace-write': '可写工作区',
+        'workspace-write.description': '允许在工作目录内写入'
       }
     },
     contextPreview: '上下文预览',

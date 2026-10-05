@@ -6,7 +6,7 @@
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
-import * as XLSX from 'xlsx'
+import * as XLSX from '@e965/xlsx'
 import { workbookToSheets } from '../apps/renderer/src/lib/sheetCache'
 
 const fixture = resolve(__dirname, 'fixtures/finance.xlsx')

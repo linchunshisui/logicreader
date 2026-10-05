@@ -10,21 +10,23 @@ files:
   - out/**/*
   - package.json
   - "!**/*.map"
+  # 官方 Claude Agent SDK 的**平台子包**里装着 236 MB 的原生 CLI。
+  # 我们不再内置它（见下方 extraResources 处的说明），所以也不让它进 asar：
+  # 可执行文件本来就不能从 asar 里启动，留在里面只是白占 236 MB。
+  # 模式匹配的是 `claude-agent-sdk-<平台>-<架构>`，不会误伤 SDK 本体 `claude-agent-sdk`。
+  - "!**/node_modules/@anthropic-ai/claude-agent-sdk-*/**"
 asarUnpack:
   - "**/node_modules/better-sqlite3/**"
 extraResources:
   - from: resources/icons
     to: icons
     filter: ["**/*"]
-  # 官方 Claude Agent SDK 的原生 CLI（236 MB）。**必须放在 asar 之外**：
-  #  · 可执行文件不能从 asar 里启动；
-  #  · 它也太大，塞进 asar 会让安装包与解压都难受。
-  # 运行时由 services/agent/sdk.ts 从 process.resourcesPath/claude-cli/ 解析。
-  # 来源由 scripts/copy-claude-cli.mjs 在打包前准备好（pnpm 的子包路径带哈希，没法直接写 here）
-  - from: resources/claude-cli
-    to: claude-cli
-    filter:
-      - "**/*"
+  # 这里原本还有一条把 `resources/claude-cli`（约 236 MB 官方 Claude Code CLI，
+  # 由脚本从 SDK 平台子包里复制出来）带进产物的 extraResources。
+  # 现已移除：那是 Anthropic 的二进制，随包再分发的许可条款需要单独确认（README 长期标注过这一风险），
+  # 而且它与"Agent 中立"的产品定位相悖。移除后：装了 Claude Code 的用户仍可正常使用
+  # （运行时解析用户自己安装的 claude，见 services/agent/sdk.ts 与 cli.ts），
+  # 没装的用户拿到的是一个功能完整的阅读器 —— 与"未装任何 Agent 仍是完整阅读器"的既有降级路径一致。
 # 启动器放到 win-unpacked 根目录（LogicReader.exe 旁边）：
 # 个别机器的安全策略会在程序代码运行之前拦死未签名 exe（沙箱初始化崩溃 / C: 盘写入被拒），
 # 此时双击 exe 无反应；双击「启动逻辑阅读器.cmd」会按 正常 → 关沙箱 → 便携数据目录 三档降级（避坑指南 §2.9）。

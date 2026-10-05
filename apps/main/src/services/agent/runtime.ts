@@ -1,5 +1,13 @@
 /** Agent 运行时：会话生命周期、事件总线、权限往返 —— 规划书 §5.4。 */
-import { createId, decidePermission, normalizePermissionMode, type PermissionMode } from '@logicreader/shared'
+import {
+  createId,
+  decidePermission,
+  isPermissionMode,
+  normalizePermissionMode,
+  permissionControlsOf,
+  policyFromControls,
+  type PermissionMode
+} from '@logicreader/shared'
 import { logMain } from '../../util/ipc'
 import { agentRegistry } from './registry'
 import { SdkAdapter, asSdkHandle, toPermissionDetail, type SdkCanUseTool } from './sdk'
@@ -38,6 +46,8 @@ export interface CreateSessionRequest {
   documentDir?: string | null
   /** 授权模式：决定写文件 / 执行命令是自动放行还是逐次询问（默认 manual） */
   permissionMode?: PermissionMode | null
+  /** 该通道自己那些档位的值（Codex 的 approvalPolicy / sandbox），原样交给适配器 */
+  configValues?: Record<string, string>
   /** 分叉已有会话（复制历史，原会话不动） */
   forkSession?: boolean | null
   /** 从某个用户消息处开始（配合 fork） */
@@ -117,7 +127,15 @@ export class AgentRuntime {
     if (!capability.available) throw new Error(capability.error ?? 'Agent 不可用')
     const adapter = agentRegistry.createAdapter(request.agentId)
     const workspaceDir = agentRegistry.defaultWorkdir(request.documentDir)
-    const permissionMode = normalizePermissionMode(request.permissionMode)
+    const clientPolicy = normalizePermissionMode(request.permissionMode)
+    /**
+     * 用户拨的是**该通道自己的档位**（Claude 的授权模式 / Codex 的审批策略+沙箱），
+     * 而下面的能力位与 `decidePermission` 只认客户端策略这一套 —— 折算交给纯函数
+     * （shared/permissions.ts 的 `policyFromControls`，有单测），别把 if 散在这里。
+     * 例：Codex 拨成"沙箱只读" → 折算成 plan → 写与执行两个能力位都是 false。
+     */
+    const configValues = request.configValues ?? {}
+    const permissionMode = policyFromControls(capability.protocol, clientPolicy, configValues)
     const settings = settingsService.all()
     /**
      * 授权模式是"逐次询问"的粒度控制，**不是**越过设置的后门：
@@ -139,6 +157,8 @@ export class AgentRuntime {
       forkSession: request.forkSession === true,
       resumeSessionAt: request.resumeSessionAt ?? null,
       permissionMode,
+      // 通道自己的档位原样带下去：codex 用它决定 thread/start 的 approvalPolicy / sandbox
+      configOverrides: Object.keys(configValues).length > 0 ? configValues : undefined,
       disableTools: request.disableTools === true
     }
     const sessionId = createId('sess')
@@ -761,10 +781,36 @@ export class AgentRuntime {
     return session.sdk.revertHunksOf(toolUseId, indices)
   }
 
+  /**
+   * 改会话上的一个配置项（模型 / 思考强度 / **通道自己的授权档位**）。
+   *
+   * 授权档位这条要特别小心：`RuntimeSession` 上缓存了 permissionMode 与两个能力位
+   * （权限往返读的就是它，见下面 requestPermission / fs/write_text_file），
+   * 活的切换必须**同时更新这份缓存**，否则会出现"界面切到自动、卡片却还在弹"。
+   * 只有协议支持活动会话切换的（Claude Code 的授权模式，`rebuild: false`）才走这条路；
+   * 需要重建的那些（Codex 的 approvalPolicy / sandbox）由界面负责 dispose，
+   * 这里遇到就直接报错，不静默当没发生。
+   */
   async setConfigOption(sessionId: string, optionId: string, value: string | boolean): Promise<void> {
     const session = this.sessions.get(sessionId)
     if (!session) throw new Error('会话不存在')
+    const control = permissionControlsOf(session.capability.protocol).find((item) => item.id === optionId)
+    if (control?.rebuild) {
+      throw new Error('「' + control.name + '」只能在建会话时指定，改它必须重建会话')
+    }
     await session.handle.setConfigOption?.(optionId, value)
+    if (optionId === 'permissionMode' && isPermissionMode(value)) {
+      const settings = settingsService.all()
+      const policy = policyFromControls(session.capability.protocol, value, { permissionMode: value })
+      session.permissionMode = policy
+      session.canWrite = policy === 'edit' || policy === 'auto' || settings.agent.allowWrite
+      session.canExecute = policy === 'auto' || settings.agent.allowExecute
+      logMain(
+        'info',
+        'agent',
+        '档位切换（活动会话，不重建）：' + policy + ' 写=' + String(session.canWrite) + ' 执行=' + String(session.canExecute)
+      )
+    }
   }
 
   // ------------------------------------------------------------- 权限往返

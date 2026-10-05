@@ -109,7 +109,7 @@ export const useLayout = create<LayoutState>((set, get) => ({
     set((s) => ({
       sidebarVisible: snapshot.sidebar?.visible ?? s.sidebarVisible,
       sidebarWidth: snapshot.sidebar?.width ?? s.sidebarWidth,
-      sidebarView: (snapshot.sidebar?.activeView as SidebarViewId) ?? s.sidebarView,
+      sidebarView: normalizeSidebarView(snapshot.sidebar?.activeView) ?? s.sidebarView,
       sidebarViewState: snapshot.sidebar?.viewState ?? {},
       auxVisible: snapshot.auxBar?.visible ?? s.auxVisible,
       auxWidth: snapshot.auxBar?.width ?? s.auxWidth,
@@ -122,3 +122,16 @@ export const useLayout = create<LayoutState>((set, get) => ({
       activeGroupId: snapshot.activeGroupId ?? s.activeGroupId
     }))
 }))
+
+/**
+ * 恢复侧栏视图时把"已经没有入口的旧视图"收敛掉。
+ *
+ * `annotations` 已并入阅读器自带侧栏（活动栏不再有这一项）：旧快照恢复出它的话，
+ * 左侧会开着一个**活动栏上没有对应按钮**的面板 —— 用户既不知道它从哪来，也不知道怎么回来。
+ */
+function normalizeSidebarView(value: unknown): SidebarViewId | null {
+  if (typeof value !== 'string') return null
+  const known: SidebarViewId[] = ['explorer', 'outline', 'graph', 'agent', 'annotations', 'search']
+  if (!known.includes(value as SidebarViewId)) return null
+  return value === 'annotations' ? 'outline' : (value as SidebarViewId)
+}

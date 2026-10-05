@@ -11,10 +11,12 @@
 import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { edgeLabel, nodeLabel, NODE_KIND_COLOR } from '@logicreader/graph-schema'
-import type { GraphEdge, GraphNode } from '@logicreader/graph-schema'
+import type { GraphAnchorRef, GraphEdge, GraphNode } from '@logicreader/graph-schema'
+import type { AnchorRecord } from '@logicreader/shared'
 import { api } from '../../lib/api'
 import i18n from '../../i18n'
 import { openGraphTab } from '../../commands'
+import { pickNearestAnchor } from '../../lib/anchorPick'
 import { revealInReader } from '../../lib/graphJump'
 import { useGraph } from '../../state/graph.store'
 import { useUiStore } from '../../state/ui.store'
@@ -48,6 +50,11 @@ export function GraphChainPanel({ docId }: { docId: string }): JSX.Element | nul
 
   const chain = request?.chain
   if (!chain || !request || request.docId !== docId || !graph || graph.docId !== docId) return null
+  /**
+   * 挑对端节点出处的参照点 = **当前阅读位置**（本次跳转落在 A 的那处出处）。
+   * 顺着逻辑链一跳一跳往下走时它随每一跳更新，所以永远是"离我现在读的这段最近"。
+   */
+  const referenceStart = request.charStart
   const activeId = previewId && graph.nodes.some((item) => item.id === previewId) ? previewId : chain.nodeId
   const node = graph.nodes.find((item) => item.id === activeId)
   if (!node) return null
@@ -59,18 +66,21 @@ export function GraphChainPanel({ docId }: { docId: string }): JSX.Element | nul
 
   /** 跳到对端节点对应的原文（与图中跳转走同一条路径，链可以一路追下去） */
   const jumpToPeer = async (peer: GraphNode): Promise<void> => {
-    const inline = peer.anchors?.[0]
-    const anchorId = peer.anchorIds?.[0]
-    const record = inline ? null : anchorId ? await api.store.getAnchor(anchorId) : null
-    const range = inline
-      ? { charStart: inline.charStart, charEnd: inline.charEnd }
-      : record
-        ? { charStart: record.charStart, charEnd: record.charEnd }
-        : null
-    if (!range) return
+    /*
+     * 对端可能有**多处出处**（anchors 保留同一概念的全部出现位置）。
+     * 取离当前阅读位置最近的那处，而不是数组里的第一处 —— 否则跳 B 会弹回 B 第一次出现的地方
+     * （可能远在几十页之前，读者还得自己往回找"这一段的 B"）。
+     */
+    const anchors: (GraphAnchorRef | AnchorRecord)[] = peer.anchors?.length
+      ? peer.anchors
+      : (await Promise.all((peer.anchorIds ?? []).map((id) => api.store.getAnchor(id)))).filter(
+          (item): item is AnchorRecord => item !== null
+        )
+    const picked = pickNearestAnchor(anchors, referenceStart)
+    if (!picked) return
     setBusy(true)
     try {
-      await revealInReader(docId, range.charStart, range.charEnd, {
+      await revealInReader(docId, picked.charStart, picked.charEnd, {
         hold: true,
         chain: { nodeId: peer.id, title: peer.title, via: 'node' }
       })

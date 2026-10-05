@@ -1,11 +1,21 @@
-import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useGraph } from '../../state/graph.store'
 
-export function QualityReport(): JSX.Element | null {
+/**
+ * 质量报告。
+ *
+ * 展开状态由调用方持有（存在关系图标签的 view 里，见 GraphViewState.overlays）：
+ * 默认**收起**成一行摘要 —— 它和迷你地图、图例同时展开时，画布中央就没地方看图了。
+ */
+export function QualityReport({
+  open,
+  onToggle
+}: {
+  open: boolean
+  onToggle: (open: boolean) => void
+}): JSX.Element | null {
   const { t } = useTranslation()
   const graph = useGraph()
-  const [open, setOpen] = useState(true)
   const data = graph.graph
   if (!data) return null
   const stats = data.stats
@@ -40,7 +50,7 @@ export function QualityReport(): JSX.Element | null {
 
   return (
     <div className="lr-quality" data-open={open}>
-      <button className="lr-quality__toggle" onClick={() => setOpen((value) => !value)}>
+      <button className="lr-quality__toggle" onClick={() => onToggle(!open)}>
         {open ? '▾' : '▸'} {t('graph.qualityReport')}
         <span className="lr-quality__summary">
           {stats.nodeCount} · {stats.edgeCount} · {Math.round((stats.anchorCoverage ?? 0) * 100)}%

@@ -120,3 +120,14 @@ function requireElectron(): typeof import('electron') {
 }
 
 export const IPC_CH = CH
+
+/**
+ * 只保留"值是字符串"的键值对（通道档位这类入参用它）。
+ *
+ * 渲染进程送进来的东西一律当成不可信：`configValues` 直接落到适配器的报文里
+ * （例如 Codex 的 `sandbox`），混进数组/对象就不只是类型不匹配的问题了。
+ */
+export function isPlainStringRecord(value: unknown): value is Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  return Object.entries(value as Record<string, unknown>).every(([, item]) => typeof item === 'string')
+}

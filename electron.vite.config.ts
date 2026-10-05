@@ -38,17 +38,19 @@ const workspaceAlias: Record<string, string> = {
 /**
  * 必须**排除在打包之外**的依赖：
  *  - `electron` 与 node 内置模块：运行时由宿主提供；
- *  - `better-sqlite3`：原生模块，需要运行时按平台加载；
  *  - `@anthropic-ai/claude-agent-sdk`：**ESM-only**（入口 `sdk.mjs`），
  *    而主进程产物是 CJS —— 打成 CJS 会把它整份塞进 bundle 并在运行时炸掉。
  *    因此保持外部依赖 + 运行时 `import()`（见 services/agent/sdk.ts 的 loadSdk）。
- *    它的平台子包（含 236 MB 的原生 CLI）也不能被 Vite 试图解析。
+ *    它的平台子包（含 236 MB 的原生 CLI）也不能被 Vite 试图解析 ——
+ *    那只在开发态的 node_modules 里存在，打包产物已将其排除（见 electron-builder.yml）。
+ *
+ * 注：持久化用的是 Node 内置的 `node:sqlite`（见 store.service.ts），不是 better-sqlite3，
+ * 所以这里没有原生 sqlite 模块需要外置。
  */
 const nodeExternals = [
   'electron',
   ...builtinModules,
   ...builtinModules.map((m) => `node:${m}`),
-  'better-sqlite3',
   '@anthropic-ai/claude-agent-sdk',
   /^@anthropic-ai\/claude-agent-sdk-/
 ]

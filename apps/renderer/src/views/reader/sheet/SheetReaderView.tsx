@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { ReaderTab } from '@logicreader/shared'
 import type { DocumentModel } from '@logicreader/document-model'
@@ -9,13 +9,15 @@ import { useSettings } from '../../../state/settings.store'
 import { registerReaderController } from '../../../state/readerBridge'
 import { useRevealRequest } from '../../../lib/revealRequest'
 import { markRange, useClearRevealOnReset } from '../../../lib/revealMark'
+import { DEFAULT_ROW_HEIGHT, computeSheetWindow, rowScrollOffset } from '../../../lib/sheetWindow'
+import { ZoomInput, clampZoom } from '../ZoomInput'
+import { IconActualSize, IconFitWidth, IconZoomIn, IconZoomOut } from '../../../workbench/icons'
 
 interface Props {
   tab: ReaderTab
   model: DocumentModel
 }
 
-const MAX_RENDER_ROWS = 2000
 const EMPTY_ROW: (string | null)[] = []
 
 /** 从 locator 的单元格区间（"A5:E5"）取 0 基行号；取不到返回 -1 */
@@ -33,8 +35,9 @@ interface SheetCellProps {
 }
 
 /**
- * 单元格与行都做 memo：点击一个单元格只重渲染受影响的行，
- * 而不是整张表（上限 2000 行 × 256 列，全量重渲染会明显卡顿）。
+ * 单元格与行都做 memo：点击一个单元格只重渲染受影响的行。
+ * 表格本身只渲染窗口内的几十行（见 lib/sheetWindow），memo 是第二道防线：
+ * 滚动时窗口滑动会让部分行换位，memo 让"值没变"的行不重渲染。
  */
 const SheetCell = memo(function SheetCell({ row, column, value, active, onSelect }: SheetCellProps) {
   const trimmed = value.trim()
@@ -92,13 +95,90 @@ export function SheetReaderView({ tab, model }: Props): JSX.Element {
   const [sheetIndex, setSheetIndex] = useState(0)
   const [showFormulas, setShowFormulas] = useState(false)
   const [activeCell, setActiveCell] = useState<{ row: number; column: number } | null>(null)
+  const [scale, setScale] = useState(1)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const tableRef = useRef<HTMLTableElement>(null)
+  /*
+   * 虚拟滚动：只渲染窗口内的行（见 lib/sheetWindow）。
+   * `scroll` 是**滚动容器坐标**（已被 CSS zoom 放大），`rowHeight` 是**未缩放**行高；
+   * 两套坐标的换算一律交给 sheetWindow 里的纯函数，这里不做心算。
+   */
+  const [scroll, setScroll] = useState({ top: 0, height: 0 })
+  const [rowHeight, setRowHeight] = useState(DEFAULT_ROW_HEIGHT)
+  const scrollFrame = useRef(0)
   const setSelection = useUiStore((s) => s.setSelection)
   const setActiveReaderTab = useUiStore((s) => s.setActiveReaderTab)
   const setReaderProgress = useUiStore((s) => s.setReaderProgress)
   const { settings } = useSettings()
 
   const sheet: SheetData | undefined = sheets[sheetIndex]
+
+  /*
+   * 行高从已渲染的行上量：`.lr-sheet` 是 `white-space: nowrap`，行高统一，量一行就够。
+   * `getBoundingClientRect()` 在这个 Chromium 下**会被 CSS zoom 放大**，
+   * 所以要除以 scale 折回未缩放坐标 —— 窗口函数要的正是未缩放的 rowHeight。
+   * 不依赖 scroll.top：那会让每帧滚动都强制同步布局，而行高与滚动位置无关。
+   */
+  useLayoutEffect(() => {
+    const row = scrollRef.current?.querySelector<HTMLElement>('tbody tr[data-row]')
+    if (!row || !sheet) return
+    const measured = row.getBoundingClientRect().height
+    const next = scale > 0 ? measured / scale : measured
+    if (next > 0 && Math.abs(next - rowHeight) > 0.5) setRowHeight(next)
+  }, [sheet, scale, showFormulas, rowHeight])
+
+  /* 视口尺寸：切换工作表 / 缩放后容器高度会变，重取一次 */
+  useLayoutEffect(() => {
+    const host = scrollRef.current
+    if (!host) return
+    setScroll({ top: host.scrollTop, height: host.clientHeight })
+  }, [sheet, scale])
+
+  useEffect(() => {
+    return () => {
+      if (scrollFrame.current) cancelAnimationFrame(scrollFrame.current)
+    }
+  }, [])
+
+  /**
+   * 滚动位置：每帧最多提交一次。
+   * 逐事件写 state 会让整棵树跟着重渲染（避坑指南 §45 的老毛病），所以用 rAF 合并。
+   */
+  const handleScroll = useCallback(() => {
+    if (scrollFrame.current) return
+    scrollFrame.current = requestAnimationFrame(() => {
+      scrollFrame.current = 0
+      const host = scrollRef.current
+      if (!host) return
+      setScroll({ top: host.scrollTop, height: host.clientHeight })
+    })
+  }, [])
+
+  /**
+   * 表格的"自然宽度"（倍率 1 时的像素宽）。
+   *
+   * **必须把 zoom 临时置 1 再量**：直接拿当前矩形除以 scale 的话，
+   * 一旦这个 Chromium 的 `getBoundingClientRect()` 不按 zoom 缩放（旧行为），
+   * `自然宽 = 矩形 / scale` 会随 scale 变小 → 适应宽度算出的倍率越算越大（正反馈，
+   * 与 ARCHITECTURE §1.23 里 PDF 旋转不断放大是同一类 bug）。量之前先归一，闭环就不成立。
+   */
+  const naturalWidth = useCallback((): number => {
+    const table = tableRef.current
+    if (!table) return 0
+    const previous = table.style.zoom
+    table.style.zoom = '1'
+    const width = table.getBoundingClientRect().width
+    table.style.zoom = previous
+    return width
+  }, [])
+
+  const fitWidth = useCallback((): void => {
+    const host = scrollRef.current
+    const natural = naturalWidth()
+    if (!host || natural <= 0) return
+    // 留 2px 余量：正好相等时亚像素误差会换来一条无意义的横向滚动条
+    setScale(clampZoom((host.clientWidth - 2) / natural, 0.2, 4))
+  }, [naturalWidth])
 
   useEffect(() => {
     const cached = getSheets(model.docId)
@@ -128,8 +208,9 @@ export function SheetReaderView({ tab, model }: Props): JSX.Element {
 
   useEffect(() => {
     setActiveReaderTab(tab.id)
-    setReaderProgress({ page: sheetIndex + 1, total: sheets.length, zoom: 1, percent: 0 })
-  }, [tab.id, sheetIndex, sheets.length, setActiveReaderTab, setReaderProgress])
+    // 表格分的是**工作表**不是页：口径交给状态栏（见 lib ReaderProgress.unit）
+    setReaderProgress({ page: sheetIndex + 1, total: sheets.length, zoom: scale, percent: 0, unit: 'sheet' })
+  }, [tab.id, sheetIndex, sheets.length, scale, setActiveReaderTab, setReaderProgress])
 
   const columnLabel = useCallback((index: number): string => {
     let n = index + 1
@@ -196,14 +277,25 @@ export function SheetReaderView({ tab, model }: Props): JSX.Element {
        */
       const row = rowFromRange(locator.range)
       if (row < 0) return false
-      const target = scrollRef.current?.querySelector<HTMLElement>('tr[data-row="' + row + '"]')
-      if (!target) return false
+      const host = scrollRef.current
+      if (!host) return false
+      const target = host.querySelector<HTMLElement>('tr[data-row="' + row + '"]')
+      if (!target) {
+        /*
+         * 虚拟滚动下目标行可能根本不在 DOM 里（落在窗口之外）。
+         * 先把容器滚到那一行，行进入窗口后由 `useRevealRequest` 的下一轮重试接住 ——
+         * 这里返回 false 就是"还没落地，请重试"，不能假装成功。
+         */
+        host.scrollTop = rowScrollOffset(row, rowHeight, scale)
+        setScroll({ top: host.scrollTop, height: host.clientHeight })
+        return false
+      }
       target.scrollIntoView({ behavior: settings.reader.smoothScroll ? 'smooth' : 'auto', block: 'center' })
       markRange(scrollRef.current, target, { charStart, charEnd: charStart }, options)
       setActiveCell({ row, column: 0 })
       return true
     },
-    [model, sheets, sheetIndex, settings.reader.smoothScroll]
+    [model, sheets, sheetIndex, settings.reader.smoothScroll, rowHeight, scale]
   )
 
   useRevealRequest(model.docId, (request) =>
@@ -216,12 +308,13 @@ export function SheetReaderView({ tab, model }: Props): JSX.Element {
       docId: model.docId,
       tabId: tab.id,
       kind: 'sheet',
-      zoomIn: () => undefined,
-      zoomOut: () => undefined,
-      zoomFitWidth: () => undefined,
-      zoomFitPage: () => undefined,
-      zoomActual: () => undefined,
-      setZoom: () => undefined,
+      zoomIn: () => setScale((value) => clampZoom(value + 0.1, 0.2, 4)),
+      zoomOut: () => setScale((value) => clampZoom(value - 0.1, 0.2, 4)),
+      zoomFitWidth: fitWidth,
+      // 表格没有"页面"可装：适应页面等同于适应宽度（表比视口宽时才有意义）
+      zoomFitPage: fitWidth,
+      zoomActual: () => setScale(1),
+      setZoom: (value) => setScale(clampZoom(value, 0.2, 4)),
       rotate: () => undefined,
       setViewMode: () => undefined,
       nextPage: () => setSheetIndex((index) => Math.min(sheets.length - 1, index + 1)),
@@ -244,7 +337,7 @@ export function SheetReaderView({ tab, model }: Props): JSX.Element {
         return citation
       }
     })
-  }, [model, tab.id, sheets.length, applyReveal])
+  }, [model, tab.id, sheets.length, applyReveal, fitWidth])
 
   if (loadError) {
     return (
@@ -264,7 +357,13 @@ export function SheetReaderView({ tab, model }: Props): JSX.Element {
     )
   }
 
-  const rowsToRender = Math.min(sheet.rowCount, MAX_RENDER_ROWS)
+  const sheetWindow = computeSheetWindow({
+    scrollTop: scroll.top,
+    viewportHeight: scroll.height,
+    rowHeight,
+    scale,
+    totalRows: sheet.rowCount
+  })
 
   return (
     <div className="lr-reader">
@@ -283,17 +382,47 @@ export function SheetReaderView({ tab, model }: Props): JSX.Element {
           </button>
         ))}
         <div className="lr-reader__toolbar-divider" />
+        <button
+          className="lr-icon-button"
+          title={t('reader.zoomOut')}
+          onClick={() => setScale((value) => clampZoom(value - 0.1, 0.2, 4))}
+        >
+          <IconZoomOut size={16} />
+        </button>
+        <ZoomInput scale={scale} onCommit={setScale} min={0.2} max={4} />
+        <button
+          className="lr-icon-button"
+          title={t('reader.zoomIn')}
+          onClick={() => setScale((value) => clampZoom(value + 0.1, 0.2, 4))}
+        >
+          <IconZoomIn size={16} />
+        </button>
+        <button
+          className="lr-icon-button"
+          title={t('reader.zoomFitWidth')}
+          data-active={false}
+          onClick={fitWidth}
+        >
+          <IconFitWidth size={16} />
+        </button>
+        <button className="lr-icon-button" title={t('reader.zoomActual')} onClick={() => setScale(1)}>
+          <IconActualSize size={16} />
+        </button>
+        <div className="lr-reader__toolbar-divider" />
         <label className="lr-reader__toolbar-meta">
           <input type="checkbox" checked={showFormulas} onChange={(event) => setShowFormulas(event.target.checked)} /> {t('reader.sheet.formulas')}
         </label>
         <div className="lr-reader__toolbar-spacer" />
         <span className="lr-reader__toolbar-meta">
           {sheet.name} · {sheet.rowCount} × {sheet.columnCount}
-          {sheet.rowCount > MAX_RENDER_ROWS ? ' (' + t('common.warning') + ': ' + t('reader.sheet.truncatedRows', { rows: MAX_RENDER_ROWS }) + ')' : ''}
         </span>
       </div>
-      <div className="lr-reader__viewport lr-scroll lr-sheet-viewport" ref={scrollRef}>
-        <table className="lr-sheet">
+      <div
+        className="lr-reader__viewport lr-scroll lr-sheet-viewport"
+        ref={scrollRef}
+        onScroll={handleScroll}
+      >
+        <table ref={tableRef} className="lr-sheet" style={{ zoom: scale }}>
           <thead>
             <tr>
               <th className="lr-sheet__corner" />
@@ -305,17 +434,39 @@ export function SheetReaderView({ tab, model }: Props): JSX.Element {
             </tr>
           </thead>
           <tbody>
-            {Array.from({ length: rowsToRender }, (_, row) => (
-              <SheetRow
-                key={row}
-                row={row}
-                values={(showFormulas ? sheet.formulas[row] : sheet.rows[row]) ?? EMPTY_ROW}
-                columnCount={sheet.columnCount}
-                activeRow={activeCell?.row === row}
-                activeColumn={activeCell?.column ?? null}
-                onSelect={selectCell}
-              />
-            ))}
+            {/* 上方占位用**未缩放**高度：zoom 会把它放大回窗口顶端该在的位置 */}
+            {sheetWindow.padTop > 0 && (
+              <tr aria-hidden="true">
+                <td
+                  className="lr-sheet__spacer"
+                  colSpan={sheet.columnCount + 1}
+                  style={{ height: sheetWindow.padTop }}
+                />
+              </tr>
+            )}
+            {Array.from({ length: sheetWindow.end - sheetWindow.start }, (_, offset) => {
+              const row = sheetWindow.start + offset
+              return (
+                <SheetRow
+                  key={row}
+                  row={row}
+                  values={(showFormulas ? sheet.formulas[row] : sheet.rows[row]) ?? EMPTY_ROW}
+                  columnCount={sheet.columnCount}
+                  activeRow={activeCell?.row === row}
+                  activeColumn={activeCell?.column ?? null}
+                  onSelect={selectCell}
+                />
+              )
+            })}
+            {sheetWindow.padBottom > 0 && (
+              <tr aria-hidden="true">
+                <td
+                  className="lr-sheet__spacer"
+                  colSpan={sheet.columnCount + 1}
+                  style={{ height: sheetWindow.padBottom }}
+                />
+              </tr>
+            )}
           </tbody>
         </table>
       </div>

@@ -36,7 +36,9 @@ export function TextReaderView({ tab, model }: Props): JSX.Element {
       page: 1,
       total: 1,
       zoom,
-      percent: 0
+      percent: 0,
+      // 纯文本没有页：状态栏不显示"第 N / M"（旧行为是永远显示"第 1 / 1 页"）
+      unit: null
     })
   }, [tab.id, zoom, setActiveReaderTab, setReaderProgress])
 

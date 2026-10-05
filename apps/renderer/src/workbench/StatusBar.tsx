@@ -5,6 +5,7 @@ import { useLayout } from '../state/layout.store'
 import { useSettings } from '../state/settings.store'
 import { useTabs } from '../state/tabs.store'
 import { useUiStore } from '../state/ui.store'
+import { useAgent } from '../state/agent.store'
 import { executeCommand } from '../state/commands.store'
 import { useDocuments } from '../state/documents.store'
 
@@ -15,6 +16,7 @@ export function StatusBar(): JSX.Element {
   const { settings, resolvedTheme } = useSettings()
   const { readerProgress, selection, statusMessage: message, statusMessageAt } = useUiStore()
   const documents = useDocuments()
+  const agent = useAgent()
   const [now, setNow] = useState(Date.now())
 
   useEffect(() => {
@@ -37,6 +39,30 @@ export function StatusBar(): JSX.Element {
 
   const showMessage = message && now - statusMessageAt < 8000
 
+  /*
+   * "第 N / M" 的口径由阅读器自己声明（`readerProgress.unit`）：
+   * 表格读的是**工作表**，Markdown / DOCX / 纯文本根本没有分页概念 ——
+   * 一律按"页"渲染会得到"第 1 / 1 页"这种没人看得懂的东西（表格更糟：两页 Sheet 被叫成两页）。
+   */
+  const progressLabel =
+    readerProgress?.unit === 'sheet'
+      ? t('status.sheetOf', { index: readerProgress.page, total: readerProgress.total })
+      : readerProgress?.unit === 'page'
+        ? t('common.pageOf', { page: readerProgress.page, total: readerProgress.total })
+        : null
+
+  /*
+   * Agent 项要能回答"现在用的是谁、在不在忙"：
+   * 只写一个 "Agent" 的话，用户既看不出当前通道，也看不出它是否正在工作。
+   */
+  const agentCapability = agent.agents.find((item) => item.id === agent.selectedAgentId)?.capability ?? null
+  const agentLabel = agentCapability?.displayName
+    ? t('status.agentState', {
+        agent: agentCapability.displayName,
+        state: agent.streaming ? t('agent.statusWorking') : t('status.agentIdle')
+      })
+    : t('agent.unavailable')
+
   return (
     <footer className="lr-statusbar">
       <div className="lr-statusbar__group">
@@ -47,13 +73,13 @@ export function StatusBar(): JSX.Element {
         >
           {title}
         </button>
-        {readerProgress ? (
+        {progressLabel ? (
           <button
             className="lr-statusbar__item"
             onClick={() => void executeCommand(CMD.gotoPage)}
             title={t('reader.pagePlaceholder')}
           >
-            {t('common.pageOf', { page: readerProgress.page, total: readerProgress.total })}
+            {progressLabel}
           </button>
         ) : null}
         {readerProgress ? (
@@ -74,10 +100,16 @@ export function StatusBar(): JSX.Element {
         ) : null}
       </div>
       <div className="lr-statusbar__group">
+        {/*
+         * 状态栏这一项显示的是**应用主题**，那就应该切应用主题。
+         * 它原来点下去执行的是「阅读区主题」（readerThemeOverride）—— 显示与动作对不上：
+         * 用户看到"主题：浅色"点一下，结果整个界面的主题没变（变的只有阅读区）。
+         * 阅读区主题仍可从命令面板（`cmd.reader.toggleDarkMode`）与设置里改，没有丢。
+         */}
         <button
           className="lr-statusbar__item"
-          title={t('settings.appearance.readerThemeOverride')}
-          onClick={() => void executeCommand(CMD.themeToggleReader)}
+          title={t('cmd.workbench.action.toggleLightDarkThemes')}
+          onClick={() => void executeCommand(CMD.themeToggleLightDark)}
         >
           {t('status.theme')}：{resolvedTheme === 'dark' ? t('settings.appearance.themeDark') : t('settings.appearance.themeLight')}
         </button>
@@ -90,13 +122,15 @@ export function StatusBar(): JSX.Element {
         </button>
         <button
           className="lr-statusbar__item"
-          title={t('agent.title')}
+          title={agentCapability?.displayName ?? t('agent.unavailable')}
+          data-streaming={agent.streaming}
           onClick={() => void executeCommand(CMD.agentFocusInput)}
         >
-          {settings.agent.disabled.length > 0 ? t('agent.unavailable') : t('agent.title')}
+          {agentLabel}
         </button>
-        <span className="lr-statusbar__item lr-statusbar__build" title="构建时间">
-          {typeof __LR_BUILD__ === "string" ? __LR_BUILD__ : ""}
+        {/* 带标签的构建时间：裸时间戳看起来像"停住的时钟"，但它其实是"我跑的是哪份产物" */}
+        <span className="lr-statusbar__item lr-statusbar__build">
+          {typeof __LR_BUILD__ === 'string' ? t('status.build', { value: __LR_BUILD__ }) : ''}
         </span>
 
         {layout.zenMode ? <span className="lr-statusbar__item">🧘 {t('common.focusMode')}</span> : null}

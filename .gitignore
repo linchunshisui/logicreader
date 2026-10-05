@@ -1,6 +1,4 @@
 node_modules/
-# 打包前由 scripts/copy-claude-cli.mjs 从 node_modules 复制（234 MB，不进版本库）
-resources/claude-cli/
 out/
 release/
 release-*/

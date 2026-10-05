@@ -38,10 +38,10 @@ import { existsSync, readdirSync } from 'node:fs'
 import type { ChildProcess } from 'node:child_process'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { createId, type AgentSessionInfoView } from '@logicreader/shared'
+import { createId, CODEX_PERMISSION_CONTROLS, type AgentSessionInfoView } from '@logicreader/shared'
 import { logMain } from '../../util/ipc'
 import { killTree, readVersion, resolveAgentExecutable, spawnAgent, type ResolvedExecutable } from './exec'
-import { buildModelConfigOptions, mapCodexModel, type CodexModelInfo, type ModelView } from './model-view'
+import { buildModelConfigOptions, mapCodexModel, permissionConfigOptions, type CodexModelInfo, type ModelView } from './model-view'
 import type {
   AgentAdapter,
   AgentCapability,
@@ -710,12 +710,21 @@ export class CodexSession implements AgentSessionHandle {
         logMain('warn', 'codex', (this.options.forkSession ? '分叉' : '续聊') + '会话失败，改为新建：' + String(error))
       }
     }
+    /*
+     * 界面拨的两个旋钮（审批策略 / 沙箱）**优先**：它们是用户在 Codex 自己的词汇里选的值。
+     * 没给（例如一次性任务、或旧快照）才回落到按客户端策略折算的老路子。
+     * 注意：这两个参数只有 `thread/start` 认，中途改不了 —— 所以界面切它时会重建线程。
+     */
+    const approvalPolicy = this.options.configOverrides?.approvalPolicy ?? approvalPolicyFor(this.options.permissionMode)
+    const sandbox = this.options.configOverrides?.sandbox ?? (this.options.permissionMode === 'plan' ? 'read-only' : 'workspace-write')
+    // 留痕：这两个值只能在建线程时给，出问题时第一眼要看的就是"到底按什么建起来的"
+    logMain('info', 'codex', '新建线程：审批策略=' + approvalPolicy + ' 沙箱=' + sandbox)
     const result = await this.client.request<{ thread?: Record<string, unknown> }>(
       'thread/start',
       {
         cwd: this.options.cwd,
-        approvalPolicy: approvalPolicyFor(this.options.permissionMode),
-        sandbox: this.options.permissionMode === 'plan' ? 'read-only' : 'workspace-write'
+        approvalPolicy,
+        sandbox
       },
       REQUEST_TIMEOUT_MS
     )
@@ -957,10 +966,13 @@ export class CodexAdapter implements AgentAdapter {
       supportsStreaming: true,
       supportsModel: models.length > 0,
       supportsThoughtLevel: models.some((model) => (model.thoughtLevels?.length ?? 0) > 0),
-      // 模型与思考强度是逐回合参数，不需要重建会话
-      supportsPermissionModeSwitch: true,
       models,
-      configOptions: buildModelConfigOptions(models),
+      /*
+       * 授权档位是**它自己的**两个维度（审批策略 + 沙箱），而且只能在 `thread/start` 时指定，
+       * 没有中途切换的接口 → rebuild=true（切档必须重建线程）。
+       * 模型与思考强度则是逐回合参数（`turn/start` 的 model/effort），不需要重建。
+       */
+      configOptions: [...buildModelConfigOptions(models), ...permissionConfigOptions(CODEX_PERMISSION_CONTROLS)],
       defaultModel: models[0]?.id ?? null,
       defaultThoughtLevel: models[0]?.defaultThoughtLevel ?? models[0]?.thoughtLevels?.[0]?.id ?? null,
       error: null,
@@ -985,7 +997,6 @@ export class CodexAdapter implements AgentAdapter {
       supportsStreaming: false,
       supportsModel: false,
       supportsThoughtLevel: false,
-      supportsPermissionModeSwitch: false,
       models: [],
       configOptions: [] as ConfigOption[],
       defaultModel: null,

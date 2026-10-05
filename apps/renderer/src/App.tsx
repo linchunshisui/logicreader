@@ -59,8 +59,12 @@ export function App(): JSX.Element {
           useTabs.getState().openTab({ kind: 'welcome', id: 'welcome-1' })
         }
         reportRestoreOutcome(outcome)
-        // 首次启动（没有可用快照）时给出四步向导
-        if (!outcome.restored) setShowWizard(true)
+        /*
+         * 首启向导只看"向导有没有被看过"（settings.wizardSeen），不看"本机有没有会话快照"。
+         * 旧判据是 `!outcome.restored`：用户主动「清除已保存的会话」之后，
+         * 下一次启动又被当成第一次启动、再被向导拦一次 —— 语义完全对不上。
+         */
+        if (!useSettings.getState().settings.wizardSeen) setShowWizard(true)
         if (outcome.restored) {
           const total = outcome.tabs
           useUiStore.getState().setStatusMessage(
@@ -78,6 +82,18 @@ export function App(): JSX.Element {
           const rawCommand = payload?.commandId ?? ''
           const [commandId, inlineArg] = rawCommand.split(':')
           const inlineArgs = inlineArg ? { mode: inlineArg, page: Number(inlineArg) || undefined } : {}
+          /**
+           * 本轮 UI 修复的断言集合（见 lib/smokeAudit.ts）。
+           * 前缀刻意与既有的 smoke.auditMapping / smoke.auditAnchor 区分开 —— 那两个是"点一遍再断言"的脚本。
+           */
+          if (commandId.startsWith('smoke.assert')) {
+            void (async () => {
+              const { runSmokeAudit } = await import('./lib/smokeAudit')
+              // inlineArg 用于"读某条会话"这类需要参数的断言（如 smoke.assertMessageSummary:<conversationId>）
+              await runSmokeAudit(commandId, inlineArg)
+            })()
+            return
+          }
           if (commandId === 'smoke.hitTest') {
             void (async () => {
               const page = document.querySelector<HTMLElement>('.lr-pdf-page')
@@ -3222,6 +3238,9 @@ export function App(): JSX.Element {
         <FirstRunWizard
           onDone={() => {
             setShowWizard(false)
+            // 记在设置里，而不是继续靠"本机有没有会话快照"判断：
+            // 用户主动清掉会话后重启，不应该再被当成"第一次启动"
+            void useSettings.getState().patch({ wizardSeen: true })
           }}
         />
       ) : null}

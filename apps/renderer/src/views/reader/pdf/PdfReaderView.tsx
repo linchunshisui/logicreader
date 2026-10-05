@@ -25,8 +25,36 @@ import { exportAnnotatedPdf, type ExportAnnotation } from './pdfExport'
 import { PdfRail } from './PdfRail'
 import { notify } from '../../../state/notifications.store'
 import i18n from '../../../i18n'
+import { CMD, railPanelsOf } from '@logicreader/shared'
+import { executeCommand } from '../../../state/commands.store'
+import { Menu } from '../../../workbench/Menu'
+import {
+  IconAnnotate,
+  IconArrowDown,
+  IconArrowUp,
+  IconChevronLeft,
+  IconChevronRight,
+  IconClose,
+  IconFitPage,
+  IconFitWidth,
+  IconMore,
+  IconRotate,
+  IconSearch,
+  IconStrike,
+  IconThumbnails,
+  IconUnderline,
+  IconZoomIn,
+  IconZoomOut
+} from '../../../workbench/icons'
 
 type ZoomSetting = number | 'fit-width' | 'fit-page' | 'actual'
+
+/**
+ * PDF 三种视图模式（ARCHITECTURE §1.24）。
+ * 单独起个名字是为了让 `<select>` 的 onchange 能**收窄成这个联合**，
+ * 而不是旧写法 `as 'single'`（断言成一个成员，等于把另外两种模式从类型里抹掉）。
+ */
+type PdfViewMode = 'single' | 'continuous' | 'spread'
 
 /**
  * 双页时两页之间的中缝宽度（px）。
@@ -67,12 +95,15 @@ export function PdfReaderView({ tab, model }: Props): JSX.Element {
   const [currentPage, setCurrentPage] = useState(tab.view.page || 1)
   const [zoom, setZoom] = useState<ZoomSetting>((tab.view.zoom as ZoomSetting) ?? 'fit-width')
   const [rotation, setRotation] = useState<number>(tab.view.rotation ?? 0)
-  const [viewMode, setViewMode] = useState<'single' | 'continuous' | 'spread'>(tab.view.viewMode ?? 'continuous')
+  const [viewMode, setViewMode] = useState<PdfViewMode>(tab.view.viewMode ?? 'continuous')
   const [scrollElement, setScrollElement] = useState<HTMLDivElement | null>(null)
   const [containerWidth, setContainerWidth] = useState(900)
   const [containerHeight, setContainerHeight] = useState(700)
   const [findQuery, setFindQuery] = useState('')
   const [findIndex, setFindIndex] = useState(0)
+  /** 查找条默认收起：常驻输入框会把工具栏挤到溢出（窄窗口尤甚） */
+  const [findOpen, setFindOpen] = useState(false)
+  const [moreOpen, setMoreOpen] = useState(false)
   const [annotations, setAnnotations] = useState<AnnotationView[]>([])
   const [activeAnnotation, setActiveAnnotation] = useState<string | null>(tab.view.activeAnnotationId)
   const [colorIndex, setColorIndex] = useState(0)
@@ -300,7 +331,7 @@ export function PdfReaderView({ tab, model }: Props): JSX.Element {
 
   useEffect(() => {
     setActiveReaderTab(tab.id)
-    setReaderProgress({ page: currentPage, total: doc?.numPages ?? 0, zoom: scale, percent: 0 })
+    setReaderProgress({ page: currentPage, total: doc?.numPages ?? 0, zoom: scale, percent: 0, unit: 'page' })
   }, [tab.id, currentPage, scale, doc, setActiveReaderTab, setReaderProgress])
 
   // 滚动 → 当前页
@@ -822,8 +853,9 @@ export function PdfReaderView({ tab, model }: Props): JSX.Element {
       findNext: () => gotoFindHit(findIndex + 1),
       findPrevious: () => gotoFindHit(findIndex - 1),
       openFind: () => {
-        const element = document.querySelector<HTMLInputElement>('.lr-findbar input')
-        element?.focus()
+        setFindOpen(true)
+        // 展开是 React 状态更新：输入框这一帧还不存在，下一帧再聚焦
+        setTimeout(() => document.querySelector<HTMLInputElement>('.lr-reader__find')?.focus(), 0)
       },
       // 高亮已停用（产品决定：选中文字不需要再加色块），其余标注类型照旧
       addAnnotation: (kind) => (kind === 'highlight' ? undefined : void createAnnotation(kind)),
@@ -938,98 +970,255 @@ export function PdfReaderView({ tab, model }: Props): JSX.Element {
     />
   )
 
+  // 暗色模式的当前档位：工具栏上是个按钮（原来是一段文字 chip），点了就循环切档
+  const darkModeLabel =
+    settings.pdfDarkMode === 'off'
+      ? t('reader.darkMode.off')
+      : settings.pdfDarkMode === 'invert'
+        ? t('reader.darkMode.invert')
+        : t('reader.darkMode.smart')
+
+  /** 「更多」菜单里的视图模式：给当前那一项打勾（工具栏上的下拉在窄窗口会被收起） */
+  const viewMark = (mode: PdfViewMode): string => (viewMode === mode ? '✓ ' : '')
+
+  /**
+   * 自带侧栏的两块面板（缩略图 / 标注）：各自独立、可同时打开，都关掉则整条侧栏收起。
+   * 旧快照只有三选一的 `sidebarView`，兼容规则收敛在 shared 的 `railPanelsOf`（有单测）。
+   */
+  const railPanels = railPanelsOf(tab.view)
+  const toggleRailPanel = (panel: 'thumbnails' | 'annotations', open: boolean): void => {
+    useTabs.getState().updateReaderView(tab.id, { railPanels: { ...railPanels, [panel]: open } })
+  }
+
   return (
     <div className="lr-reader">
       <div className="lr-reader__toolbar">
-        <button className="lr-icon-button" title={t('reader.prevPage')} onClick={() => scrollToPage(Math.max(1, currentPage - 1))}>
-          ◀
+        <button
+          className="lr-icon-button"
+          data-group="nav"
+          title={t('reader.prevPage')}
+          onClick={() => scrollToPage(Math.max(1, currentPage - 1))}
+        >
+          <IconChevronLeft />
         </button>
         <input
           className="lr-reader__page-input"
+          data-group="page"
           value={currentPage}
           onChange={(event) => {
             const value = Number(event.target.value)
             if (Number.isFinite(value)) scrollToPage(Math.max(1, Math.min(doc.numPages, value)))
           }}
         />
-        <span className="lr-reader__toolbar-meta">/ {doc.numPages}</span>
-        <button className="lr-icon-button" title={t('reader.nextPage')} onClick={() => scrollToPage(Math.min(doc.numPages, currentPage + 1))}>
-          ▶
+        <span className="lr-reader__toolbar-meta" data-group="page">
+          / {doc.numPages}
+        </span>
+        <button
+          className="lr-icon-button"
+          data-group="nav"
+          title={t('reader.nextPage')}
+          onClick={() => scrollToPage(Math.min(doc.numPages, currentPage + 1))}
+        >
+          <IconChevronRight />
         </button>
-        <div className="lr-reader__toolbar-divider" />
-        <button className="lr-icon-button" title={t('reader.zoomOut')} onClick={() => setZoom(Math.max(0.2, scale - 0.15))}>
-          −
+        <div className="lr-reader__toolbar-divider" data-group="zoom" />
+        <button
+          className="lr-icon-button"
+          data-group="zoom"
+          title={t('reader.zoomOut')}
+          onClick={() => setZoom(Math.max(0.2, scale - 0.15))}
+        >
+          <IconZoomOut />
         </button>
         <ZoomInput scale={scale} onCommit={(value) => setZoom(clampZoom(value))} />
-        <button className="lr-icon-button" title={t('reader.zoomIn')} onClick={() => setZoom(Math.min(4, scale + 0.15))}>
-          ＋
+        <button
+          className="lr-icon-button"
+          data-group="zoom"
+          title={t('reader.zoomIn')}
+          onClick={() => setZoom(Math.min(4, scale + 0.15))}
+        >
+          <IconZoomIn />
         </button>
-        <button className="lr-icon-button" title={t('reader.zoomFitWidth')} data-active={zoom === 'fit-width'} onClick={() => setZoom('fit-width')}>
-          ⇔
+        <button
+          className="lr-icon-button"
+          data-group="zoomfit"
+          title={t('reader.zoomFitWidth')}
+          data-active={zoom === 'fit-width'}
+          onClick={() => setZoom('fit-width')}
+        >
+          <IconFitWidth />
         </button>
-        <button className="lr-icon-button" title={t('reader.zoomFitPage')} data-active={zoom === 'fit-page'} onClick={() => setZoom('fit-page')}>
-          ⤢
+        <button
+          className="lr-icon-button"
+          data-group="zoomfit"
+          title={t('reader.zoomFitPage')}
+          data-active={zoom === 'fit-page'}
+          onClick={() => setZoom('fit-page')}
+        >
+          <IconFitPage />
         </button>
-        <div className="lr-reader__toolbar-divider" />
-        <button className="lr-icon-button" title={t('reader.rotate')} onClick={() => setRotation((value) => (value + 90) % 360)}>
-          ⟳
+        <div className="lr-reader__toolbar-divider" data-group="viewmode" />
+        <button
+          className="lr-icon-button"
+          data-group="viewmode"
+          title={t('reader.rotate')}
+          onClick={() => setRotation((value) => (value + 90) % 360)}
+        >
+          <IconRotate />
         </button>
-        <select value={viewMode} onChange={(event) => setViewMode(event.target.value as 'single')} title={t('reader.viewContinuous')}>
+        <select
+          className="lr-reader__viewmode"
+          data-group="viewmode"
+          value={viewMode}
+          title={t('reader.viewMode')}
+          onChange={(event) => setViewMode(event.target.value as PdfViewMode)}
+        >
           <option value="single">{t('reader.viewSingle')}</option>
           <option value="continuous">{t('reader.viewContinuous')}</option>
           <option value="spread">{t('reader.viewSpread')}</option>
         </select>
-        <div className="lr-reader__toolbar-divider" />
-        <input
-          className="lr-reader__find"
-          value={findQuery}
-          placeholder={t('reader.findPlaceholder')}
-          onChange={(event) => {
-            setFindQuery(event.target.value)
-            setFindIndex(0)
-          }}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter') gotoFindHit(event.shiftKey ? findIndex - 1 : findIndex + 1)
-          }}
-        />
-        <span className="lr-reader__toolbar-meta">
-          {findQuery ? t('reader.findCount', { index: findHits.length === 0 ? 0 : findIndex + 1, total: findHits.length }) : ''}
-        </span>
-        <button className="lr-icon-button" title={t('reader.findPrevious')} onClick={() => gotoFindHit(findIndex - 1)}>
-          ↑
-        </button>
-        <button className="lr-icon-button" title={t('reader.findNext')} onClick={() => gotoFindHit(findIndex + 1)}>
-          ↓
-        </button>
-        <div className="lr-reader__toolbar-divider" />
+        <div className="lr-reader__toolbar-divider" data-group="annotate" />
         {/* 高亮按钮已移除（产品决定：不需要高亮） */}
-        <button className="lr-icon-button" title={t('reader.annotateUnderline')} onClick={() => void createAnnotation('underline')}>
-          U
-        </button>
-        <button className="lr-icon-button" title={t('reader.annotateStrike')} onClick={() => void createAnnotation('strike')}>
-          S
-        </button>
-        <div className="lr-reader__toolbar-spacer" />
-        {/* 诊断入口：不依赖快捷键（有些环境会吞掉 Ctrl 组合键） */}
         <button
           className="lr-icon-button"
-          title={t('reader.debugTextLayer')}
-          onClick={() => {
-            void (async () => {
-              const { dumpTextLayerGeometry } = await import('../../../lib/textLayerDebug')
-              await dumpTextLayerGeometry()
-              notify(t('reader.debugTextLayerDone'), 'success', { timeoutMs: 6000 })
-            })()
-          }}
+          data-group="annotate"
+          title={t('reader.annotateUnderline')}
+          onClick={() => void createAnnotation('underline')}
         >
-          🔬
+          <IconUnderline />
         </button>
-        <button className="lr-icon-button" title={t('reader.export.annotatedTitle')} onClick={() => void exportAnnotated()}>
-          ⤓
+        <button
+          className="lr-icon-button"
+          data-group="annotate"
+          title={t('reader.annotateStrike')}
+          onClick={() => void createAnnotation('strike')}
+        >
+          <IconStrike />
         </button>
-        <span className="lr-reader__toolbar-meta">
-          {settings.pdfDarkMode === 'off' ? t('reader.darkMode.off') : settings.pdfDarkMode === 'invert' ? t('reader.darkMode.invert') : t('reader.darkMode.smart')}
-        </span>
+        <div className="lr-reader__toolbar-divider" />
+        {/*
+         * 自带侧栏的两块面板：各自一个开关，**可以同时打开**（用户要求）。
+         * 这一栏是唯一的唤起入口，所以它们不参与"窄窗口收进更多菜单"的分档（永远可见）。
+         */}
+        <button
+          className="lr-icon-button"
+          title={railPanels.thumbnails ? t('reader.railHide') : t('reader.thumbnails')}
+          data-active={railPanels.thumbnails}
+          data-panel="thumbnails"
+          onClick={() => toggleRailPanel('thumbnails', !railPanels.thumbnails)}
+        >
+          <IconThumbnails />
+        </button>
+        <button
+          className="lr-icon-button"
+          title={railPanels.annotations ? t('reader.railHide') : t('reader.annotations')}
+          data-active={railPanels.annotations}
+          data-panel="annotations"
+          onClick={() => toggleRailPanel('annotations', !railPanels.annotations)}
+        >
+          <IconAnnotate />
+        </button>
+        <div className="lr-reader__toolbar-spacer" />
+        {/*
+         * 查找：折叠态只占一个图标。
+         * 旧版把输入框常驻在工具栏里，配合下面的"更多"菜单，960px 的最小窗口宽度就装不下了。
+         */}
+        {findOpen ? (
+          <span className="lr-reader__find-inline">
+            <input
+              // eslint-disable-next-line jsx-a11y/no-autofocus
+              autoFocus
+              className="lr-reader__find"
+              value={findQuery}
+              placeholder={t('reader.findPlaceholder')}
+              onChange={(event) => {
+                setFindQuery(event.target.value)
+                setFindIndex(0)
+              }}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') gotoFindHit(event.shiftKey ? findIndex - 1 : findIndex + 1)
+                if (event.key === 'Escape') {
+                  setFindQuery('')
+                  setFindOpen(false)
+                }
+              }}
+            />
+            <span className="lr-reader__toolbar-meta">
+              {findQuery ? t('reader.findCount', { index: findHits.length === 0 ? 0 : findIndex + 1, total: findHits.length }) : ''}
+            </span>
+            <button className="lr-icon-button" title={t('reader.findPrevious')} onClick={() => gotoFindHit(findIndex - 1)}>
+              <IconArrowUp />
+            </button>
+            <button className="lr-icon-button" title={t('reader.findNext')} onClick={() => gotoFindHit(findIndex + 1)}>
+              <IconArrowDown />
+            </button>
+            <button
+              className="lr-icon-button"
+              title={t('reader.findClose')}
+              onClick={() => {
+                setFindQuery('')
+                setFindOpen(false)
+              }}
+            >
+              <IconClose />
+            </button>
+          </span>
+        ) : (
+          <button className="lr-icon-button" title={t('reader.find')} onClick={() => setFindOpen(true)}>
+            <IconSearch size={16} />
+          </button>
+        )}
+        {/*
+         * 次要动作收进「更多」：诊断与导出都是低频操作，
+         * 常驻在工具栏上只会把主操作挤到溢出（窄窗口时更明显）。
+         */}
+        <Menu
+          label={<IconMore />}
+          labelText={t('reader.more')}
+          buttonClassName="lr-icon-button"
+          hoverSwitch={false}
+          open={moreOpen}
+          onOpenChange={setMoreOpen}
+          items={[
+            /*
+             * 窄窗口下工具栏会按自身宽度收起"标注 / 视图模式 / 适应宽度 / 缩放 / 页码"这几组
+             * （见 pdf.css 的容器查询），所以「更多」里必须各留一份 —— 否则收起来就等于找不到了。
+             */
+            {
+              id: 'underline',
+              label: t('reader.annotateUnderline'),
+              run: () => void createAnnotation('underline')
+            },
+            {
+              id: 'strike',
+              label: t('reader.annotateStrike'),
+              run: () => void createAnnotation('strike')
+            },
+            { id: 'sepView', label: '', separator: true },
+            { id: 'viewSingle', label: viewMark('single') + t('reader.viewSingle'), run: () => setViewMode('single') },
+            { id: 'viewContinuous', label: viewMark('continuous') + t('reader.viewContinuous'), run: () => setViewMode('continuous') },
+            { id: 'viewSpread', label: viewMark('spread') + t('reader.viewSpread'), run: () => setViewMode('spread') },
+            { id: 'sep', label: '', separator: true },
+            {
+              id: 'diagnose',
+              label: t('reader.debugTextLayer'),
+              run: () => {
+                void (async () => {
+                  const { dumpTextLayerGeometry } = await import('../../../lib/textLayerDebug')
+                  await dumpTextLayerGeometry()
+                  notify(t('reader.debugTextLayerDone'), 'success', { timeoutMs: 6000 })
+                })()
+              }
+            },
+            { id: 'export', label: t('reader.export.annotatedTitle'), run: () => void exportAnnotated() },
+            { id: 'sepDark', label: '', separator: true },
+            {
+              id: 'dark',
+              label: t('reader.darkMode.label') + '：' + darkModeLabel,
+              run: () => void executeCommand(CMD.themeCyclePdfDark)
+            }
+          ]}
+        />
       </div>
 
       <div className="lr-pdf-root">
@@ -1037,10 +1226,10 @@ export function PdfReaderView({ tab, model }: Props): JSX.Element {
           doc={doc}
           model={model}
           currentPage={currentPage}
-          activeView={tab.view.sidebarView}
-          expandedOutlineIds={tab.view.expandedOutlineIds}
+          panels={railPanels}
           annotations={annotations}
           activeAnnotationId={activeAnnotation}
+          onToggle={toggleRailPanel}
           onPickPage={(page) => scrollToPage(page)}
           onPickAnnotation={(id) => {
             const annotation = annotations.find((item) => item.id === id)

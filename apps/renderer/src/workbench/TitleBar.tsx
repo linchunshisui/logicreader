@@ -38,13 +38,18 @@ export function TitleBar(): JSX.Element {
   ]
 
   const editItems: MenuItem[] = [
-    { id: 'undo', label: t('menu.editUndo'), shortcut: 'Ctrl+Z', run: () => document.execCommand('undo') },
-    { id: 'redo', label: t('menu.editRedo'), shortcut: 'Ctrl+Y', run: () => document.execCommand('redo') },
+    /*
+     * 走主进程的 `webContents` 角色命令（`app:edit`）：
+     * 原来的 `document.execCommand('undo'|'redo'|'cut'|'copy'|'paste'|'selectAll')` 是废弃 API，
+     * 其中 `paste` 在 Chromium 里根本没实现 —— 按下去毫无反应。
+     */
+    { id: 'undo', label: t('menu.editUndo'), shortcut: 'Ctrl+Z', run: () => void window.logicreader.app.edit('undo') },
+    { id: 'redo', label: t('menu.editRedo'), shortcut: 'Ctrl+Y', run: () => void window.logicreader.app.edit('redo') },
     { id: 'sep1', label: '', separator: true },
-    { id: 'cut', label: t('menu.editCut'), shortcut: 'Ctrl+X', run: () => document.execCommand('cut') },
-    { id: 'copy', label: t('menu.editCopy'), shortcut: 'Ctrl+C', run: () => document.execCommand('copy') },
-    { id: 'paste', label: t('menu.editPaste'), shortcut: 'Ctrl+V', run: () => document.execCommand('paste') },
-    { id: 'selectAll', label: t('menu.editSelectAll'), shortcut: 'Ctrl+A', run: () => document.execCommand('selectAll') },
+    { id: 'cut', label: t('menu.editCut'), shortcut: 'Ctrl+X', run: () => void window.logicreader.app.edit('cut') },
+    { id: 'copy', label: t('menu.editCopy'), shortcut: 'Ctrl+C', run: () => void window.logicreader.app.edit('copy') },
+    { id: 'paste', label: t('menu.editPaste'), shortcut: 'Ctrl+V', run: () => void window.logicreader.app.edit('paste') },
+    { id: 'selectAll', label: t('menu.editSelectAll'), shortcut: 'Ctrl+A', run: () => void window.logicreader.app.edit('selectAll') },
     { id: 'sep2', label: '', separator: true },
     { id: 'find', label: t('menu.editFind'), shortcut: 'Ctrl+F', run: run(CMD.readerFind) }
   ]

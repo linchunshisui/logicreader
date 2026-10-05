@@ -32,6 +32,132 @@ export function normalizePermissionMode(value: unknown): PermissionMode {
   return isPermissionMode(value) ? value : DEFAULT_PERMISSION_MODE
 }
 
+/* ------------------------------------------------------------------ 各通道自己的档位
+ *
+ * 上面那四个档是**我们客户端**的放行策略（决定怎么应答 Agent 的授权请求、握手时声明什么能力位）。
+ * 但每个 Agent 工具**自己**有什么档位，是协议决定的，三者完全不同（离线探针实测，2026-10-04）：
+ *
+ *   Claude Code（官方 SDK）  原生就有授权模式，而且可以在**活动会话**上直接切
+ *                            （`query.setPermissionMode()`，不重建会话）
+ *   Codex（官方 app-server） 有「审批策略 + 沙箱」两个维度，但只能在 `thread/start` 时指定，
+ *                            中途改不了（没有 set 接口）→ 切档必须重建线程
+ *   DeepSeek Harness（ACP）  **完全没有**：`session/new` 只回 `{sessionId, configOptions}`，
+ *                            configOptions 只有 model / reasoning_effort；`session/set_mode`
+ *                            直接 `-32601 Method not found`（见 scripts/probe-dsh-acp.mjs）
+ *
+ * 所以界面**不能**拿一套 Claude 味的档位去套所有 Agent：上限来自协议，不是本程序的缺陷（ARCHITECTURE §1.10c）。
+ * 这里把"每个通道真实提供什么"写成数据，主进程（适配器）与渲染进程（控件）共用同一份。
+ */
+
+/** 档位候选项：值用**协议原文**，名字/说明由界面按 `agent.permission.<控件 id>.<值>` 本地化。 */
+export interface PermissionControlOption {
+  value: string
+  /** 协议侧的中立名称（界面找不到本地化文案时用它） */
+  name: string
+}
+
+/** 某个通道真实提供的授权控制项。 */
+export interface PermissionControl {
+  /** 协议侧标识：`permissionMode`（SDK）/ `approvalPolicy` / `sandbox`（Codex） */
+  id: string
+  /** 控件标题的协议中立写法（界面优先用 `agent.permission.<id>.name`） */
+  name: string
+  options: PermissionControlOption[]
+  /**
+   * 默认值。**必须显式给**，不能"取第一项"：
+   * 选项列表按"最保守在前"排列（与那四个档的展示顺序一致），但默认值要保住既有行为 ——
+   * 例：Codex 的沙箱默认 `workspace-write`（工作区内可写、每次仍要审批），
+   * 若默认成 `read-only`，等于把"能写但要批"悄悄降级成"根本写不了"，用户还没法通过卡片批准。
+   */
+  defaultValue: string
+  /** 改这一项要不要重建会话/线程（false = 协议支持在活动会话上直接切） */
+  rebuild: boolean
+}
+
+/** Claude Code（官方 SDK）：原生授权模式，可在活动会话上直接切。 */
+export const SDK_PERMISSION_CONTROLS: PermissionControl[] = [
+  {
+    id: 'permissionMode',
+    name: 'Permission mode',
+    rebuild: false,
+    defaultValue: DEFAULT_PERMISSION_MODE,
+    options: PERMISSION_MODES.map((mode) => ({ value: mode, name: mode }))
+  }
+]
+
+/**
+ * Codex（官方 app-server）：审批策略 + 沙箱。
+ *
+ * 只列适配器**真的会发出去**的两组值（`thread/start` 的 `approvalPolicy` / `sandbox`）——
+ * 列一个发不出去的档位等于骗用户。
+ */
+export const CODEX_PERMISSION_CONTROLS: PermissionControl[] = [
+  {
+    id: 'approvalPolicy',
+    name: 'Approval policy',
+    rebuild: true,
+    // 默认"每次询问"（最保守的那一档，也是旧行为）
+    defaultValue: 'untrusted',
+    options: [
+      { value: 'untrusted', name: 'untrusted' },
+      { value: 'on-request', name: 'on-request' }
+    ]
+  },
+  {
+    id: 'sandbox',
+    name: 'Sandbox',
+    rebuild: true,
+    // 默认沿用旧行为（可写工作区、由审批把关）；只读排在第一项只是展示顺序
+    defaultValue: 'workspace-write',
+    options: [
+      { value: 'read-only', name: 'read-only' },
+      { value: 'workspace-write', name: 'workspace-write' }
+    ]
+  }
+]
+
+/** 协议 → 它真实提供的控制项；没有档位概念的通道（ACP / mock）是空数组。 */
+export function permissionControlsOf(protocol: string): PermissionControl[] {
+  if (protocol === 'sdk' || protocol === 'claude-code') return SDK_PERMISSION_CONTROLS
+  if (protocol === 'app-server' || protocol === 'codex') return CODEX_PERMISSION_CONTROLS
+  return []
+}
+
+/** 某个控制项的默认值（取显式声明的那一项，见 `PermissionControl.defaultValue`）。 */
+export function defaultControlValues(controls: PermissionControl[]): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const control of controls) out[control.id] = control.defaultValue
+  return out
+}
+
+/**
+ * 把"通道自己的档位"折算成**我们客户端**的放行策略（纯函数，单测覆盖）。
+ *
+ * 为什么要折算：`decidePermission`（怎么应答授权请求）与握手能力位（能不能写/执行）
+ * 只有一份判定，它吃的是 `PermissionMode`；而用户在界面上拨的是各协议自己的旋钮。
+ * 两者由一个函数对齐，否则"界面选了只读、客户端却仍放行写入"这类错会散在各处。
+ *
+ * - SDK：控制项本身就是那四个档（一一对应）
+ * - Codex：沙箱只读 → `plan`（不许改任何东西）；可写 + 审批 `untrusted` → `manual`（每次都问）；
+ *          可写 + `on-request` → `edit`（工作区内写入放行，命令仍问）
+ * - ACP / mock：协议没有档位 → 直接用界面上的「客户端放行策略」
+ */
+export function policyFromControls(
+  protocol: string,
+  clientPolicy: PermissionMode,
+  values: Record<string, string | undefined>
+): PermissionMode {
+  if (protocol === 'sdk' || protocol === 'claude-code') {
+    return normalizePermissionMode(values.permissionMode ?? clientPolicy)
+  }
+  if (protocol === 'app-server' || protocol === 'codex') {
+    if (values.sandbox === 'read-only') return 'plan'
+    if (values.approvalPolicy === 'untrusted') return 'manual'
+    return 'edit'
+  }
+  return normalizePermissionMode(clientPolicy)
+}
+
 /** 会话内由界面维护的授权策略。 */
 export interface PermissionPolicy {
   mode: PermissionMode

@@ -52,6 +52,21 @@ export interface RevealRequest {
   chain?: RevealChain
 }
 
+/**
+ * 状态栏的"第 N / M"。
+ *
+ * `unit` 由阅读器自己声明：表格读的是**工作表**，Markdown / DOCX / 纯文本没有分页概念（`null`）。
+ * 以前所有阅读器都往 page/total 里塞数字，状态栏一律按"页"念 —— 于是两页 Sheet 被叫成"两页文档"，
+ * 纯文本永远显示"第 1 / 1 页"。口径必须由产生方给出，不能在显示方猜。
+ */
+export interface ReaderProgress {
+  page: number
+  total: number
+  zoom: number
+  percent: number
+  unit: 'page' | 'sheet' | null
+}
+
 interface UiState {
   commandPaletteOpen: boolean
   quickOpenOpen: boolean
@@ -61,7 +76,7 @@ interface UiState {
   /** 当前聚焦的阅读器 tabId，用于状态栏与命令路由 */
   activeReaderTabId: string | null
   /** 阅读进度（状态栏） */
-  readerProgress: { page: number; total: number; zoom: number; percent: number } | null
+  readerProgress: ReaderProgress | null
   revealRequest: RevealRequest | null
   /** 打开设置页时希望定位到的分类 */
   settingsCategory: string | null

@@ -4,8 +4,8 @@
  * 命中数据库缓存打开文档时不会重新解析（documents.store 直接用库里的块重建模型），
  * 这条路径上内存缓存是空的 —— 视图用 ensureSheets 按需从原文件补载。
  */
-import * as XLSX from 'xlsx'
-import type { WorkBook } from 'xlsx'
+import * as XLSX from '@e965/xlsx'
+import type { WorkBook } from '@e965/xlsx'
 import { api } from './api'
 
 export interface SheetData {

@@ -12,13 +12,20 @@ export interface MenuItem {
 }
 
 interface MenuProps {
-  label: string
+  /** 按钮内容：标题栏用文字，工具栏的「更多」用图标 */
+  label: ReactNode
+  /** 按钮的无障碍名与 tooltip（图标按钮必须给，否则只有一个形状） */
+  labelText?: string
   items: MenuItem[]
   open: boolean
   onOpenChange: (open: boolean) => void
+  /** 覆盖按钮样式（标题栏菜单与工具栏溢出菜单的观感不同） */
+  buttonClassName?: string
+  /** 另一个菜单已打开时，悬停本项就切换过去 —— 只有标题栏需要这种习惯 */
+  hoverSwitch?: boolean
 }
 
-export function Menu({ label, items, open, onOpenChange }: MenuProps): JSX.Element {
+export function Menu({ label, labelText, items, open, onOpenChange, buttonClassName, hoverSwitch = true }: MenuProps): JSX.Element {
   const anchorRef = useRef<HTMLButtonElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
   const [position, setPosition] = useState({ left: 0, top: 0 })
@@ -47,12 +54,14 @@ export function Menu({ label, items, open, onOpenChange }: MenuProps): JSX.Eleme
     <>
       <button
         ref={anchorRef}
-        className="lr-titlebar__menu-button"
+        className={buttonClassName ?? 'lr-titlebar__menu-button'}
         data-open={open}
+        title={labelText}
+        aria-label={labelText}
         onClick={() => onOpenChange(!open)}
         onMouseEnter={() => {
           // 已有菜单打开时，悬停切换，符合 VS Code 习惯
-          if (!open && document.querySelector('.lr-menu')) onOpenChange(true)
+          if (hoverSwitch && !open && document.querySelector('.lr-menu')) onOpenChange(true)
         }}
       >
         {label}
@@ -71,6 +80,11 @@ export function Menu({ label, items, open, onOpenChange }: MenuProps): JSX.Eleme
                 key={item.id}
                 className="lr-menu__item"
                 disabled={item.disabled}
+                /*
+                 * 别让菜单项抢走焦点：原生菜单不抢焦点，而 Electron 的撤销/粘贴
+                 * 作用在"当前聚焦的元素"上 —— 焦点一落到菜单按钮，编辑菜单就全成了空操作。
+                 */
+                onMouseDown={(event) => event.preventDefault()}
                 onClick={() => {
                   onOpenChange(false)
                   item.run?.()

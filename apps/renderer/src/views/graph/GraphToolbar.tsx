@@ -114,12 +114,23 @@ export function GraphToolbar({
   )
 }
 
-export function GraphLegend(): JSX.Element {
+/**
+ * 边类型图例。
+ *
+ * 展开状态由调用方持有（存进关系图标签的 view，见 GraphViewState.overlays）：
+ * 默认**收起** —— 展开后是一列九行，会占掉画布一角，和左下角的 React Flow 控件挤在一起。
+ */
+export function GraphLegend({
+  open,
+  onToggle
+}: {
+  open: boolean
+  onToggle: (open: boolean) => void
+}): JSX.Element {
   const { t } = useTranslation()
-  const [open, setOpen] = useState(true)
   return (
     <div className="lr-graph__legend" data-open={open}>
-      <button className="lr-graph__legend-toggle" onClick={() => setOpen((value) => !value)}>
+      <button className="lr-graph__legend-toggle" onClick={() => onToggle(!open)}>
         {open ? '▾' : '▸'} {t('graph.legend')}
       </button>
       {open ? (

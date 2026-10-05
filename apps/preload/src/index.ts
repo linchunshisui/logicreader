@@ -5,7 +5,7 @@ import type {
   AgentCapabilityView, AgentConfigOption, AgentEventPayload, AgentModelView, AgentRegistrationView, AgentSessionInfoView, WorkspaceFileView,
   AppInfo, AppSettings, AnnotationRecord, AnchorRecord, BlockRecord, DocumentRecord,
   FileStat, LogEntry, MessageDialogOptions, RecentEntry, RestoreReport, SaveDialogOptions,
-  SessionSnapshot, Unsubscribe, WindowState, LogicReaderApi, FsChangeEvent, ResolvedTheme
+  SessionSnapshot, Unsubscribe, WindowState, LogicReaderApi, FsChangeEvent, ResolvedTheme, SearchHit
 } from '@logicreader/shared'
 
 type InvokeArgs = unknown[]
@@ -31,6 +31,7 @@ const api: LogicReaderApi = {
     quit: () => invoke<void>(CH.app.quit),
     relaunch: () => invoke<void>(CH.app.relaunch),
     setUiScale: (scale) => invoke<void>(CH.app.setUiScale, scale),
+    edit: (action) => invoke<void>(CH.app.edit, action),
     onOpenFiles: (cb) => subscribe<[string[]]>(CH.app.openFiles, cb),
     takePendingFiles: () => invoke<string[]>(CH.app.takePendingFiles),
     onMenuCommand: (cb) => subscribe<[{ commandId: string; args?: unknown }]>(CH.app.menuCommand, cb)
@@ -94,6 +95,7 @@ const api: LogicReaderApi = {
     removeDocument: (id) => invoke<void>(CH.store.removeDocument, id),
     saveBlocks: (docId, blocks: BlockRecord[]) => invoke<void>(CH.store.saveBlocks, docId, blocks),
     getBlocks: (docId) => invoke<BlockRecord[]>(CH.store.getBlocks, docId),
+    searchBlocks: (query, limit) => invoke<SearchHit[]>(CH.store.searchBlocks, query, limit),
     saveAnchors: (anchors: AnchorRecord[]) => invoke<void>(CH.store.saveAnchors, anchors),
     getAnchor: (id) => invoke<AnchorRecord | null>(CH.store.getAnchor, id),
     listAnchors: (docId) => invoke<AnchorRecord[]>(CH.store.listAnchors, docId),

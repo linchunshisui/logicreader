@@ -30,7 +30,8 @@ export function defaultReaderView(): ReaderViewState {
     themeOverride: 'inherit',
     pdfDarkMode: settings.pdfDarkMode,
     pdfImagePolicy: settings.pdfImagePolicy,
-    sidebarView: 'outline',
+    // 阅读器自带侧栏：默认只开缩略图（标注那块要点一下工具栏上的按钮才出来）
+    railPanels: { thumbnails: true, annotations: false },
     expandedOutlineIds: [],
     activeAnnotationId: null
   }

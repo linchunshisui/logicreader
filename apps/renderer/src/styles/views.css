@@ -1163,9 +1163,39 @@
 .lr-agent__welcome-hint {
   margin: 0;
   max-width: 300px;
-  font-family: var(--lr-font-mono);
   font-size: var(--lr-fs-sm);
+  line-height: 1.6;
   color: var(--vscode-descriptionForeground);
+}
+
+/*
+ * 「通读全文」询问卡片（规划书 FR-7：先问用户，再决定要不要让 Agent 通读打开的文件）。
+ * 它替代了旧行为 —— 打开文档就直接把整篇全文发出去。
+ */
+.lr-agent__askcard {
+  margin: 4px 12px 12px;
+  padding: 12px;
+  border: 1px solid var(--vscode-widget-border);
+  border-radius: 10px;
+  background: rgba(127, 127, 127, 0.06);
+}
+
+.lr-agent__askcard-title {
+  font-size: var(--lr-fs-md);
+  font-weight: 600;
+}
+
+.lr-agent__askcard-body {
+  margin: 6px 0 10px;
+  font-size: var(--lr-fs-xs);
+  line-height: 1.6;
+  color: var(--vscode-descriptionForeground);
+}
+
+.lr-agent__askcard-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 /* -------------------------------------------------------- 消息条目 */
@@ -1579,13 +1609,20 @@
 .lr-agent__composer-row {
   display: flex;
   align-items: center;
+  /*
+   * 允许换行：chip 不再被压扁截断。主信息（当前 Agent + 模型）哪怕辅助栏只有 240px 也读得全，
+   * 装不下的次要 chip 落到第二行。
+   */
+  flex-wrap: wrap;
   gap: 6px;
+  row-gap: 4px;
   padding: 0 2px;
   min-width: 0;
 }
 
 .lr-agent__composer-spacer {
-  flex: 1;
+  flex: 1 1 0;
+  min-width: 0;
 }
 
 .lr-agent__mode {
@@ -1598,6 +1635,9 @@
   font-size: var(--lr-fs-xs);
   color: var(--vscode-descriptionForeground);
   white-space: nowrap;
+  /* 与 .lr-agent__chip 一致：不收缩，装不下就换行，而不是把"授权模式"截成半个词 */
+  flex: 0 0 auto;
+  max-width: 100%;
 }
 
 .lr-agent__mode:hover {
@@ -1616,13 +1656,23 @@
 }
 
 .lr-agent__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   padding: 2px 8px;
   border-radius: 999px;
   /* 没边框时 11px 文字在深色底上几乎看不见，给一条极淡的边当"控件"信号 */
   border: 1px solid rgba(127, 127, 127, 0.28);
   font-size: var(--lr-fs-xs);
   color: var(--vscode-descriptionForeground);
-  max-width: 180px;
+  /*
+   * 旧写法是 max-width: 180px + ellipsis。辅助栏只有 400 多像素、最窄 240px，
+   * 一排五六个 chip 被均匀压扁，全都截成 "Clau…" / "历…" / "思…"，一个都读不出来。
+   * 现在：**不收缩**（shrink 0），装不下就换行（见 .lr-agent__composer-row）；
+   * max-width 只兜住"单个名字比整行还长"的极端情况。
+   */
+  flex: 0 0 auto;
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1700,6 +1750,17 @@
 
 .lr-agent__picker-hint {
   opacity: 0.75;
+}
+
+/* 弹层脚注：说明"这个档位是谁的功能"（客户端策略 vs 工具自己的档位） */
+.lr-agent__picker-note {
+  margin-top: 6px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: rgba(127, 127, 127, 0.12);
+  font-size: var(--lr-fs-xs);
+  line-height: 1.5;
+  color: var(--vscode-descriptionForeground);
 }
 
 .lr-agent__picker-item {
@@ -2084,6 +2145,49 @@
   opacity: 0.7;
 }
 
+/* 检索范围切换（本文档 / 全部文档）：与表格的工作表标签同一套观感 */
+.lr-search-scope {
+  display: flex;
+  gap: 4px;
+  padding: 0 10px 6px;
+}
+
+.lr-search-scope__item {
+  padding: 2px 10px;
+  border-radius: var(--lr-radius);
+  font-size: var(--lr-fs-sm);
+  color: var(--vscode-foreground);
+  opacity: 0.75;
+}
+
+.lr-search-scope__item[data-active='true'] {
+  background: var(--vscode-list-activeSelectionBackground);
+  color: var(--vscode-list-activeSelectionForeground);
+  opacity: 1;
+}
+
+/* 库级检索里每条结果上方的文档名：结果必须能看出"这是哪篇里的" */
+.lr-search-doc {
+  padding: 4px 10px 0;
+  font-size: var(--lr-fs-xs);
+  opacity: 0.85;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lr-search-hint {
+  padding: 4px 10px 0;
+  font-size: var(--lr-fs-xs);
+  opacity: 0.6;
+}
+
+.lr-search-error {
+  padding: 6px 10px;
+  font-size: var(--lr-fs-sm);
+  color: var(--vscode-errorForeground);
+}
+
 .lr-search-result {
   display: block;
   width: 100%;
@@ -2251,4 +2355,17 @@
   align-items: center;
   gap: 10px;
   opacity: 0.8;
+}
+
+/* 常驻提示（拖动文件到窗口）：不再是单独的第 5 屏 */
+.lr-wizard__tip {
+  margin: 0;
+  padding: 0 20px 4px;
+  font-size: var(--lr-fs-xs);
+  color: var(--vscode-descriptionForeground);
+}
+
+/* 把「上一步」与「下一步」按方向分开，避免"取消/确认"那种误读 */
+.lr-wizard__spacer {
+  flex: 1;
 }

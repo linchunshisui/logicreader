@@ -7,6 +7,8 @@ export const CH = {
     quit: 'app:quit',
     relaunch: 'app:relaunch',
     setUiScale: 'app:set-ui-scale',
+    /** 编辑菜单：undo / redo / cut / copy / paste / selectAll（由主进程的 webContents 执行） */
+    edit: 'app:edit',
     openFiles: 'app:open-files',
     takePendingFiles: 'app:take-pending-files',
     menuCommand: 'app:menu-command'
@@ -65,6 +67,7 @@ export const CH = {
     removeDocument: 'store:remove-document',
     saveBlocks: 'store:save-blocks',
     getBlocks: 'store:get-blocks',
+    searchBlocks: 'store:search-blocks',
     saveAnchors: 'store:save-anchors',
     getAnchor: 'store:get-anchor',
     listAnchors: 'store:list-anchors',
@@ -245,6 +248,27 @@ export interface BlockRecord {
   charEnd: number
   locatorJson: string
   parentId: string | null
+}
+
+/**
+ * 跨文档全文检索的一条命中（库级检索，不是当前文档内的查找）。
+ *
+ * 带上 `docId` / `charStart` / `charEnd` 是刻意的：拿到命中之后要能直接跳回原文并高亮，
+ * 而这一跳靠的就是 (docId, 字符区间) —— 与关系图节点跳转共用同一条 `requestReveal` 通道。
+ */
+export interface SearchHit {
+  docId: string
+  docTitle: string
+  /** 文档在磁盘上的路径：命中的文档若还没打开，调用方要先用它把文档打开才谈得上跳转 */
+  docPath: string
+  blockId: string
+  blockKind: string
+  seq: number
+  text: string
+  charStart: number
+  charEnd: number
+  /** 命中的第一个字在块内的偏移（用于把结果窗口滚到命中处）；找不到时为 -1 */
+  matchStart: number
 }
 
 export interface AnchorRecord {

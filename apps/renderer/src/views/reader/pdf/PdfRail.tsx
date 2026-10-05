@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { PDFDocumentProxy } from 'pdfjs-dist'
-import { flattenOutline, type DocumentModel, type OutlineNode } from '@logicreader/document-model'
-import { useTabs } from '../../../state/tabs.store'
+import type { DocumentModel } from '@logicreader/document-model'
+import { IconClose } from '../../../workbench/icons'
 
 export interface RailAnnotation {
   id: string
@@ -12,12 +12,18 @@ export interface RailAnnotation {
   page: number
 }
 
+/** 阅读器侧栏里的两块面板：各自独立、可同时打开 */
+export type RailPanel = 'thumbnails' | 'annotations'
+
 interface Props {
   doc: PDFDocumentProxy
   model: DocumentModel
   currentPage: number
-  activeView: 'thumbnails' | 'outline' | 'annotations' | 'search'
-  expandedOutlineIds: string[]
+  /**
+   * 两块面板的显隐。**各自独立、允许同时为 true**（用户要求："支持同时存在"）；
+   * 都为 false 时这一整条侧栏不渲染（工具栏上那两个按钮是唯一的唤起入口）。
+   */
+  panels: { thumbnails: boolean; annotations: boolean }
   annotations: RailAnnotation[]
   activeAnnotationId: string | null
   findQuery: string
@@ -25,69 +31,54 @@ interface Props {
   onPickAnnotation: (id: string) => void
   onDeleteAnnotation: (id: string) => void
   onExport: () => void
+  /** 关掉某一块（面板头上的 × 与工具栏按钮共用这一个状态） */
+  onToggle: (panel: RailPanel, open: boolean) => void
 }
 
-export function PdfRail(props: Props): JSX.Element {
+/**
+ * PDF 阅读器自带的侧栏：**缩略图**与**页内标注**两块，各自独立、可同时打开。
+ *
+ * 以前是"二选一的页签"（还要加上已并入全局「大纲」的目录，共三选一），
+ * 用户的实际需求是"想看哪块看哪块、两块一起看也行，不想看就整条收起来" ——
+ * 所以页签条去掉，改成两块可叠加的面板 + 工具栏上的唤起按钮。
+ * 目录（PDF 内嵌书签）仍然只在全局活动栏的「大纲」里有一份，不在这里重复。
+ */
+export function PdfRail(props: Props): JSX.Element | null {
   const { t } = useTranslation()
-  const tabs = useTabs()
-  const tab = tabs.activeTab()
-  const [view, setView] = useState(props.activeView)
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({})
-
-  useEffect(() => {
-    setView(props.activeView)
-  }, [props.activeView])
-
-  const switchView = (next: Props['activeView']): void => {
-    setView(next)
-    if (tab && tab.kind === 'reader') tabs.updateReaderView(tab.id, { sidebarView: next })
-  }
-
-  const outlineRows = useMemo(() => flattenOutline(props.model.outline), [props.model.outline])
-
-  const isExpanded = (node: OutlineNode): boolean => expanded[node.id] ?? props.expandedOutlineIds.includes(node.id)
-
+  if (!props.panels.thumbnails && !props.panels.annotations) return null
   return (
     <div className="lr-pdf-rail">
-      <div className="lr-pdf-rail__tabs">
-        <button className="lr-pdf-rail__tab" data-active={view === 'thumbnails'} onClick={() => switchView('thumbnails')}>
-          {t('reader.thumbnails')}
-        </button>
-        <button className="lr-pdf-rail__tab" data-active={view === 'outline'} onClick={() => switchView('outline')}>
-          {t('reader.outline')}
-        </button>
-        <button className="lr-pdf-rail__tab" data-active={view === 'annotations'} onClick={() => switchView('annotations')}>
-          {t('reader.annotations')}
-        </button>
-      </div>
-      <div className="lr-pdf-rail__body">
-        {view === 'thumbnails' ? (
-          <ThumbnailList doc={props.doc} currentPage={props.currentPage} onPick={props.onPickPage} />
-        ) : null}
+      {props.panels.thumbnails ? (
+        <section className="lr-pdf-rail__section" data-panel="thumbnails">
+          <header className="lr-pdf-rail__section-head">
+            <span>{t('reader.thumbnails')}</span>
+            <button
+              className="lr-icon-button"
+              title={t('reader.railHide')}
+              onClick={() => props.onToggle('thumbnails', false)}
+            >
+              <IconClose />
+            </button>
+          </header>
+          <div className="lr-pdf-rail__section-body">
+            <ThumbnailList doc={props.doc} currentPage={props.currentPage} onPick={props.onPickPage} />
+          </div>
+        </section>
+      ) : null}
 
-        {view === 'outline' ? (
-          outlineRows.length === 0 ? (
-            <div className="lr-empty">{t('sideBar.outlineEmpty')}</div>
-          ) : (
-            outlineRows.map((node) => (
-              <button
-                key={node.id}
-                className="lr-pdf-outline-row"
-                style={{ paddingLeft: 6 + (node.level - 1) * 10 }}
-                title={node.title}
-                onClick={() => {
-                  if (node.locator && node.locator.kind === 'pdf') props.onPickPage(node.locator.page)
-                }}
-              >
-                <span className="lr-tree__chevron">{node.children.length > 0 ? (isExpanded(node) ? '▾' : '▸') : ''}</span>
-                <span className="lr-tree__label">{node.title}</span>
-              </button>
-            ))
-          )
-        ) : null}
-
-        {view === 'annotations' ? (
-          <div>
+      {props.panels.annotations ? (
+        <section className="lr-pdf-rail__section" data-panel="annotations">
+          <header className="lr-pdf-rail__section-head">
+            <span>{t('reader.annotations')}</span>
+            <button
+              className="lr-icon-button"
+              title={t('reader.railHide')}
+              onClick={() => props.onToggle('annotations', false)}
+            >
+              <IconClose />
+            </button>
+          </header>
+          <div className="lr-pdf-rail__section-body">
             <div className="lr-pdf-sidebar-toolbar" style={{ padding: '4px 0', borderBottom: 'none' }}>
               <button className="lr-button lr-button--secondary" onClick={props.onExport}>
                 {t('reader.export.annotatedTitle')}
@@ -110,14 +101,14 @@ export function PdfRail(props: Props): JSX.Element {
                     <span className="lr-annotation-row__note">{annotation.note ?? ''}</span>
                   </button>
                   <button className="lr-icon-button" title={t('reader.annotationDelete')} onClick={() => props.onDeleteAnnotation(annotation.id)}>
-                    ✕
+                    <IconClose />
                   </button>
                 </div>
               ))
             )}
           </div>
-        ) : null}
-      </div>
+        </section>
+      ) : null}
     </div>
   )
 }

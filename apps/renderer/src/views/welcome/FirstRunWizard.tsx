@@ -4,9 +4,8 @@ import { CMD, type AgentCapabilityView } from '@logicreader/shared'
 import { api } from '../../lib/api'
 import { useSettings } from '../../state/settings.store'
 import { executeCommand } from '../../state/commands.store'
-import { notify } from '../../state/notifications.store'
 
-/** 首次启动向导（规划书 §8.4）：主题 → 语言 → 探测 Agent → LibreOffice 方案。 */
+/** 首次启动向导（规划书 §8.4）：主题 → 语言 → 探测 Agent → LibreOffice。 */
 export function FirstRunWizard({ onDone }: { onDone: () => void }): JSX.Element {
   const { t } = useTranslation()
   const { settings, patch } = useSettings()
@@ -24,6 +23,16 @@ export function FirstRunWizard({ onDone }: { onDone: () => void }): JSX.Element 
     void api.convert.availability(true).then(setLibreOffice).catch(() => setLibreOffice(null))
   }, [step, libreOffice])
 
+  // Esc 与「跳过」同义：关掉向导，不丢设置（每项改动都是当场生效并落盘的）
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') onDone()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onDone])
+
+  // 步骤条与屏数同源：只有这一个数组，末屏就是最后一个元素
   const steps = [t('settings.appearance.theme'), t('settings.appearance.locale'), t('activity.agent'), 'LibreOffice']
 
   return (
@@ -125,41 +134,36 @@ export function FirstRunWizard({ onDone }: { onDone: () => void }): JSX.Element 
                   >
                     {t('settings.agent.addDir')}
                   </button>
-                  <button className="lr-button lr-button--secondary" onClick={() => setStep(4)}>
-                    {t('graph.askLater')}
-                  </button>
                 </div>
               </>
             )}
           </div>
         ) : null}
 
-        {step === 4 ? (
-          <div className="lr-wizard__body">
-            <p>{t('welcome.tip')}</p>
-            <p className="lr-setting__hint">{t('settings.storage.clearSession')}</p>
-          </div>
-        ) : null}
+        {/* 常驻的一行提示：不再单独占一屏（旧的第 5 屏只有这句提示 + 一条设置项） */}
+        <p className="lr-wizard__tip">{t('welcome.tip')}</p>
 
         <div className="lr-dialog__actions">
+          {/*
+           * 出口必须一眼可见：Esc 与「跳过」都只是关掉向导 ——
+           * 向导里改的每一样都是即时生效并落盘的（主题 / 语言都是当场 patch），离开不会丢设置。
+           */}
+          <button className="lr-button lr-button--secondary" onClick={onDone}>
+            {t('common.skip')}
+          </button>
+          <div className="lr-wizard__spacer" />
           {step > 0 ? (
             <button className="lr-button lr-button--secondary" onClick={() => setStep((value) => value - 1)}>
-              {t('common.cancel')}
+              {t('common.back')}
             </button>
           ) : null}
-          {step < 4 ? (
+          {step < steps.length - 1 ? (
             <button className="lr-button" onClick={() => setStep((value) => value + 1)}>
-              {t('common.confirm')}
+              {t('common.next')}
             </button>
           ) : (
-            <button
-              className="lr-button"
-              onClick={() => {
-                notify(t('welcome.title') + ' · ' + t('welcome.subtitle'), 'success')
-                onDone()
-              }}
-            >
-              {t('common.ok')}
+            <button className="lr-button" onClick={onDone}>
+              {t('common.done')}
             </button>
           )}
           <button

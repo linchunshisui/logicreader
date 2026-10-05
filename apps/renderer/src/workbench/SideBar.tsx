@@ -3,7 +3,6 @@ import { useTranslation } from 'react-i18next'
 import { useLayout } from '../state/layout.store'
 import { ExplorerView } from '../features/explorer/ExplorerView'
 import { OutlineView } from '../features/outline/OutlineView'
-import { AnnotationsView } from '../features/annotations/AnnotationsView'
 import { SearchView } from '../features/search/SearchView'
 import { GraphSidebarView } from '../features/graph/GraphSidebarView'
 import { AgentSidebarView } from '../features/agent/AgentSidebarView'
@@ -14,7 +13,6 @@ const TITLE_KEY: Record<string, string> = {
   outline: 'sideBar.outline',
   graph: 'sideBar.graph',
   agent: 'sideBar.agent',
-  annotations: 'sideBar.annotations',
   search: 'sideBar.search'
 }
 
@@ -32,8 +30,6 @@ export const SideBar = forwardRef<HTMLElement>(function SideBar(_props, ref): JS
         return <ExplorerView />
       case 'outline':
         return <OutlineView />
-      case 'annotations':
-        return <AnnotationsView />
       case 'search':
         return <SearchView />
       case 'graph':

@@ -145,6 +145,32 @@ try {
   }
 
   /**
+   * **授权档位探针**（第七十轮加）：这个 dsh 到底有没有"模式/档位"概念？
+   *
+   * 结论直接决定界面：Agent 面板底部那四个档（手动/自动编辑/计划/自动）是 Claude Code 的形态，
+   * 只有**协议真的有**才该画出来。这里一次问清三件事：
+   *   ① `session/new` 的响应里有没有 `modes` 字段；
+   *   ② `session/set_mode` 认不认（dsh 0.2.0-rc.2 实测 `-32601 Method not found`）；
+   *   ③ 顺带确认 `configOptions` 只有 model / reasoning_effort（没有档位可放）。
+   * 复现记录见 执行记录 §89 与 ARCHITECTURE §1.10c。
+   */
+  {
+    const probe = await request('session/new', { cwd: listCwd, mcpServers: [] }, 20000).catch(() => null)
+    console.log(
+      '档位探针：session/new 顶层键=' +
+        JSON.stringify(probe ? Object.keys(probe) : null) +
+        ' 有 modes 字段=' +
+        String(Boolean(probe && 'modes' in probe))
+    )
+    try {
+      await request('session/set_mode', { sessionId: session.sessionId, modeId: 'plan' }, 15000)
+      console.log('档位探针：session/set_mode ✅ 认 —— 界面可以按它自己的档位来做')
+    } catch (error) {
+      console.log('档位探针：session/set_mode ✖ ' + String(error) + '（没有档位概念 → 界面不许为它造档位）')
+    }
+  }
+
+  /**
    * 实测 `session/set_config_option` 的取值形态。
    * dsh 的 `model` 项 currentValue 是**数组** `[provider, model]`，而我们的界面只会发字符串 ——
    * 到底哪一串才是它认的，只能问它自己（错了也只会被客户端吞掉，界面上表现为"改了没用"）。

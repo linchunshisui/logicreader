@@ -3,7 +3,7 @@ import { useLayout, type SidebarViewId } from '../state/layout.store'
 import { useDocuments } from '../state/documents.store'
 import { useTabs } from '../state/tabs.store'
 import {
-  IconAgent, IconAnnotations, IconFiles, IconGraph, IconOutline, IconSearch, IconSettings
+  IconAgent, IconFiles, IconGraph, IconOutline, IconSearch, IconSettings
 } from './icons'
 import { CMD } from '@logicreader/shared'
 import { executeCommand } from '../state/commands.store'
@@ -14,13 +14,16 @@ interface Item {
   icon: (props: { size?: number }) => JSX.Element
 }
 
+/*
+ * 「标注」这一项已下线：标注只存在于 PDF，而阅读器自带的侧栏里已经有一份
+ * （缩略图 / 页内标注）—— 同一份数据在左侧出现两个入口，用户看到的是"打开了三列导航"。
+ */
 const ITEMS: Item[] = [
   { id: 'explorer', titleKey: 'activity.explorer', icon: IconFiles },
   { id: 'search', titleKey: 'activity.search', icon: IconSearch },
   { id: 'outline', titleKey: 'activity.outline', icon: IconOutline },
   { id: 'graph', titleKey: 'activity.graph', icon: IconGraph },
-  { id: 'agent', titleKey: 'activity.agent', icon: IconAgent },
-  { id: 'annotations', titleKey: 'activity.annotations', icon: IconAnnotations }
+  { id: 'agent', titleKey: 'activity.agent', icon: IconAgent }
 ]
 
 export function ActivityBar(): JSX.Element {

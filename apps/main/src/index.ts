@@ -646,8 +646,18 @@ if (!gotLock) {
 
     // 冒烟自检：LR_SMOKE=1 时启动数秒后截图并自动退出，用于无人值守验证启动链路
     if (process.env.LR_SMOKE) {
-      const parsed = Number(process.env.LR_SMOKE)
-      const delay = parsed > 1 ? parsed : 8000
+      const raw = process.env.LR_SMOKE
+      const parsed = Number(raw)
+      /**
+       * 单位是**毫秒**，但小于 1000 的数值按"秒"理解。
+       *
+       * 实测踩坑：`LR_SMOKE=22`（本意 22 秒）在旧逻辑里满足 `parsed > 1`，
+       * 于是延时真的是 22 —— **22 毫秒**。启动后 1.15 秒就截图退出，
+       * 看起来像"LR_SMOKE 没生效 / 程序抢跑"，实际是单位歧义把验收证据全废掉了
+       * （详见 避坑指南 §7.10）。宁可用错单位也要写清口径，所以这里**同时打日志**。
+       */
+      const delay = Number.isFinite(parsed) && parsed > 0 ? (parsed < 1000 ? parsed * 1000 : parsed) : 8000
+      logMain('info', 'smoke', '冒烟：LR_SMOKE=' + raw + ' → 延时=' + delay + 'ms（<1000 视为秒）')
       // 冒烟自动化：早期触发 Agent 提问 / 关系图生成，给真实模型留足生成时间
       setTimeout(() => {
         if (process.env.LR_SMOKE_AGENT) {
@@ -706,9 +716,14 @@ if (!gotLock) {
              *  2) span 中心的命中测试结果就是它自己（没有被遮罩、链接层、面板挡住）。
              * 这样脚本就不会再出现"拖到空白处 → DOM 选区为空"的假阴性。
              */
-            // 首启向导会盖住正文，导致拖选全部落空；先点掉它
+            /*
+             * 首启向导会盖住正文，导致拖选全部落空；先关掉它。
+             * 走「跳过」按钮（Esc 与它同义）——旧版本这里找的是"确认"，
+             * 而向导改版后那颗按钮已经叫「下一步」，找不到就会回落到第一个按钮（主题选项），
+             * 于是向导一直盖在正文上，拖选冒烟集体假失败。
+             */
             await win.webContents.executeJavaScript(
-              "(() => { const w = document.querySelector(\".lr-wizard\"); if (w) { const b = Array.from(w.querySelectorAll(\"button\")).find((x) => (x.textContent || \"\").indexOf(\"确认\") >= 0) || w.querySelector(\"button\"); if (b) b.click(); return true } return false })()"
+              "(() => { const w = document.querySelector(\".lr-wizard\"); if (!w) return false; const buttons = Array.from(w.parentElement.querySelectorAll(\"button\")); const skip = buttons.find((x) => /跳过|Skip/.test(x.textContent || \"\")); if (skip) { skip.click(); return true } const close = buttons.find((x) => /完成|Done/.test(x.textContent || \"\")); if (close) { close.click(); return true } return false })()"
             )
             await new Promise((resolve) => setTimeout(resolve, 600))
             const measureScript = [

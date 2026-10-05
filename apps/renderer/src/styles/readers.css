@@ -159,6 +159,8 @@
   font-family: var(--lr-font-mono);
   font-size: var(--lr-fs-sm);
   white-space: nowrap;
+  /* 小表不要缩在左上角：比视口窄就居中；比视口宽时 auto 边距归零，由滚动容器出横向滚动条 */
+  margin: 0 auto;
 }
 
 .lr-sheet__corner,
@@ -218,6 +220,17 @@
 .lr-sheet__cell[data-active='true'] {
   outline: 2px solid var(--vscode-focusBorder);
   outline-offset: -2px;
+}
+
+/*
+ * 虚拟滚动的占位行（lib/sheetWindow 算出的 padTop / padBottom）：
+ * 它夹在两段真实数据中间，只负责撑高度 —— 边框、内边距、行高
+ * 任何一项留着都会变成数据之间一条看得见的"幽灵线"。
+ */
+.lr-sheet__spacer {
+  padding: 0;
+  border: 0;
+  line-height: 0;
 }
 
 .lr-sheet-tab {

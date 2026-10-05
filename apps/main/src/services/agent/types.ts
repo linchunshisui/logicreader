@@ -60,6 +60,8 @@ export interface ConfigOption {
    */
   currentValue: string | boolean | unknown[] | null
   options?: ConfigOptionValue[]
+  /** 改这一项要不要重建会话/线程（见 shared/api.ts 的同名字段） */
+  rebuild?: boolean
 }
 
 export interface AgentCapability {
@@ -85,11 +87,6 @@ export interface AgentCapability {
   supportsStreaming: boolean
   supportsModel: boolean
   supportsThoughtLevel: boolean
-  /**
-   * 运行时能否切换授权模式。
-   * SDK 通道可以（`setPermissionMode` 走控制通道），ACP 通道要重建会话。
-   */
-  supportsPermissionModeSwitch: boolean
   models: ModelOption[]
   configOptions: ConfigOption[]
   defaultModel: string | null
@@ -242,6 +239,15 @@ export interface SessionOptions {
   resumeSessionAt?: string | null
   /** 授权模式（sdk 通道会翻成 SDK 的 permissionMode） */
   permissionMode?: 'manual' | 'plan' | 'edit' | 'auto'
+  /**
+   * **该通道自己那些档位**当前选中的值（Codex 的 `approvalPolicy` / `sandbox`）。
+   *
+   * 与 `permissionMode`（我们客户端的放行策略）分开：后者由前者折算而来
+   * （`policyFromControls`，见 shared/permissions.ts），但两者不能互相顶替 ——
+   * 用户拨的是各协议自己的旋钮，我们只负责把它翻译成"要不要放行"。
+   * 显式给了值就以它为准（适配器不再用自己的兜底）。
+   */
+  configOverrides?: Record<string, string>
   clientCapabilities?: Record<string, unknown>
   /**
    * 会话级权限回调（只有 SDK 通道用）。

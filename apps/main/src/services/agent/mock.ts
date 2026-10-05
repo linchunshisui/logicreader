@@ -28,7 +28,6 @@ export class MockAdapter implements AgentAdapter {
       launchArgs: [],
       supportsAcp: false,
       supportsSdk: false,
-      supportsPermissionModeSwitch: false,
       supportsResume: false,
       supportsStreaming: true,
       supportsModel: true,

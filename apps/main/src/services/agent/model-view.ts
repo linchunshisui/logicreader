@@ -1,4 +1,5 @@
 import type { SdkModelInfo } from './sdk'
+import type { PermissionControl } from '@logicreader/shared'
 import type { ConfigOption, ModelOption } from './types'
 
 /** 界面消费的模型视图（与 packages/shared 的 AgentModelView 对齐）。 */
@@ -109,4 +110,26 @@ export function buildModelConfigOptions(models: ModelOption[]): ConfigOption[] {
     })
   }
   return options
+}
+
+/**
+ * 把**通道自己的授权控制项**转成界面能渲染的配置项（`category: 'permission'`）。
+ *
+ * 与模型/强度那些配置项走同一条通道（探测 → capability.configOptions → 渲染进程），
+ * 所以界面不必知道"哪家 Agent 有档位"，只认 `category === 'permission'` 就行。
+ *
+ * `currentValue` 取控制项**显式声明的默认值**（不是"第一项"：列表按最保守在前排，
+ * 而默认值要保住既有行为，两者不一定同一项 —— 理由见 PermissionControl.defaultValue）。
+ * 名字与说明由渲染进程按 `agent.permission.<控件 id>.<值>` 本地化，找不到才用这里的协议原文。
+ */
+export function permissionConfigOptions(controls: PermissionControl[]): ConfigOption[] {
+  return controls.map((control) => ({
+    id: control.id,
+    name: control.name,
+    category: 'permission',
+    type: 'select',
+    currentValue: control.defaultValue,
+    options: control.options,
+    rebuild: control.rebuild
+  }))
 }

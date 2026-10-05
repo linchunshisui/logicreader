@@ -83,13 +83,10 @@ pnpm build
 pnpm build:unpack     # 产出 release/win-unpacked/LogicReader.exe（已验证可运行）
 pnpm publish:local   # 镜像产物到 D:\Apps\LogicReader（工作区外干净目录），双击即可运行
 pnpm build:win        # 产出 NSIS 安装包与 portable 单文件
-
-#    两个脚本都会先跑 scripts/copy-claude-cli.mjs：
-#    把官方 Claude Agent SDK 自带的原生 CLI 复制到 resources/claude-cli/，
-#    再由 extraResources 放进产物（asar 外，可执行文件不能从 asar 启动）。
 ```
 
 > 说明：仓库根目录即应用目录，`pnpm-workspace.yaml` 只声明了 `packages/*` 三个内部包。
+> 产物**不内置官方 Claude Code CLI**（236 MB）：装了 Claude Code 的用户照常可用，没装的用户仍是一个完整阅读器，见《许可与第三方组件》。
 
 ## 目录结构
 
@@ -103,8 +100,7 @@ packages/
   document-model/  统一块模型、归一化、锚点三重重定位、分块（含单测）
   graph-schema/    节点/边受控词表、精度档位、JSON Schema 与校验（含单测）
 resources/icons/   应用图标（ICO / PNG）
-resources/claude-cli/  打包前由脚本复制的官方 Claude CLI（234 MB，构建期生成，已 gitignore）
-scripts/           构建辅助脚本（ensure-electron / copy-claude-cli / publish-local / trust-windows / launch-doctor / make-shortcut）
+scripts/           构建辅助脚本（ensure-electron / publish-local / trust-windows / launch-doctor / make-shortcut）
 scripts/launcher/  产物自带的三档启动器（启动逻辑阅读器.cmd + LogicReader-Launcher.ps1）
 scripts/fixtures/  测试夹具与图标的生成脚本（PDF / DOCX / XLSX / PNG / ICO）
 tests/fixtures/    样本文档（PDF / Markdown / DOCX / XLSX）
@@ -166,11 +162,20 @@ release/           Windows 免安装程序（electron-builder 输出，已 gitig
 $env:CSC_LINK = 'D:\cert\logicreader.pfx'
 $env:CSC_KEY_PASSWORD = '***'
 pnpm build:win
-# 或 Azure Trusted Signing：设置 AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET，
+# 或 Azure 签名：设置 AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET，
 # 并打开 electron-builder.yml 里注释掉的 azureSignOptions
 ```
 
-证书来源：商业 OV / EV 证书、Azure Trusted Signing（按量付费）；开源项目可申请 SignPath Foundation / Certum Open Source 的免费签名。
+证书来源与选型（2026 年的实际情况）：
+
+| 通道 | 费用 | 适用与限制 |
+| --- | --- | --- |
+| **SignPath Foundation** | **开源项目免费** | 要求 OSI 许可、**产物内无专有组件**、项目活跃且已发布有文档。证书由基金会签发时，发布者即基金会。**本项目已不再内置 Anthropic 的 CLI，这条通道因此才变得可用**（此前会被"含专有组件"挡掉） |
+| **Azure 签名**（原 Trusted Signing） | 约 $9.99/月 | 已 GA；组织限美/加/欧/英，**个人仅限美国与加拿大** |
+| 商业 OV | $150–300/年 | 自 2023-06 起私钥必须放在 FIPS 140-2/3 Level 2+ 硬件令牌或云签服务里，成本已含令牌 |
+| 商业 EV | $400+/年 | EV 已**不再**即时免除 SmartScreen 提示（约 2024 起），仍需时间积累信誉 |
+
+> 签名只解决"未知发布者"这一项；SmartScreen 信誉要时间积累。程序自身绝不请求管理员权限的设计（见《环境要求》）不受影响。
 
 **本机排查与缓解**（只读体检 / 解除锁定 / 加排除项 / 用本机病毒库实测）：
 
@@ -244,8 +249,7 @@ pnpm launch:doctor -- -Kill   # 结束所有实例（含以管理员身份运行
 - 本项目代码以 **MIT** 许可证发布，见 [LICENSE](LICENSE)。
 - 打包产物内含第三方组件，请一并遵守其许可：
   - **Electron / Chromium**：MIT 及 BSD 风格许可（产物内 `LICENSES.chromium.html`、`LICENSE.electron.txt`）。
-  - **Claude Code 原生 CLI**（`resources/claude-cli/claude.exe`，约 234 MB）：由官方 `@anthropic-ai/claude-agent-sdk` 随包分发，版权归 Anthropic。
-    它**不进版本库**（构建期由 `scripts/copy-claude-cli.mjs` 复制），但会出现在打包产物里 —— **公开再分发前请先确认其许可条款**；
-    若不打算随包分发，去掉该脚本这一步即可，程序会回落到用户自己安装的 CLI。
+  - **Claude Code CLI**：**本产物不再内置**。原先随包分发的 `resources/claude-cli/`（约 236 MB，取自 `@anthropic-ai/claude-agent-sdk` 的平台子包，且同时被排除在 asar 之外）已移除 —— 那是 Anthropic 的二进制，而官方条款对第三方再分发与订阅认证有明确限制。
+    影响面很小：**装了 Claude Code 的用户照常可用**（程序解析你自己安装的 `claude`），**没装的用户仍拿到一个完整阅读器**（既有降级路径，见《功能一览》M3）。
   - **LibreOffice**（可选，用于 `.doc` / `.ppt` / `.odt` / `.odp` 转换）：MPL 2.0，本项目**不内置**，缺装时给出引导页而非崩溃。
 - **免责声明**：本工具只做本地文档解析，以及你主动发起的 Agent 调用；不收集、不上传你的文档内容。

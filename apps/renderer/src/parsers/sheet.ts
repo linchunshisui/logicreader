@@ -3,7 +3,7 @@
  * 每个块对应工作表的一行，便于锚点定位到单元格区域（Sheet1!A5:E5）。
  * 单元格提取逻辑在 lib/sheetCache.workbookToSheets（与缓存命中后的补载路径共用同一份实现）。
  */
-import * as XLSX from 'xlsx'
+import * as XLSX from '@e965/xlsx'
 import { createId } from '@logicreader/shared'
 import { finalizeDocumentModel, type Block, type DocumentModel } from '@logicreader/document-model'
 import { api } from '../lib/api'

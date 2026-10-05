@@ -4,6 +4,7 @@ import { executeCommand } from './state/commands.store'
 import { useUiStore } from './state/ui.store'
 import { useTabs } from './state/tabs.store'
 import { useLayout } from './state/layout.store'
+import { useAgent } from './state/agent.store'
 
 export interface Keybinding {
   keys: string[]
@@ -101,7 +102,17 @@ export function installKeybindings(): () => void {
         useLayout.getState().toggleZenMode()
         return
       }
-      void executeCommand(CMD.agentStop)
+      /*
+       * 焦点在输入框里时，把 Esc 让给组件自己处理。
+       *
+       * 旧实现无条件 `agentStop`：用户在 Agent 输入框里打了半句想按 Esc 放弃，
+       * 结果把正在跑的回合一起掐断了（"Esc 全局掐断正在跑的回合"）。
+       * 输入框里的 Esc 语义是"取消这次输入 / 关掉浮层"——
+       * Agent 面板的 textarea 自带这条顺序（浮层 → 草稿 → 停止）。
+       */
+      if (editable) return
+      // 不在输入框里才是"停止生成"的明确意图，而且只在真的有回合在跑时才停
+      if (useAgent.getState().streaming) void executeCommand(CMD.agentStop)
       return
     }
 

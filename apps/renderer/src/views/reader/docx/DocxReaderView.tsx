@@ -35,7 +35,7 @@ export function DocxReaderView({ tab, model }: Props): JSX.Element {
 
   useEffect(() => {
     setActiveReaderTab(tab.id)
-    setReaderProgress({ page: 1, total: 1, zoom, percent: 0 })
+    setReaderProgress({ page: 1, total: 1, zoom, percent: 0, unit: null })
   }, [tab.id, zoom, setActiveReaderTab, setReaderProgress])
 
   useEffect(() => {

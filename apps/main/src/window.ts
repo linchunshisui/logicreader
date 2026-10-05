@@ -1,8 +1,9 @@
 /** 主窗口创建与几何恢复 —— 规划书 §5.9.2 / §5.9.7。 */
 import { BrowserWindow, screen, shell, nativeTheme, app } from 'electron'
 import { join } from 'node:path'
-import type { WindowSnapshot, WindowState } from '@logicreader/shared'
+import { resolveTheme, type WindowSnapshot, type WindowState } from '@logicreader/shared'
 import { broadcast, logMain } from './util/ipc'
+import { settingsService } from './services/settings.service'
 
 const DEFAULT_SIZE = { width: 1440, height: 920 }
 const MIN_SIZE = { width: 960, height: 600 }
@@ -153,12 +154,32 @@ export function titleBarOverlay(theme: 'light' | 'dark'): { color: string; symbo
 
 export function applyThemeToWindow(win: BrowserWindow, theme: 'light' | 'dark'): void {
   if (win.isDestroyed()) return
+  const overlay = titleBarOverlay(theme)
   try {
-    win.setTitleBarOverlay(titleBarOverlay(theme))
+    win.setTitleBarOverlay(overlay)
   } catch {
     /* Linux 等平台可能不支持 */
   }
   win.setBackgroundColor(theme === 'dark' ? '#1e1e1e' : '#ffffff')
+  /*
+   * 把这次的决定写进日志：右上角那三个窗口按钮由**系统**绘制、截不到图里，
+   * 出问题时只能靠"覆盖层颜色 vs 应用主题"这两个数对齐来判断（设置档位也一并打出来）。
+   */
+  logMain(
+    'info',
+    'theme',
+    '窗口主题：' +
+      theme +
+      ' 覆盖层底=' +
+      overlay.color +
+      ' 符号=' +
+      overlay.symbolColor +
+      '（设置=' +
+      settingsService.all().theme +
+      ' 系统深色=' +
+      String(nativeTheme.shouldUseDarkColors) +
+      '）'
+  )
 }
 
 export function collectState(win: BrowserWindow): WindowState {
@@ -184,8 +205,17 @@ export function snapshotGeometry(win: BrowserWindow): { bounds: WindowState['bou
   return { bounds: state.bounds, maximized: state.maximized, fullscreen: state.fullscreen, displayId }
 }
 
+/**
+ * 窗口（标题栏覆盖层 / 背景色）该用哪个主题。
+ *
+ * ★ 必须看**应用的设置**，不能只看系统主题。
+ * 旧实现是 `nativeTheme.shouldUseDarkColors ? 'dark' : 'light'` —— 用户把应用切成浅色、
+ * 而 Windows 还是深色时，标题栏本身是浅的，右上角那三个窗口按钮（最小化 / 还原 / 关闭）
+ * 却在浅色条上留一块深色。用户的原话："右上角的…最小化…关闭在浅色模式下也需要调整"。
+ * `system` 档才跟随系统 —— 与渲染进程的 `resolveTheme` 同一套规则（同一份实现）。
+ */
 export function currentTheme(): 'light' | 'dark' {
-  return nativeTheme.shouldUseDarkColors ? 'dark' : 'light'
+  return resolveTheme(settingsService.all().theme, nativeTheme.shouldUseDarkColors)
 }
 
 export function appVersion(): string {

@@ -18,7 +18,8 @@
  */
 import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
-import { diffTexts, revertHunks } from '@logicreader/shared'
+import { diffTexts, isPermissionMode, revertHunks, SDK_PERMISSION_CONTROLS } from '@logicreader/shared'
+import { permissionConfigOptions } from './model-view'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 import { logMain } from '../../util/ipc'
@@ -274,25 +275,20 @@ export async function deleteSdkSession(sessionId: string, dir?: string | null): 
 }
 
 /**
- * SDK 自带的原生 CLI（平台可选依赖）。
+ * SDK 平台子包自带的原生 CLI。
  * 布局：`node_modules/@anthropic-ai/claude-agent-sdk-win32-x64/claude.exe`
  * （pnpm 下是 .pnpm 里的符号链接结构，用 createRequire 解析真实路径）。
+ *
+ * **打包产物里没有它**：我们不再把该二进制随包分发（electron-builder.yml 里既没有
+ * 复制它的 extraResources，也把平台子包排除在 asar 之外），所以这个函数在打包后返回 null，
+ * 由调用方回落到用户自己安装的 claude —— 这是刻意的：那是 Anthropic 的二进制，
+ * 随包再分发的许可条款需要单独确认。
  */
-export function findBundledCli(): string | null {
+export function findSdkCli(): string | null {
   const platform = process.platform
   const arch = process.arch
   const binary = platform === 'win32' ? 'claude.exe' : 'claude'
   const candidates: string[] = []
-  /**
-   * 打包后：CLI 被 electron-builder 放到 `resources/claude-cli`（asar 外）。
-   * 这一步必须在前，因为打包产物里 node_modules 已经进 asar 了，解析不到原生二进制。
-   */
-  const resourcesPath = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath
-  if (resourcesPath) {
-    candidates.push(join(resourcesPath, 'claude-cli', binary))
-    candidates.push(join(resourcesPath, 'claude-cli', platform + '-' + arch, binary))
-    candidates.push(join(resourcesPath, 'app.asar.unpacked', 'node_modules', '@anthropic-ai', 'claude-agent-sdk-' + platform + '-' + arch, binary))
-  }
   try {
     const require = createRequire(import.meta.url)
     const entry = require.resolve(SDK_PACKAGE) // …/@anthropic-ai/claude-agent-sdk/sdk.mjs
@@ -830,6 +826,15 @@ class SdkSession implements AgentSessionHandle {
   async setConfigOption(optionId: string, value: string | boolean): Promise<void> {
     if (optionId === 'model' && typeof value === 'string') {
       await this.query.setModel(value === 'default' ? undefined : value)
+      return
+    }
+    /*
+     * 授权模式：官方 SDK 支持在**活动会话**上直接切（控制通道 `setPermissionMode`）——
+     * 这是它相比自研 ACP 通道的优势（那边权限写死在握手时，切档只能重建会话，见 ARCHITECTURE §1.10）。
+     * 所以界面切档时不必把会话丢掉重建，对话与上下文都留着。
+     */
+    if (optionId === 'permissionMode' && isPermissionMode(value)) {
+      await this.setPermissionMode(value)
     }
   }
 
@@ -967,7 +972,7 @@ export class SdkAdapter implements AgentAdapter {
     if (this.configuredExecutable && existsSync(this.configuredExecutable)) {
       return { path: this.configuredExecutable, source: '配置' }
     }
-    const bundled = findBundledCli()
+    const bundled = findSdkCli()
     if (bundled) return { path: bundled, source: 'SDK 自带' }
     return { path: null, source: 'SDK 默认查找' }
   }
@@ -998,9 +1003,13 @@ export class SdkAdapter implements AgentAdapter {
       supportsStreaming: true,
       supportsModel: true,
       supportsThoughtLevel: true,
-      supportsPermissionModeSwitch: true,
       models,
-      configOptions: [],
+      /*
+       * Claude Code **原生**就有授权模式，而且能在**活动会话**上直接切（`query.setPermissionMode()`），
+       * 所以 rebuild=false —— 界面切档时不必把会话丢掉重建（旧实现一律重建，
+       * 那是把 ACP 的限制当成通例；见 ARCHITECTURE §1.10 与 避坑指南 §5.12）。
+       */
+      configOptions: permissionConfigOptions(SDK_PERMISSION_CONTROLS),
       defaultModel: 'default',
       // 思考强度由 SDK 逐模型声明（`supportedEffortLevels`），会话建立后再刷新
       defaultThoughtLevel: null,
